@@ -7,11 +7,13 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 /// A single source-level mutation.
 ///
 /// Contains all the information needed to locate the mutation in the
 /// original source file and to apply the text replacement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Mutant {
     /// Path to the Python source file that was mutated.
     pub file_path: PathBuf,
@@ -58,7 +60,7 @@ impl Mutant {
 }
 
 /// Outcome of running the test suite against a single mutant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MutantStatus {
     /// The test suite detected the mutant (at least one test failed).
     Killed,
@@ -76,7 +78,7 @@ pub enum MutantStatus {
 ///
 /// Combines the [`Mutant`] descriptor with the [`MutantStatus`] outcome,
 /// the list of tests that were executed, and the wall-clock duration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MutantResult {
     /// The mutant that was tested.
     pub mutant: Mutant,
