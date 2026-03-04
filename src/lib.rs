@@ -23,8 +23,14 @@ pub use error::Error;
 /// Returns [`Error`] if any stage of the pipeline fails (configuration,
 /// mutation, coverage, test-running, or report generation).
 #[inline]
-#[allow(clippy::missing_const_for_fn, reason = "will perform non-const work once wired up")]
-#[allow(clippy::unnecessary_wraps, reason = "signature is intentional; will return errors once wired up")]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "will perform non-const work once wired up"
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature is intentional; will return errors once wired up"
+)]
 pub fn run() -> Result<(), Error> {
     Ok(())
 }

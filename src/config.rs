@@ -71,29 +71,41 @@ pub fn load(dir: &Path) -> Result<FestConfig, Error> {
 
 /// Parse a `fest.toml` file.
 fn load_fest_toml(path: &Path) -> Result<FestConfig, Error> {
-    let content = std::fs::read_to_string(path).map_err(|err| {
-        Error::Config(format!("failed to read {}: {err}", path.display()))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| Error::Config(format!("failed to read {}: {err}", path.display())))?;
 
-    let root: FestTomlRoot = toml::from_str(&content).map_err(|err| {
-        Error::Config(format!("failed to parse {}: {err}", path.display()))
-    })?;
+    let root: FestTomlRoot = toml::from_str(&content)
+        .map_err(|err| Error::Config(format!("failed to parse {}: {err}", path.display())))?;
 
     Ok(root.fest)
 }
 
 /// Parse the `[tool.fest]` section from a `pyproject.toml` file.
+///
+/// Returns default config when `[tool.fest]` is absent. Propagates errors
+/// when the section exists but contains invalid data.
 fn load_pyproject_toml(path: &Path) -> Result<FestConfig, Error> {
-    let content = std::fs::read_to_string(path).map_err(|err| {
-        Error::Config(format!("failed to read {}: {err}", path.display()))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| Error::Config(format!("failed to read {}: {err}", path.display())))?;
 
-    // The file may not have a [tool.fest] section at all. In that case,
-    // return default config rather than an error.
-    let root: PyprojectTomlRoot = match toml::from_str(&content) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(FestConfig::default()),
-    };
+    let table: toml::Table = toml::from_str(&content)
+        .map_err(|err| Error::Config(format!("failed to parse {}: {err}", path.display())))?;
+
+    // If there is no [tool.fest] section, return defaults silently.
+    let has_tool_fest = table
+        .get("tool")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("fest"))
+        .is_some();
+
+    if !has_tool_fest {
+        return Ok(FestConfig::default());
+    }
+
+    // The section exists — propagate any deserialization errors.
+    let root: PyprojectTomlRoot = toml::from_str(&content).map_err(|err| {
+        Error::Config(format!("invalid [tool.fest] in {}: {err}", path.display()))
+    })?;
 
     Ok(root.tool.fest)
 }
@@ -144,8 +156,7 @@ path = "mutators/my_custom.py"
 path = "target/release/libmy_mutator.so"
 "#;
 
-        let root: FestTomlRoot =
-            toml::from_str(toml_content).expect("should parse full fest.toml");
+        let root: FestTomlRoot = toml::from_str(toml_content).expect("should parse full fest.toml");
         let cfg = root.fest;
 
         assert_eq!(cfg.source, vec!["src/**/*.py", "lib/**/*.py"]);
@@ -376,8 +387,7 @@ timeout = 42
     #[test]
     fn serialize_deserialize_roundtrip() {
         let original = FestConfig::default();
-        let serialized =
-            toml::to_string(&original).expect("should serialize FestConfig");
+        let serialized = toml::to_string(&original).expect("should serialize FestConfig");
 
         // Wrap in [fest] table for deserialization
         let wrapped = format!("[fest]\n{serialized}");
@@ -393,7 +403,8 @@ timeout = 42
         let fest_path = dir.path().join("fest.toml");
 
         let mut file = std::fs::File::create(&fest_path).expect("should create file");
-        file.write_all(b"this is not valid toml {{{}}}").expect("should write file");
+        file.write_all(b"this is not valid toml {{{}}}")
+            .expect("should write file");
 
         let result = load(dir.path());
         assert!(result.is_err());

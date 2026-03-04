@@ -120,7 +120,8 @@ pub struct FestConfig {
     /// Name of the test runner command (e.g. `"pytest"`).
     #[serde(default = "default_test_runner")]
     pub test_runner: String,
-    /// Explicit worker count. If `None`, computed from [`workers_cpu_ratio`](Self::workers_cpu_ratio).
+    /// Explicit worker count. If `None`, computed from
+    /// [`workers_cpu_ratio`](Self::workers_cpu_ratio).
     #[serde(default)]
     pub workers: Option<usize>,
     /// Fraction of available CPUs to use when `workers` is not set.

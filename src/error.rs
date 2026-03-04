@@ -2,7 +2,10 @@
 
 /// All error variants that fest can produce.
 #[derive(Debug, thiserror::Error)]
-#[allow(clippy::error_impl_error, reason = "this is the canonical crate-level error type")]
+#[allow(
+    clippy::error_impl_error,
+    reason = "this is the canonical crate-level error type"
+)]
 pub enum Error {
     /// An error originating from configuration parsing or validation.
     #[error("config error: {0}")]
