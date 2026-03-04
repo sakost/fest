@@ -2,5 +2,7 @@
 
 /// Thin binary entry point — delegates to the library.
 fn main() -> Result<(), fest::Error> {
-    fest::run()
+    let args = fest::cli::parse();
+    let run_args = fest::cli::run_args(args);
+    fest::run(run_args)
 }

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Output format for the mutation-testing report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// Plain-text report written to stdout.

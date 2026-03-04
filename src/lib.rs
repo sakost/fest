@@ -4,6 +4,7 @@
 //! generating mutants from Python source code, running a test suite
 //! against each mutant, and reporting which mutants survived.
 
+pub mod cli;
 pub mod config;
 pub mod coverage;
 pub mod error;
@@ -16,7 +17,8 @@ pub use error::Error;
 /// Run the fest pipeline to completion.
 ///
 /// This is the top-level entry point invoked by the CLI binary.
-/// It will be wired up to the full pipeline in a later task.
+/// It accepts the parsed [`cli::RunArgs`] from the command line so that
+/// CLI overrides can be merged with the loaded configuration.
 ///
 /// # Errors
 ///
@@ -31,6 +33,10 @@ pub use error::Error;
     clippy::unnecessary_wraps,
     reason = "signature is intentional; will return errors once wired up"
 )]
-pub fn run() -> Result<(), Error> {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "RunArgs is consumed; pass-by-value is intentional for the final API"
+)]
+pub fn run(_args: cli::RunArgs) -> Result<(), Error> {
     Ok(())
 }
