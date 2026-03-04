@@ -31,6 +31,32 @@ pub struct Mutant {
     pub mutator_name: String,
 }
 
+impl Mutant {
+    /// Apply this mutation to the given source text, returning the mutated source.
+    ///
+    /// Splices [`mutated_text`](Self::mutated_text) into the source at the
+    /// byte range `[byte_offset .. byte_offset + byte_length]`, preserving
+    /// everything before and after the replaced region.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "byte offsets originate from AST and are always valid"
+    )]
+    #[allow(
+        clippy::string_slice,
+        reason = "byte offsets originate from AST and are always valid UTF-8 boundaries"
+    )]
+    pub fn apply_to_source(&self, source: &str) -> String {
+        let mut result =
+            String::with_capacity(source.len() - self.byte_length + self.mutated_text.len());
+        result.push_str(&source[..self.byte_offset]);
+        result.push_str(&self.mutated_text);
+        result.push_str(&source[self.byte_offset + self.byte_length..]);
+        result
+    }
+}
+
 /// Outcome of running the test suite against a single mutant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutantStatus {
@@ -178,5 +204,97 @@ mod tests {
 
         assert_eq!(result.status, MutantStatus::Error("segfault".to_owned()));
         assert!(result.tests_run.is_empty());
+    }
+
+    /// `apply_to_source` replaces a single operator in the middle.
+    #[test]
+    fn apply_to_source_middle_replacement() {
+        let source = "x = a + b";
+        let mutant = Mutant {
+            file_path: PathBuf::from("test.py"),
+            line: 1_u32,
+            column: 7_u32,
+            byte_offset: 6_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
+
+        assert_eq!(mutant.apply_to_source(source), "x = a - b");
+    }
+
+    /// `apply_to_source` handles replacement at the start of the source.
+    #[test]
+    fn apply_to_source_at_start() {
+        let source = "True and False";
+        let mutant = Mutant {
+            file_path: PathBuf::from("test.py"),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 4_usize,
+            original_text: "True".to_owned(),
+            mutated_text: "False".to_owned(),
+            mutator_name: "constant_replace".to_owned(),
+        };
+
+        assert_eq!(mutant.apply_to_source(source), "False and False");
+    }
+
+    /// `apply_to_source` handles replacement at the end of the source.
+    #[test]
+    fn apply_to_source_at_end() {
+        let source = "x = True";
+        let mutant = Mutant {
+            file_path: PathBuf::from("test.py"),
+            line: 1_u32,
+            column: 5_u32,
+            byte_offset: 4_usize,
+            byte_length: 4_usize,
+            original_text: "True".to_owned(),
+            mutated_text: "False".to_owned(),
+            mutator_name: "constant_replace".to_owned(),
+        };
+
+        assert_eq!(mutant.apply_to_source(source), "x = False");
+    }
+
+    /// `apply_to_source` handles replacement with different-length text.
+    #[test]
+    fn apply_to_source_different_length() {
+        let source = "x = a // b";
+        let mutant = Mutant {
+            file_path: PathBuf::from("test.py"),
+            line: 1_u32,
+            column: 7_u32,
+            byte_offset: 6_usize,
+            byte_length: 2_usize,
+            original_text: "//".to_owned(),
+            mutated_text: "*".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
+
+        assert_eq!(mutant.apply_to_source(source), "x = a * b");
+    }
+
+    /// `apply_to_source` preserves surrounding multiline code.
+    #[test]
+    fn apply_to_source_preserves_multiline() {
+        let source = "def calc():\n    return a + b\n    # done\n";
+        // The `+` is at byte offset 25 ("def calc():\n    return a " = 25 bytes)
+        let mutant = Mutant {
+            file_path: PathBuf::from("test.py"),
+            line: 2_u32,
+            column: 14_u32,
+            byte_offset: 25_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
+
+        let result = mutant.apply_to_source(source);
+        assert_eq!(result, "def calc():\n    return a - b\n    # done\n");
     }
 }
