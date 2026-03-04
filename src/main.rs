@@ -1,6 +1,6 @@
-//! fest — a mutation-testing tool for Python.
+//! CLI entry point for fest.
 
-#[allow(clippy::print_stdout, reason = "temporary hello-world placeholder")]
-fn main() {
-    println!("Hello, world!");
+/// Thin binary entry point — delegates to the library.
+fn main() -> Result<(), fest::Error> {
+    fest::run()
 }

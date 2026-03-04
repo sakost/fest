@@ -8,6 +8,14 @@ keywords = ["mutation-testing", "python", "testing"]
 categories = ["development-tools::testing"]
 rust-version = "1.93"
 
+[lib]
+name = "fest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fest"
+path = "src/main.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
@@ -123,7 +131,7 @@ use_debug = "deny"
 wildcard_dependencies = "deny"
 
 [package.metadata.cargo-machete]
-ignored = ["clap", "indicatif", "rayon", "ruff_python_ast", "ruff_python_parser", "serde", "serde_json", "tokio"]
+ignored = ["clap", "indicatif", "rayon", "ruff_python_ast", "ruff_python_parser", "serde", "serde_json", "thiserror", "tokio"]
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
@@ -133,4 +141,5 @@ ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.11.6", v
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.11.6", version = "0.0.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+thiserror = "2.0.17"
 tokio = { version = "1.50.0", features = ["full"] }
