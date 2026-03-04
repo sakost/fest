@@ -1,0 +1,19 @@
+# release-plz configuration
+# https://release-plz.ieni.dev/docs/config
+
+[workspace]
+# Enable semver compatibility checks
+semver_check = true
+# Generate changelogs from conventional commits
+changelog_update = true
+# Git tag format
+git_tag_name = "v{{ version }}"
+# Use conventional commits for changelog generation
+changelog_config = "keep-a-changelog"
+
+[[package]]
+name = "fest"
+# Enable changelog for the package
+changelog_update = true
+# Include conventional commits in changelog
+changelog_include = ["feat", "fix", "docs", "perf", "refactor", "build", "ci"]

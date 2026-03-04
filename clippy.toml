@@ -1,0 +1,22 @@
+# Clippy configuration — strict thresholds
+
+# Complexity limits
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 60
+type-complexity-threshold = 250
+
+# Identifiers recognized as valid in documentation
+doc-valid-idents = ["fest", ".."]
+
+# Disallowed placeholder variable names
+disallowed-names = ["foo", "bar", "baz", "quux", "toto", "tata"]
+
+# Do not avoid breaking changes in exported API — we are pre-1.0
+avoid-breaking-exported-api = false
+
+# Warn on all wildcard imports, not just from prelude modules
+warn-on-all-wildcard-imports = true
+
+# Large error threshold for must_use_candidate
+large-error-threshold = 128

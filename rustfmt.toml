@@ -1,0 +1,25 @@
+# Stable rustfmt options (work with `cargo fmt`)
+edition = "2024"
+hard_tabs = false
+tab_spaces = 4
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+force_explicit_abi = true
+reorder_imports = true
+reorder_modules = true
+merge_derives = true
+remove_nested_parens = true
+
+# Nightly-only options (use `cargo +nightly fmt`)
+comment_width = 100
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+wrap_comments = true
+format_code_in_doc_comments = true
+format_macro_matchers = true
+format_strings = true
+normalize_comments = true
+normalize_doc_attributes = true
+condense_wildcard_suffixes = true
