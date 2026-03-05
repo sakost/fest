@@ -16,6 +16,7 @@ pub mod coverage;
 pub mod error;
 pub mod mutation;
 pub mod plugin;
+pub mod progress;
 pub mod report;
 pub mod runner;
 
@@ -213,6 +214,7 @@ mod tests {
     #[test]
     fn resolve_project_dir_from_config_path() {
         let args = cli::RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -231,6 +233,7 @@ mod tests {
     #[test]
     fn resolve_project_dir_cwd_fallback() {
         let args = cli::RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -251,6 +254,7 @@ mod tests {
     #[test]
     fn resolve_project_dir_bare_filename() {
         let args = cli::RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,

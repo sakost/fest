@@ -33,6 +33,14 @@ pub enum Command {
 /// Arguments for the `run` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
+    /// Enable verbose per-mutant progress output.
+    ///
+    /// Prints one line per mutant to stderr showing the status, file, mutator,
+    /// and duration. When not set, a progress bar is shown on TTY stderr, or
+    /// no output on non-TTY stderr.
+    #[arg(short, long)]
+    pub verbose: bool,
+
     /// Glob patterns matching Python source files to mutate.
     ///
     /// Overrides the `source` list from the config file.
@@ -104,6 +112,7 @@ pub fn run_args(args: Args) -> RunArgs {
     match args.command {
         Some(Command::Run(run_args)) => run_args,
         None => RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -161,6 +170,7 @@ mod tests {
     fn merge_no_overrides_returns_config_unchanged() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -180,6 +190,7 @@ mod tests {
     fn merge_source_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: Some(vec!["tests/**/*.py".to_owned()]),
             exclude: None,
             workers: None,
@@ -199,6 +210,7 @@ mod tests {
     fn merge_exclude_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: Some(vec!["vendor/**".to_owned()]),
             workers: None,
@@ -218,6 +230,7 @@ mod tests {
     fn merge_workers_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: Some(16_usize),
@@ -237,6 +250,7 @@ mod tests {
     fn merge_workers_cpu_ratio_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -256,6 +270,7 @@ mod tests {
     fn merge_timeout_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -275,6 +290,7 @@ mod tests {
     fn merge_fail_under_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -294,6 +310,7 @@ mod tests {
     fn merge_output_override() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: None,
@@ -313,6 +330,7 @@ mod tests {
     fn merge_multiple_overrides() {
         let config = FestConfig::default();
         let args = RunArgs {
+            verbose: false,
             source: Some(vec!["lib/**/*.py".to_owned()]),
             exclude: Some(vec!["lib/generated/**".to_owned()]),
             workers: Some(4_usize),
@@ -343,6 +361,7 @@ mod tests {
         config.output = OutputFormat::Json;
 
         let args = RunArgs {
+            verbose: false,
             source: None,
             exclude: None,
             workers: Some(8_usize),
