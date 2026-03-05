@@ -832,4 +832,42 @@ mod tests {
         assert!(output.contains("Errors"));
         assert!(output.contains("No coverage"));
     }
+
+    /// HTML report shows `[NO COVERAGE]` label in mutation detail.
+    #[test]
+    fn html_report_shows_no_coverage_label() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::NoCoverage,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("[NO COVERAGE]"));
+    }
+
+    /// HTML report has balanced `<div>` and `</div>` tags.
+    #[test]
+    fn html_report_div_tags_balanced() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 2_u32, "op", "-", "+"),
+                MutantStatus::Survived,
+            ),
+            make_result(
+                make_mutant("b.py", 3_u32, "op", "*", "/"),
+                MutantStatus::NoCoverage,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 2_usize, 3_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        let open_divs = output.matches("<div").count();
+        let close_divs = output.matches("</div>").count();
+        assert_eq!(open_divs, close_divs);
+    }
 }
