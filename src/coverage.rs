@@ -195,9 +195,10 @@ fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
 /// Check whether the cached `.coverage.json` is fresh.
 ///
 /// Returns `true` when `<project_dir>/.coverage.json` exists and its
-/// modification time is newer than every `**/*.py` file under the project
+/// modification time is newer than every `**/*.py` file **and** every
+/// configuration file (`fest.toml`, `pyproject.toml`) under the project
 /// directory. Returns `false` otherwise (missing file, I/O errors, or any
-/// Python source file is newer than the cache).
+/// relevant file is newer than the cache).
 #[inline]
 #[must_use]
 pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
@@ -205,6 +206,18 @@ pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
     let Ok(json_mtime) = std::fs::metadata(&json_path).and_then(|m| m.modified()) else {
         return false;
     };
+
+    // Invalidate cache when configuration files change (e.g. source
+    // patterns were updated, which changes which files get coverage).
+    for config_name in ["fest.toml", "pyproject.toml"] {
+        let config_path = project_dir.join(config_name);
+        let is_newer = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime > json_mtime);
+        if is_newer {
+            return false;
+        }
+    }
 
     let pattern = format!("{}/**/*.py", project_dir.display());
     let Ok(entries) = glob::glob(&pattern) else {
@@ -516,6 +529,47 @@ mod tests {
         std::fs::write(&json_path, "{}").expect("write json");
 
         assert!(is_coverage_cache_fresh(dir.path()));
+    }
+
+    /// `is_coverage_cache_fresh` returns false when `fest.toml` is newer.
+    #[test]
+    fn is_coverage_cache_stale_after_config_change() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create .py file first.
+        let py_path = dir.path().join("app.py");
+        std::fs::write(&py_path, "x = 1").expect("write py");
+
+        // Sleep so .coverage.json is strictly newer than .py.
+        std::thread::sleep(std::time::Duration::from_millis(50_u64));
+
+        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+        std::fs::write(&json_path, "{}").expect("write json");
+
+        // Sleep so fest.toml is strictly newer than .coverage.json.
+        std::thread::sleep(std::time::Duration::from_millis(50_u64));
+
+        let config_path = dir.path().join("fest.toml");
+        std::fs::write(&config_path, "[fest]\nsource = [\"packages/**/*.py\"]")
+            .expect("write config");
+
+        assert!(!is_coverage_cache_fresh(dir.path()));
+    }
+
+    /// `is_coverage_cache_fresh` returns false when `pyproject.toml` is newer.
+    #[test]
+    fn is_coverage_cache_stale_after_pyproject_change() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+        std::fs::write(&json_path, "{}").expect("write json");
+
+        std::thread::sleep(std::time::Duration::from_millis(50_u64));
+
+        let config_path = dir.path().join("pyproject.toml");
+        std::fs::write(&config_path, "[tool.fest]\ntimeout = 30").expect("write pyproject");
+
+        assert!(!is_coverage_cache_fresh(dir.path()));
     }
 
     /// `load_cached_coverage` parses a valid `.coverage.json` round-trip.
