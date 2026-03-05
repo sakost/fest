@@ -89,6 +89,28 @@ pub struct RunArgs {
     /// or `pyproject.toml`.
     #[arg(short, long)]
     pub config: Option<PathBuf>,
+
+    /// Disable mtime-based coverage caching.
+    ///
+    /// Forces a fresh coverage collection even when `.coverage.json` exists
+    /// and all `.py` files are older than it.
+    #[arg(long)]
+    pub no_coverage_cache: bool,
+
+    /// Path to a pre-existing `.coverage` or `.coverage.json` file.
+    ///
+    /// When set, skips running pytest for coverage and uses this file
+    /// directly. `.json` files are parsed immediately; `.coverage` `SQLite`
+    /// databases are exported to JSON first.
+    #[arg(long)]
+    pub coverage_from: Option<PathBuf>,
+
+    /// Disable forcing the fast C-based coverage tracer.
+    ///
+    /// By default fest sets `COVERAGE_CORE=ctrace` for faster coverage
+    /// collection. Use this flag to let coverage.py pick its own backend.
+    #[arg(long)]
+    pub no_fast_coverage: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +143,9 @@ pub fn run_args(args: Args) -> RunArgs {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         },
     }
 }
@@ -154,6 +179,15 @@ pub fn merge_config(args: &RunArgs, mut config: FestConfig) -> FestConfig {
     if let Some(output) = args.output.as_ref() {
         config.output = output.clone();
     }
+    if args.no_coverage_cache {
+        config.coverage_cache = false;
+    }
+    if let Some(coverage_from) = args.coverage_from.as_ref() {
+        config.coverage_from = Some(coverage_from.clone());
+    }
+    if args.no_fast_coverage {
+        config.fast_coverage = false;
+    }
     config
 }
 
@@ -179,6 +213,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config.clone());
@@ -199,6 +236,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -219,6 +259,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -239,6 +282,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -259,6 +305,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -279,6 +328,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -299,6 +351,9 @@ mod tests {
             fail_under: Some(90.0),
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -319,6 +374,9 @@ mod tests {
             fail_under: None,
             output: Some(OutputFormat::Json),
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -339,6 +397,9 @@ mod tests {
             fail_under: Some(85.0),
             output: Some(OutputFormat::Html),
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
@@ -370,11 +431,67 @@ mod tests {
             fail_under: None,
             output: Some(OutputFormat::Text),
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let merged = merge_config(&args, config);
         assert_eq!(merged.workers, Some(8_usize));
         assert_eq!(merged.timeout, 120_u64);
         assert_eq!(merged.output, OutputFormat::Text);
+    }
+
+    /// CLI `--no-coverage-cache` sets `coverage_cache = false`.
+    #[test]
+    fn merge_no_coverage_cache() {
+        let config = FestConfig::default();
+        assert!(config.coverage_cache);
+
+        let args = RunArgs {
+            verbose: false,
+            source: None,
+            exclude: None,
+            workers: None,
+            workers_cpu_ratio: None,
+            timeout: None,
+            fail_under: None,
+            output: None,
+            config: None,
+            no_coverage_cache: true,
+            coverage_from: None,
+            no_fast_coverage: false,
+        };
+
+        let merged = merge_config(&args, config);
+        assert!(!merged.coverage_cache);
+    }
+
+    /// CLI `--coverage-from` populates `coverage_from` in config.
+    #[test]
+    fn merge_coverage_from() {
+        let config = FestConfig::default();
+        assert!(config.coverage_from.is_none());
+
+        let args = RunArgs {
+            verbose: false,
+            source: None,
+            exclude: None,
+            workers: None,
+            workers_cpu_ratio: None,
+            timeout: None,
+            fail_under: None,
+            output: None,
+            config: None,
+            no_coverage_cache: false,
+            coverage_from: Some(PathBuf::from("my/.coverage.json")),
+            no_fast_coverage: false,
+        };
+
+        let merged = merge_config(&args, config);
+        assert_eq!(
+            merged.coverage_from,
+            Some(PathBuf::from("my/.coverage.json"))
+        );
     }
 }

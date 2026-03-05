@@ -216,6 +216,11 @@ path = "target/release/libmy_mutator.so"
         assert!(cfg.mutators.custom.is_empty());
         assert!(cfg.mutators.python.is_empty());
         assert!(cfg.mutators.dylib.is_empty());
+
+        // Coverage settings
+        assert!(cfg.coverage_cache);
+        assert!(cfg.coverage_from.is_none());
+        assert!(cfg.fast_coverage);
     }
 
     /// Minimal fest.toml — only required top-level table, all fields default.
@@ -394,6 +399,27 @@ timeout = 42
         let root: FestTomlRoot = toml::from_str(&wrapped).expect("should deserialize roundtrip");
 
         assert_eq!(root.fest, original);
+    }
+
+    /// Coverage fields are deserialized from TOML.
+    #[test]
+    fn deserialize_coverage_fields() {
+        let toml_content = r#"
+[fest]
+coverage_cache = false
+coverage_from = ".my_coverage.json"
+fast_coverage = false
+"#;
+        let root: FestTomlRoot =
+            toml::from_str(toml_content).expect("should parse coverage fields");
+        let cfg = root.fest;
+
+        assert!(!cfg.coverage_cache);
+        assert_eq!(
+            cfg.coverage_from,
+            Some(std::path::PathBuf::from(".my_coverage.json"))
+        );
+        assert!(!cfg.fast_coverage);
     }
 
     /// Invalid TOML in fest.toml produces `Error::Config`.

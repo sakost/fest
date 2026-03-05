@@ -55,7 +55,52 @@ fn check_pytest_cov_available(project_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Check whether `pytest-xdist` is importable in the project's Python
+/// environment. Returns `true` when the import succeeds.
+fn is_xdist_available(project_dir: &Path) -> bool {
+    Command::new("python")
+        .args(["-c", "import xdist"])
+        .current_dir(project_dir)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Extract source directory prefixes from glob patterns.
+///
+/// For each pattern, takes the path prefix before the first glob wildcard
+/// (`*`, `?`, `[`). Deduplicates the result. Returns an empty vec when no
+/// meaningful directories can be extracted.
+fn extract_source_dirs(patterns: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = patterns
+        .iter()
+        .filter_map(|pat| {
+            let first_glob = pat.find(['*', '?', '['])?;
+            let prefix = pat.get(..first_glob)?;
+            let dir = prefix.trim_end_matches('/');
+            if dir.is_empty() {
+                return None;
+            }
+            Some(dir.to_owned())
+        })
+        .collect();
+
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// Run `pytest --cov --cov-context=test` to generate coverage data.
+///
+/// Source directories extracted from `source_patterns` are passed as explicit
+/// `--cov=<dir>` arguments so that coverage is collected for the directories
+/// fest will mutate, regardless of the project's own `[tool.coverage.run]`
+/// config.
+///
+/// When `pytest-xdist` is installed, `-n 0` forces serial execution.
+/// Parallel workers interfere with `--cov-context=test` context tracking.
+/// Using `-n 0` rather than `-p no:xdist` keeps xdist loaded so that any
+/// `-n` in the project's `addopts` is still recognised (disabling xdist
+/// makes `-n` an unknown flag).
 ///
 /// Returns the exit status success flag. A failing exit code is **not** treated
 /// as an error — the `.coverage` database is still produced when tests fail, and
@@ -64,17 +109,41 @@ fn check_pytest_cov_available(project_dir: &Path) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns [`Error::Coverage`] only if the subprocess cannot be spawned.
-fn run_pytest_cov(project_dir: &Path) -> Result<bool, Error> {
-    let output = Command::new("python")
-        .args([
-            "-m",
-            "pytest",
-            "--cov",
-            "--cov-context=test",
-            "--no-header",
-            "-q",
-        ])
-        .current_dir(project_dir)
+fn run_pytest_cov(
+    project_dir: &Path,
+    source_patterns: &[String],
+    fast_coverage: bool,
+) -> Result<bool, Error> {
+    let source_dirs = extract_source_dirs(source_patterns);
+    let xdist_installed = is_xdist_available(project_dir);
+
+    let mut args = vec!["-m".to_owned(), "pytest".to_owned()];
+
+    if source_dirs.is_empty() {
+        args.push("--cov".to_owned());
+    } else {
+        for dir in &source_dirs {
+            args.push(format!("--cov={dir}"));
+        }
+    }
+
+    args.extend([
+        "--cov-context=test".to_owned(),
+        "--no-header".to_owned(),
+        "-q".to_owned(),
+    ]);
+
+    if xdist_installed {
+        args.extend(["-n".to_owned(), "0".to_owned()]);
+    }
+
+    let mut cmd = Command::new("python");
+    let _args_ref = cmd.args(&args).current_dir(project_dir);
+    if fast_coverage {
+        let _env_ref = cmd.env("COVERAGE_CORE", "ctrace");
+    }
+
+    let output = cmd
         .output()
         .map_err(|err| Error::Coverage(format!("failed to spawn pytest: {err}")))?;
 
@@ -94,8 +163,19 @@ fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
     let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
     let json_path_str = json_path.display().to_string();
 
+    // `--fail-under=0` overrides the project's `[tool.coverage.report]
+    // fail_under` setting. Without this, `coverage json` exits with code 2
+    // when the total coverage is below the threshold, even though the JSON
+    // file is produced successfully.
     let output = Command::new("python")
-        .args(["-m", "coverage", "json", "--show-contexts", "-o"])
+        .args([
+            "-m",
+            "coverage",
+            "json",
+            "--show-contexts",
+            "--fail-under=0",
+            "-o",
+        ])
         .arg(&json_path_str)
         .current_dir(project_dir)
         .output()
@@ -103,12 +183,115 @@ fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(Error::Coverage(format!(
-            "coverage json export failed: {stderr}"
+            "coverage json export failed: {stderr}{stdout}"
         )));
     }
 
     Ok(json_path)
+}
+
+/// Check whether the cached `.coverage.json` is fresh.
+///
+/// Returns `true` when `<project_dir>/.coverage.json` exists and its
+/// modification time is newer than every `**/*.py` file under the project
+/// directory. Returns `false` otherwise (missing file, I/O errors, or any
+/// Python source file is newer than the cache).
+#[inline]
+#[must_use]
+pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
+    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
+    let Ok(json_mtime) = std::fs::metadata(&json_path).and_then(|m| m.modified()) else {
+        return false;
+    };
+
+    let pattern = format!("{}/**/*.py", project_dir.display());
+    let Ok(entries) = glob::glob(&pattern) else {
+        return false;
+    };
+
+    for entry in entries {
+        let Ok(path) = entry else {
+            return false;
+        };
+        let Ok(py_mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            return false;
+        };
+        if py_mtime > json_mtime {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Load coverage data from the cached `.coverage.json` in the project
+/// directory, without running any subprocesses.
+///
+/// # Errors
+///
+/// Returns [`Error::Coverage`] if the file cannot be read or parsed.
+#[inline]
+pub fn load_cached_coverage(project_dir: &Path) -> Result<CoverageMap, Error> {
+    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
+    json_parser::parse_coverage_json(&json_path, project_dir)
+}
+
+/// Load coverage data from a user-provided file.
+///
+/// If the path has a `.json` extension it is parsed directly. Otherwise it
+/// is treated as a `.coverage` `SQLite` database: `coverage json` is invoked
+/// with `COVERAGE_FILE` pointing at the given path to export JSON, and then
+/// the JSON is parsed.
+///
+/// # Errors
+///
+/// Returns [`Error::Coverage`] if the export or parse fails.
+#[inline]
+pub fn load_coverage_from(path: &Path, project_dir: &Path) -> Result<CoverageMap, Error> {
+    let is_json = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+
+    if is_json {
+        return json_parser::parse_coverage_json(path, project_dir);
+    }
+
+    // Assume SQLite .coverage database — export to JSON first.
+    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
+    let json_path_str = json_path.display().to_string();
+
+    let output = Command::new("python")
+        .args([
+            "-m",
+            "coverage",
+            "json",
+            "--show-contexts",
+            "--fail-under=0",
+            "-o",
+        ])
+        .arg(&json_path_str)
+        .env("COVERAGE_FILE", path)
+        .current_dir(project_dir)
+        .output()
+        .map_err(|err| {
+            Error::Coverage(format!(
+                "failed to spawn `coverage json` for {}: {err}",
+                path.display()
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(Error::Coverage(format!(
+            "coverage json export from {} failed: {stderr}{stdout}",
+            path.display()
+        )));
+    }
+
+    json_parser::parse_coverage_json(&json_path, project_dir)
 }
 
 /// Collect per-line test coverage for a Python project.
@@ -119,9 +302,6 @@ fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
 /// 3. Exports the resulting `.coverage` database to JSON.
 /// 4. Parses the JSON into a [`CoverageMap`].
 ///
-/// The `_source_patterns` parameter is reserved for future use (e.g. filtering
-/// coverage data to only the files that will be mutated).
-///
 /// # Errors
 ///
 /// Returns [`Error::Coverage`] if `pytest-cov` is not available, the coverage
@@ -129,11 +309,12 @@ fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
 #[inline]
 pub fn collect_coverage(
     project_dir: &Path,
-    _source_patterns: &[String],
+    source_patterns: &[String],
+    fast_coverage: bool,
 ) -> Result<CoverageMap, Error> {
     check_pytest_cov_available(project_dir)?;
 
-    let _tests_passed = run_pytest_cov(project_dir)?;
+    let _tests_passed = run_pytest_cov(project_dir, source_patterns, fast_coverage)?;
     // We intentionally ignore the test pass/fail status — coverage data
     // is produced even when some tests fail.
 
@@ -170,11 +351,61 @@ mod tests {
     #[test]
     fn run_pytest_cov_in_empty_dir() {
         let dir = tempfile::tempdir().expect("create temp dir");
+        let patterns = vec!["src/**/*.py".to_owned()];
         // pytest will fail (no tests), but the function should not panic.
-        let result = run_pytest_cov(dir.path());
+        let result = run_pytest_cov(dir.path(), &patterns, true);
         // Accept Ok(false) (pytest exits non-zero) or Err (if python not
         // found). Either is fine for this test.
         let _unused = result;
+    }
+
+    #[test]
+    fn extract_source_dirs_basic() {
+        let patterns = vec!["src/app/**/*.py".to_owned()];
+        assert_eq!(extract_source_dirs(&patterns), vec!["src/app"]);
+    }
+
+    #[test]
+    fn extract_source_dirs_deduplicates() {
+        let patterns = vec!["src/app/**/*.py".to_owned(), "src/app/*.py".to_owned()];
+        assert_eq!(extract_source_dirs(&patterns), vec!["src/app"]);
+    }
+
+    #[test]
+    fn extract_source_dirs_multiple_distinct() {
+        let patterns = vec![
+            "src/collectors/**/*.py".to_owned(),
+            "lib/utils/*.py".to_owned(),
+        ];
+        let dirs = extract_source_dirs(&patterns);
+        assert_eq!(dirs, vec!["lib/utils", "src/collectors"]);
+    }
+
+    #[test]
+    fn extract_source_dirs_empty_input() {
+        let patterns: Vec<String> = vec![];
+        assert!(extract_source_dirs(&patterns).is_empty());
+    }
+
+    #[test]
+    fn extract_source_dirs_root_glob() {
+        // Pattern like `*.py` has no directory prefix — should be skipped.
+        let patterns = vec!["*.py".to_owned()];
+        assert!(extract_source_dirs(&patterns).is_empty());
+    }
+
+    #[test]
+    fn extract_source_dirs_no_wildcards() {
+        // Pattern without any glob characters — no match for wildcard chars,
+        // so `find` returns `None` and the pattern is skipped.
+        let patterns = vec!["src/app/main.py".to_owned()];
+        assert!(extract_source_dirs(&patterns).is_empty());
+    }
+
+    #[test]
+    fn extract_source_dirs_trailing_slash() {
+        let patterns = vec!["src/app/collectors/**/*.py".to_owned()];
+        assert_eq!(extract_source_dirs(&patterns), vec!["src/app/collectors"],);
     }
 
     /// `export_coverage_json` fails when there is no `.coverage` file.
@@ -242,5 +473,94 @@ mod tests {
         let map = CoverageMap::new();
         assert!(map.is_empty());
         assert_eq!(map.len(), 0_usize);
+    }
+
+    /// `is_coverage_cache_fresh` returns false when `.coverage.json` is missing.
+    #[test]
+    fn is_coverage_cache_fresh_no_json() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert!(!is_coverage_cache_fresh(dir.path()));
+    }
+
+    /// `is_coverage_cache_fresh` returns false when a `.py` file is newer.
+    #[test]
+    fn is_coverage_cache_fresh_stale() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create .coverage.json first.
+        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+        std::fs::write(&json_path, "{}").expect("write json");
+
+        // Sleep briefly so the .py file gets a strictly newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50_u64));
+
+        let py_path = dir.path().join("app.py");
+        std::fs::write(&py_path, "x = 1").expect("write py");
+
+        assert!(!is_coverage_cache_fresh(dir.path()));
+    }
+
+    /// `is_coverage_cache_fresh` returns true when json is newer than all `.py`.
+    #[test]
+    fn is_coverage_cache_fresh_valid() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        // Create .py file first.
+        let py_path = dir.path().join("app.py");
+        std::fs::write(&py_path, "x = 1").expect("write py");
+
+        // Sleep briefly so the json gets a strictly newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50_u64));
+
+        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+        std::fs::write(&json_path, "{}").expect("write json");
+
+        assert!(is_coverage_cache_fresh(dir.path()));
+    }
+
+    /// `load_cached_coverage` parses a valid `.coverage.json` round-trip.
+    #[test]
+    fn load_cached_coverage_parses_json() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+
+        let json_content = r#"{
+            "files": {
+                "lib.py": {
+                    "executed_lines": [1],
+                    "contexts": {
+                        "1": ["test_lib.py::test_func"]
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&json_path, json_content).expect("write json");
+
+        let map = load_cached_coverage(dir.path()).expect("should parse");
+        let key = (dir.path().join("lib.py"), 1_u32);
+        assert!(map.contains_key(&key));
+    }
+
+    /// `load_coverage_from` loads a user-provided `.json` file.
+    #[test]
+    fn load_coverage_from_json_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let json_path = dir.path().join("user_coverage.json");
+
+        let json_content = r#"{
+            "files": {
+                "mod.py": {
+                    "executed_lines": [5],
+                    "contexts": {
+                        "5": ["test_mod.py::test_five"]
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&json_path, json_content).expect("write json");
+
+        let map = load_coverage_from(&json_path, dir.path()).expect("should parse");
+        let key = (dir.path().join("mod.py"), 5_u32);
+        assert!(map.contains_key(&key));
     }
 }

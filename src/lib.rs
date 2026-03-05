@@ -4,11 +4,14 @@
 //! generating mutants from Python source code, running a test suite
 //! against each mutant, and reporting which mutants survived.
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
     io::Write as _,
     path::{Path, PathBuf},
 };
+
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 pub mod cli;
 pub mod config;
@@ -94,7 +97,7 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
 
     // 4. Collect coverage.
     reporter.phase("[5/7] Collecting coverage...");
-    let coverage_map = coverage::collect_coverage(&project_dir, &config.source)?;
+    let coverage_map = resolve_coverage(&config, &project_dir)?;
 
     // 5. Run each mutant against the test suite.
     reporter.phase(&format!(
@@ -167,22 +170,54 @@ fn resolve_project_dir(args: &cli::RunArgs) -> Result<PathBuf, Error> {
         .map_err(|err| Error::Config(format!("failed to determine current directory: {err}")))
 }
 
-/// Run all mutants and collect their results.
+/// Resolve coverage data based on the configuration.
 ///
-/// For each mutant, looks up the coverage map to determine which tests
-/// exercise the mutated line. Mutants with no covering tests are marked
-/// as [`mutation::MutantStatus::NoCoverage`] without reading the source
-/// file. Covered mutants have their source read (once per unique file,
-/// cached in a [`HashMap`]) and are executed via
-/// [`runner::SubprocessRunner`].
-///
-/// Returns the collected results and a boolean indicating whether the run
-/// was cancelled by a signal. When cancelled, the results contain only the
-/// mutants processed before the signal was received.
+/// When `coverage_from` is set, loads from the user-provided file.
+/// When `coverage_cache` is enabled and the cache is fresh, loads from
+/// the cached `.coverage.json`. Otherwise, runs a full collection via
+/// pytest.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] if a source file cannot be read.
+/// Returns [`Error::Coverage`] if the selected coverage source fails.
+fn resolve_coverage(
+    config: &config::FestConfig,
+    project_dir: &Path,
+) -> Result<coverage::CoverageMap, Error> {
+    if let Some(path) = config.coverage_from.as_ref() {
+        return coverage::load_coverage_from(path, project_dir);
+    }
+    if config.coverage_cache && coverage::is_coverage_cache_fresh(project_dir) {
+        return coverage::load_cached_coverage(project_dir);
+    }
+    coverage::collect_coverage(project_dir, &config.source, config.fast_coverage)
+}
+
+/// Run all mutants in parallel and collect their results.
+///
+/// The execution proceeds in three phases:
+///
+/// **Phase A — Pre-read source files.** Scans the mutants and coverage map
+/// to find which files have at least one covered mutant, then reads them
+/// into a `HashMap<PathBuf, String>` so that the parallel phase can share
+/// the cache via a plain `&HashMap` (no locks needed).
+///
+/// **Phase B — Parallel execution.** Builds a scoped rayon thread pool
+/// sized to [`config::FestConfig::resolved_workers`] and maps over the
+/// mutants with `par_iter`. Each task checks for cancellation, looks up
+/// coverage, and either marks the mutant as `NoCoverage` or runs the test
+/// suite via [`runner::SubprocessRunner`].
+///
+/// **Phase C — Collect.** Filters out `None` results (from cancelled
+/// tasks) and detects whether any cancellation occurred.
+///
+/// Returns the collected results and a boolean indicating whether the run
+/// was cancelled by a signal.
+///
+/// # Errors
+///
+/// Returns [`Error`] if a source file cannot be read or the thread pool
+/// fails to build.
 fn run_mutants(
     mutants: &[mutation::Mutant],
     coverage_map: &coverage::CoverageMap,
@@ -191,69 +226,104 @@ fn run_mutants(
 ) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
     // TODO: add runner selection config to choose between SubprocessRunner and PytestPluginRunner.
     let runner = runner::SubprocessRunner::new(config.timeout);
-
-    let mut source_cache: HashMap<PathBuf, String> = HashMap::new();
-    let mut results: Vec<mutation::MutantResult> = Vec::with_capacity(mutants.len());
     let total = mutants.len();
 
-    for (index, mutant) in mutants.iter().enumerate() {
-        // Check for cancellation between mutants.
-        if ctx.cancel.is_cancelled() {
-            return Ok((results, true));
-        }
+    // Phase A: Pre-read source files that have at least one covered mutant.
+    let source_cache = build_source_cache(mutants, coverage_map)?;
 
-        // Look up coverage for this mutant's file and line.
-        let coverage_key = (mutant.file_path.clone(), mutant.line);
-        let covering_tests = coverage_map.get(&coverage_key);
+    // Phase B: Parallel execution via rayon.
+    let num_workers = config.resolved_workers();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build()
+        .map_err(|err| Error::Runner(format!("failed to build thread pool: {err}")))?;
 
-        let result = match covering_tests {
-            Some(tests) if !tests.is_empty() => {
-                // Only read the source file when we actually need to run the mutant.
-                let source = read_source_cached(&mut source_cache, &mutant.file_path)?;
-                ctx.runtime
-                    .block_on(runner.run_mutant(mutant, source, tests))?
-            }
-            _ => mutation::MutantResult {
-                mutant: mutant.clone(),
-                status: mutation::MutantStatus::NoCoverage,
-                tests_run: Vec::new(),
-                duration: core::time::Duration::from_secs(0_u64),
-            },
-        };
+    let completed = AtomicUsize::new(0_usize);
+    let was_cancelled = AtomicBool::new(false);
 
-        ctx.progress.report_mutant(index, total, &result);
-        results.push(result);
-    }
+    let parallel_output: Result<Vec<Option<mutation::MutantResult>>, Error> = pool.install(|| {
+        mutants
+            .par_iter()
+            .map(|mutant| {
+                // Check for cancellation.
+                if ctx.cancel.is_cancelled() {
+                    was_cancelled.store(true, Ordering::Relaxed);
+                    return Ok(None);
+                }
 
-    Ok((results, false))
+                // Look up coverage for this mutant's file and line.
+                let coverage_key = (mutant.file_path.clone(), mutant.line);
+                let covering_tests = coverage_map.get(&coverage_key);
+
+                let result = match covering_tests {
+                    Some(tests) if !tests.is_empty() => {
+                        let source = source_cache
+                            .get(&mutant.file_path)
+                            .map(String::as_str)
+                            .ok_or_else(|| {
+                                Error::Mutation(format!(
+                                    "source cache missing for covered file {}",
+                                    mutant.file_path.display()
+                                ))
+                            })?;
+                        ctx.runtime
+                            .block_on(runner.run_mutant(mutant, source, tests))?
+                    }
+                    _ => mutation::MutantResult {
+                        mutant: mutant.clone(),
+                        status: mutation::MutantStatus::NoCoverage,
+                        tests_run: Vec::new(),
+                        duration: core::time::Duration::from_secs(0_u64),
+                    },
+                };
+
+                let index = completed.fetch_add(1_usize, Ordering::Relaxed);
+                ctx.progress.report_mutant(index, total, &result);
+                Ok(Some(result))
+            })
+            .collect()
+    });
+
+    // Phase C: Collect results, filtering out None (cancelled) entries.
+    let results: Vec<mutation::MutantResult> = parallel_output?.into_iter().flatten().collect();
+    let cancelled = was_cancelled.load(Ordering::Relaxed);
+
+    Ok((results, cancelled))
 }
 
-/// Read a source file, caching its contents for subsequent lookups.
+/// Pre-read source files that have at least one covered mutant.
 ///
-/// If the file has already been read, returns a reference to the cached
-/// content. Otherwise reads the file, inserts it into `cache`, and
-/// returns a reference.
+/// Scans all mutants and checks whether their file + line appears in the
+/// coverage map with a non-empty test list. Files that match are read into
+/// the returned cache so the parallel phase can share the data lock-free.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Mutation`] if the file cannot be read.
-fn read_source_cached<'cache>(
-    cache: &'cache mut HashMap<PathBuf, String>,
-    path: &Path,
-) -> Result<&'cache str, Error> {
-    if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(path.to_path_buf()) {
-        let content = std::fs::read_to_string(path).map_err(|err| {
-            Error::Mutation(format!(
-                "failed to read source file {}: {err}",
-                path.display()
-            ))
-        })?;
-        let _inserted = entry.insert(content);
+/// Returns [`Error::Mutation`] if a source file cannot be read.
+fn build_source_cache(
+    mutants: &[mutation::Mutant],
+    coverage_map: &coverage::CoverageMap,
+) -> Result<HashMap<PathBuf, String>, Error> {
+    let mut cache = HashMap::new();
+    for mutant in mutants {
+        if cache.contains_key(&mutant.file_path) {
+            continue;
+        }
+        let key = (mutant.file_path.clone(), mutant.line);
+        let needs_source = coverage_map
+            .get(&key)
+            .is_some_and(|tests| !tests.is_empty());
+        if needs_source {
+            let content = std::fs::read_to_string(&mutant.file_path).map_err(|err| {
+                Error::Mutation(format!(
+                    "failed to read source file {}: {err}",
+                    mutant.file_path.display()
+                ))
+            })?;
+            let _prev = cache.insert(mutant.file_path.clone(), content);
+        }
     }
-    cache
-        .get(path)
-        .map(String::as_str)
-        .ok_or_else(|| Error::Mutation("source cache lookup failed unexpectedly".to_owned()))
+    Ok(cache)
 }
 
 /// Write the formatted report to stdout.
@@ -319,6 +389,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: Some(PathBuf::from("/home/user/project/fest.toml")),
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -338,6 +411,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -359,6 +435,9 @@ mod tests {
             fail_under: None,
             output: None,
             config: Some(PathBuf::from("fest.toml")),
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -373,32 +452,74 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// `read_source_cached` reads a file and caches it.
+    /// `build_source_cache` reads covered files into the cache.
     #[test]
-    fn read_source_cached_reads_and_caches() {
+    fn build_source_cache_reads_covered_files() {
         let dir = tempfile::tempdir().expect("should create temp dir");
         let py_file = dir.path().join("cached.py");
         std::fs::write(&py_file, "x = 1 + 2\n").expect("write file");
 
-        let mut cache: HashMap<PathBuf, String> = HashMap::new();
+        let mutant = mutation::Mutant {
+            file_path: py_file.clone(),
+            line: 1_u32,
+            column: 5_u32,
+            byte_offset: 4_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
 
-        let content = read_source_cached(&mut cache, &py_file).expect("should read");
-        assert_eq!(content, "x = 1 + 2\n");
+        let mut coverage_map = coverage::CoverageMap::new();
+        let _prev = coverage_map.insert(
+            (py_file.clone(), 1_u32),
+            vec!["test_app.py::test_it".to_owned()],
+        );
 
-        // Should be cached now.
-        assert!(cache.contains_key(&py_file));
-
-        // Second read should return the same content from cache.
-        let content2 = read_source_cached(&mut cache, &py_file).expect("should read from cache");
-        assert_eq!(content2, "x = 1 + 2\n");
+        let cache = build_source_cache(&[mutant], &coverage_map).expect("should build");
+        assert_eq!(cache.get(&py_file).map(String::as_str), Some("x = 1 + 2\n"));
     }
 
-    /// `read_source_cached` returns an error for a non-existent file.
+    /// `build_source_cache` skips files with no coverage.
     #[test]
-    fn read_source_cached_missing_file_errors() {
-        let mut cache: HashMap<PathBuf, String> = HashMap::new();
-        let path = PathBuf::from("/nonexistent/path/missing.py");
-        let result = read_source_cached(&mut cache, &path);
+    fn build_source_cache_skips_uncovered() {
+        let mutant = mutation::Mutant {
+            file_path: PathBuf::from("src/app.py"),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
+
+        let coverage_map = coverage::CoverageMap::new();
+        let cache = build_source_cache(&[mutant], &coverage_map).expect("should build");
+        assert!(cache.is_empty());
+    }
+
+    /// `build_source_cache` returns an error for a non-existent file.
+    #[test]
+    fn build_source_cache_missing_file_errors() {
+        let mutant = mutation::Mutant {
+            file_path: PathBuf::from("/nonexistent/path/missing.py"),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        };
+
+        let mut coverage_map = coverage::CoverageMap::new();
+        let _prev = coverage_map.insert(
+            (PathBuf::from("/nonexistent/path/missing.py"), 1_u32),
+            vec!["test.py::test_x".to_owned()],
+        );
+
+        let result = build_source_cache(&[mutant], &coverage_map);
         assert!(result.is_err());
     }
 
@@ -538,7 +659,49 @@ mod tests {
                 .expect("should succeed");
 
         assert!(cancelled);
-        // Should have 0 results since cancellation is checked at loop top.
+        // Should have 0 results since cancellation is checked before each mutant.
         assert!(results.is_empty());
+    }
+
+    /// Parallel execution preserves input order of mutant results.
+    #[test]
+    fn run_mutants_parallel_preserves_order() {
+        let mutants: Vec<mutation::Mutant> = (0_u32..20_u32)
+            .map(|idx| mutation::Mutant {
+                file_path: PathBuf::from(format!("src/mod_{idx}.py")),
+                line: idx + 1_u32,
+                column: 1_u32,
+                byte_offset: 0_usize,
+                byte_length: 1_usize,
+                original_text: "+".to_owned(),
+                mutated_text: "-".to_owned(),
+                mutator_name: "arithmetic_op".to_owned(),
+            })
+            .collect();
+
+        let coverage_map = coverage::CoverageMap::new();
+        let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
+
+        let (results, cancelled) =
+            run_mutants(&mutants, &coverage_map, &config, &test_ctx.as_ctx())
+                .expect("should succeed");
+
+        assert!(!cancelled);
+        assert_eq!(results.len(), 20_usize);
+
+        // Results must preserve the original mutant order.
+        for (idx, result) in results.iter().enumerate() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "idx is at most 19, fits in u32"
+            )]
+            let expected_line = (idx as u32) + 1_u32;
+            assert_eq!(
+                result.mutant.line, expected_line,
+                "result at index {idx} has wrong line"
+            );
+            assert_eq!(result.status, mutation::MutantStatus::NoCoverage);
+        }
     }
 }

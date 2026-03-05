@@ -4,6 +4,8 @@
 //! mutation-testing run. They can be deserialized from `fest.toml` or from the
 //! `[tool.fest]` section of `pyproject.toml`.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Output format for the mutation-testing report.
@@ -139,6 +141,15 @@ pub struct FestConfig {
     /// Mutator configuration.
     #[serde(default)]
     pub mutators: MutatorConfig,
+    /// Reuse cached `.coverage.json` when all `.py` files are older.
+    #[serde(default = "default_true")]
+    pub coverage_cache: bool,
+    /// Path to a user-provided `.coverage` or `.coverage.json` file.
+    #[serde(default)]
+    pub coverage_from: Option<PathBuf>,
+    /// Force the fastest C-based coverage tracer (`COVERAGE_CORE=ctrace`).
+    #[serde(default = "default_true")]
+    pub fast_coverage: bool,
 }
 
 impl Default for FestConfig {
@@ -154,6 +165,9 @@ impl Default for FestConfig {
             fail_under: None,
             output: OutputFormat::default(),
             mutators: MutatorConfig::default(),
+            coverage_cache: true,
+            coverage_from: None,
+            fast_coverage: true,
         }
     }
 }
