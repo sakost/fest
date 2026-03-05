@@ -16,7 +16,7 @@ fest generates small changes (mutants) to your Python source code and checks whe
 
 - **Rust 1.93+** (only for building from source)
 - **Python 3** with:
-  - [pytest](https://docs.pytest.org/)
+  - [pytest](https://docs.pytest.org/) >= 7.0
   - [pytest-cov](https://pytest-cov.readthedocs.io/)
 
 ## Installation

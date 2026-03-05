@@ -40,10 +40,10 @@ mod tests {
         assert!(FEST_PLUGIN_SOURCE.contains("def pytest_addoption"));
     }
 
-    /// The embedded plugin source contains the session start hook.
+    /// The embedded plugin source contains the runtestloop hook.
     #[test]
-    fn plugin_source_contains_session_start_hook() {
-        assert!(FEST_PLUGIN_SOURCE.contains("def pytest_sessionstart"));
+    fn plugin_source_contains_runtestloop_hook() {
+        assert!(FEST_PLUGIN_SOURCE.contains("def pytest_runtestloop"));
     }
 
     /// The embedded plugin source contains the fest-socket option.

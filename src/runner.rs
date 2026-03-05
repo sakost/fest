@@ -18,6 +18,7 @@ pub mod pytest_plugin;
 pub mod subprocess;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
 
 pub use pytest_plugin::PytestPluginRunner;
 pub use subprocess::SubprocessRunner;
@@ -36,6 +37,41 @@ use crate::{
 ///
 /// The trait uses native async fn in trait (stable since Rust 1.75).
 pub trait Runner: Send + Sync {
+    /// Initialise the runner with the given number of parallel workers.
+    ///
+    /// Called once before the mutant execution loop begins.  Backends
+    /// that maintain persistent worker processes should spawn them here.
+    ///
+    /// The default implementation is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] if initialisation fails.
+    #[inline]
+    fn start(
+        &self,
+        _num_workers: usize,
+        _project_dir: &Path,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Shut down the runner and release any resources.
+    ///
+    /// Called once after the mutant execution loop completes.  Backends
+    /// that maintain persistent worker processes should terminate them
+    /// here.
+    ///
+    /// The default implementation is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] if shutdown fails.
+    #[inline]
+    fn stop(&self) -> impl Future<Output = Result<(), Error>> + Send {
+        async { Ok(()) }
+    }
+
     /// Run the test suite against a single mutant.
     ///
     /// # Parameters
@@ -73,7 +109,7 @@ const PYTHON_PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 /// `PYTHONPATH` so that the mutated file (or plugin) takes import
 /// priority. This shared helper keeps that logic in one place.
 #[inline]
-pub(crate) fn build_python_path(dir: &std::path::Path) -> String {
+pub(crate) fn build_python_path(dir: &Path) -> String {
     let dir_str = dir.display().to_string();
 
     match std::env::var("PYTHONPATH") {
@@ -109,6 +145,67 @@ pub enum AnyRunner {
 }
 
 impl AnyRunner {
+    /// Initialise the runner backend.
+    ///
+    /// For the plugin variant, spawns persistent worker processes.  On
+    /// failure, sets the `plugin_failed` flag so that subsequent
+    /// [`run_mutant`](Self::run_mutant) calls fall back to subprocess.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] only for the subprocess variant; the
+    /// plugin variant absorbs the error and falls back silently.
+    #[inline]
+    pub async fn start(&self, num_workers: usize, project_dir: &Path) -> Result<(), Error> {
+        #[allow(
+            clippy::pattern_type_mismatch,
+            reason = "matching on &AnyRunner requires pattern_type_mismatch suppression"
+        )]
+        match self {
+            Self::Subprocess(runner) => runner.start(num_workers, project_dir).await,
+            Self::Plugin {
+                plugin,
+                plugin_failed,
+                ..
+            } => {
+                if let Err(err) = plugin.start(num_workers, project_dir).await {
+                    let first = !plugin_failed.swap(true, Ordering::Relaxed);
+                    if first {
+                        let mut stderr = std::io::stderr().lock();
+                        let _result = std::io::Write::write_all(
+                            &mut stderr,
+                            format!(
+                                "fest: plugin runner failed to start ({err}), falling back to \
+                                 subprocess\n"
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Shut down the runner backend.
+    ///
+    /// For the plugin variant, terminates persistent worker processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] if shutdown fails.
+    #[inline]
+    pub async fn stop(&self) -> Result<(), Error> {
+        #[allow(
+            clippy::pattern_type_mismatch,
+            reason = "matching on &AnyRunner requires pattern_type_mismatch suppression"
+        )]
+        match self {
+            Self::Subprocess(runner) => runner.stop().await,
+            Self::Plugin { plugin, .. } => plugin.stop().await,
+        }
+    }
+
     /// Run the test suite against a single mutant, dispatching to the
     /// underlying backend.
     ///
@@ -209,5 +306,40 @@ mod tests {
         } else {
             panic!("expected AnyRunner::Plugin");
         }
+    }
+
+    /// `AnyRunner::start` on subprocess variant is a no-op that succeeds.
+    #[tokio::test]
+    async fn any_runner_start_subprocess() {
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        let result = runner.start(4_usize, Path::new(".")).await;
+        assert!(result.is_ok());
+    }
+
+    /// `AnyRunner::stop` on subprocess variant is a no-op that succeeds.
+    #[tokio::test]
+    async fn any_runner_stop_subprocess() {
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        let result = runner.stop().await;
+        assert!(result.is_ok());
+    }
+
+    /// `AnyRunner::start` on plugin variant absorbs errors and sets
+    /// `plugin_failed`.
+    #[tokio::test]
+    async fn any_runner_start_plugin_absorbs_error() {
+        // Using timeout=0 so the worker spawn will likely fail/timeout.
+        let runner = build_runner(&RunnerBackend::Plugin, 0_u64);
+        // start should not return Err -- it absorbs plugin errors.
+        let result = runner.start(1_usize, Path::new(".")).await;
+        assert!(result.is_ok());
+    }
+
+    /// `AnyRunner::stop` on plugin variant succeeds even without start.
+    #[tokio::test]
+    async fn any_runner_stop_plugin_without_start() {
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        let result = runner.stop().await;
+        assert!(result.is_ok());
     }
 }

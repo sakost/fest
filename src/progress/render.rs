@@ -133,6 +133,7 @@ impl RenderState {
         if let Ok(styled) = template {
             pb.set_style(styled.progress_chars("#>-"));
         }
+        pb.enable_steady_tick(Duration::from_millis(80));
         self.bar = Some(pb);
     }
 

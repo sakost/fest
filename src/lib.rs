@@ -80,7 +80,8 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     signal::install_signal_handlers(&runtime, &cancel)?;
 
     // Run preparation phases (config, discovery, coverage).
-    let (config, mutants, coverage_map, files_scanned) = run_preparation_phases(&args, &reporter)?;
+    let (config, mutants, coverage_map, files_scanned, project_dir) =
+        run_preparation_phases(&args, &reporter)?;
 
     // Run mutants against the test suite.
     let total_u64 = u64::try_from(mutants.len()).unwrap_or(u64::MAX);
@@ -94,7 +95,8 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     };
     let mutants_generated = mutants.len();
     let start = std::time::Instant::now();
-    let (results, was_cancelled) = run_mutants(&mutants, &coverage_map, &config, &ctx)?;
+    let (results, was_cancelled) =
+        run_mutants(&mutants, &coverage_map, &config, &ctx, &project_dir)?;
     let duration = start.elapsed();
     reporter.finish_mutants(was_cancelled);
 
@@ -141,6 +143,7 @@ fn run_preparation_phases(
         Vec<mutation::Mutant>,
         coverage::CoverageMap,
         usize,
+        PathBuf,
     ),
     Error,
 > {
@@ -190,7 +193,7 @@ fn run_preparation_phases(
     let coverage_map = resolve_coverage(&config, &project_dir)?;
     reporter.phase_complete("Coverage collected", None, t4.elapsed());
 
-    Ok((config, mutants, coverage_map, files_scanned))
+    Ok((config, mutants, coverage_map, files_scanned, project_dir))
 }
 
 /// Send the summary scoreboard event to the render task.
@@ -313,6 +316,7 @@ fn run_mutants(
     coverage_map: &coverage::CoverageMap,
     config: &config::FestConfig,
     ctx: &RunContext<'_>,
+    project_dir: &Path,
 ) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
     let runner = runner::build_runner(&config.backend, config.timeout);
     let total = mutants.len();
@@ -322,6 +326,11 @@ fn run_mutants(
 
     // Phase B: Parallel execution via rayon.
     let num_workers = config.resolved_workers();
+
+    // Start the runner (spawns persistent workers for the plugin backend).
+    ctx.runtime
+        .block_on(runner.start(num_workers, project_dir))?;
+
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_workers)
         .build()
@@ -372,6 +381,9 @@ fn run_mutants(
             })
             .collect()
     });
+
+    // Stop the runner (shuts down persistent workers).
+    let _stop = ctx.runtime.block_on(runner.stop());
 
     // Phase C: Collect results, filtering out None (cancelled) entries.
     let results: Vec<mutation::MutantResult> = parallel_output?.into_iter().flatten().collect();
@@ -610,9 +622,14 @@ mod tests {
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
-        let (results, cancelled) =
-            run_mutants(&[test_mutant()], &coverage_map, &config, &test_ctx.as_ctx())
-                .expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &[test_mutant()],
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
@@ -640,9 +657,14 @@ mod tests {
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
-        let (results, cancelled) =
-            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
-                .expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &[mutant],
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
@@ -660,9 +682,14 @@ mod tests {
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
-        let (results, cancelled) =
-            run_mutants(&[test_mutant()], &coverage_map, &config, &test_ctx.as_ctx())
-                .expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &[test_mutant()],
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
@@ -676,8 +703,14 @@ mod tests {
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
-        let (results, cancelled) =
-            run_mutants(&[], &coverage_map, &config, &test_ctx.as_ctx()).expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &[],
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(!cancelled);
         assert!(results.is_empty());
@@ -700,9 +733,14 @@ mod tests {
         // Pre-cancel before running.
         test_ctx.cancel.set_cancelled_for_test();
 
-        let (results, cancelled) =
-            run_mutants(&mutants, &coverage_map, &config, &test_ctx.as_ctx())
-                .expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &mutants,
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(cancelled);
         // Should have 0 results since cancellation is checked before each mutant.
@@ -724,9 +762,14 @@ mod tests {
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
-        let (results, cancelled) =
-            run_mutants(&mutants, &coverage_map, &config, &test_ctx.as_ctx())
-                .expect("should succeed");
+        let (results, cancelled) = run_mutants(
+            &mutants,
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            Path::new("."),
+        )
+        .expect("should succeed");
 
         assert!(!cancelled);
         assert_eq!(results.len(), 20_usize);

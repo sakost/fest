@@ -6,11 +6,14 @@ and expects a ``--fest-socket`` CLI option pointing to the Unix domain
 socket that the fest process is listening on.
 
 Protocol (JSON-over-newline):
+    plugin ->  fest:   {"type": "ready", "tests": ["nodeid", ...]}
     fest  ->  plugin:  {"type": "mutant", "file": "...", "module": "...",
                         "mutated_source": "...", "tests": ["..."]}
     plugin ->  fest:   {"type": "result", "status": "killed"|"survived"|"error",
                         "error_message": "..."}
     fest  ->  plugin:  {"type": "shutdown"}
+
+Requires pytest >= 7.0.
 """
 
 from __future__ import annotations
@@ -32,11 +35,21 @@ def pytest_addoption(parser: Any) -> None:
     )
 
 
-def pytest_sessionstart(session: Any) -> None:
-    """Connect to the fest socket and enter the mutant-execution loop."""
+def pytest_runtestloop(session: Any) -> bool:
+    """Run the fest event loop after collection, replacing the default test loop.
+
+    Returns ``True`` to tell pytest we handled test execution ourselves.
+    """
     socket_path: str | None = session.config.getoption("fest_socket")
     if socket_path is None:
-        return
+        return False
+
+    _check_pytest_version()
+
+    # Build nodeid -> Item index from collected items.
+    item_index: dict[str, Any] = {}
+    for item in session.items:
+        item_index[item.nodeid] = item
 
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -44,10 +57,12 @@ def pytest_sessionstart(session: Any) -> None:
     except OSError as exc:
         print(f"fest: connect failed: {exc}", file=sys.stderr)
         conn.close()
-        return
+        return True
 
-    conn.settimeout(60.0)
-    _send(conn, {"type": "ready"})
+    # Use a generous timeout; the Rust side enforces per-mutant timeouts.
+    conn.settimeout(None)
+    test_ids = [item.nodeid for item in session.items]
+    _send(conn, {"type": "ready", "tests": test_ids})
 
     buf = b""
     while True:
@@ -75,9 +90,9 @@ def pytest_sessionstart(session: Any) -> None:
             msg_type = msg.get("type", "")
             if msg_type == "shutdown":
                 conn.close()
-                return
+                return True
             if msg_type == "mutant":
-                result = _handle_mutant(session, msg)
+                result = _handle_mutant(session, msg, item_index)
                 _send(conn, result)
             else:
                 _send(
@@ -90,9 +105,29 @@ def pytest_sessionstart(session: Any) -> None:
                 )
 
     conn.close()
+    return True
 
 
-def _handle_mutant(session: Any, msg: dict[str, Any]) -> dict[str, Any]:
+def _check_pytest_version() -> None:
+    """Verify that the pytest version is supported (>= 7.0).
+
+    Raises ``RuntimeError`` if the version is outside the supported range,
+    which causes the connection to fail and triggers the Rust-side subprocess
+    fallback.
+    """
+    import pytest  # noqa: PLC0415
+
+    version = tuple(int(x) for x in pytest.__version__.split(".")[:2])
+    if version < (7, 0):
+        raise RuntimeError(
+            f"fest: unsupported pytest version {pytest.__version__} "
+            f"(requires >= 7.0)"
+        )
+
+
+def _handle_mutant(
+    session: Any, msg: dict[str, Any], item_index: dict[str, Any]
+) -> dict[str, Any]:
     """Apply a mutation, run the relevant tests, restore, and return a result."""
     file_path: str = msg.get("file", "")
     module_name: str = msg.get("module", "")
@@ -124,7 +159,7 @@ def _handle_mutant(session: Any, msg: dict[str, Any]) -> dict[str, Any]:
             sys.modules[module_name] = mod
             _exec_code(code, vars(mod))
 
-        status = _run_tests(session, test_ids)
+        status = _run_tests(session, test_ids, item_index)
         return {"type": "result", "status": status}
     except Exception as exc:  # noqa: BLE001
         return {
@@ -152,16 +187,29 @@ def _exec_code(code: types.CodeType, namespace: dict[str, Any]) -> None:
     exec(code, glob)  # noqa: S102  -- required for mutation testing
 
 
-def _run_tests(session: Any, test_ids: list[str]) -> str:
-    """Run the given tests and return ``'killed'`` or ``'survived'``."""
-    import pytest  # noqa: PLC0415
+def _run_tests(
+    session: Any, test_ids: list[str], item_index: dict[str, Any]
+) -> str:
+    """Run the given tests via ``runtestprotocol`` and return ``'killed'`` or ``'survived'``."""
+    from _pytest.runner import runtestprotocol  # noqa: PLC0415
 
-    args = ["-x", "--no-header", "-q", "--tb=no"] + test_ids
-    exit_code = pytest.main(args, plugins=[])
+    items = []
+    for nodeid in test_ids:
+        item = item_index.get(nodeid)
+        if item is not None:
+            items.append(item)
 
-    if exit_code == 0:
+    if not items:
         return "survived"
-    return "killed"
+
+    for idx, item in enumerate(items):
+        nextitem = items[idx + 1] if idx + 1 < len(items) else None
+        reports = runtestprotocol(item, log=False, nextitem=nextitem)
+        for report in reports:
+            if report.when in ("setup", "call") and report.failed:
+                return "killed"
+
+    return "survived"
 
 
 def _file_to_module(file_path: str) -> str:
