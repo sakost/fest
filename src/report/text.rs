@@ -10,34 +10,45 @@ use crate::mutation::MutantStatus;
 
 /// Format a [`MutationReport`] as a plain-text summary string.
 ///
-/// The output includes a header, aggregate statistics, and a listing of
-/// any mutants that survived (i.e. were not detected by the test suite).
+/// When `colored` is true, ANSI escape codes are used to highlight the
+/// header, score, and survived-mutant listing.
 ///
 /// # Errors
 ///
 /// Returns [`crate::Error::Report`] if string formatting fails.
 #[inline]
-pub fn format_text(report: &MutationReport) -> Result<String, crate::Error> {
+pub fn format_text(report: &MutationReport, colored: bool) -> Result<String, crate::Error> {
     let mut output = String::new();
 
-    write_header(&mut output)?;
-    write_statistics(report, &mut output)?;
-    write_survived_mutants(report, &mut output)?;
+    write_header(&mut output, colored)?;
+    write_statistics(report, &mut output, colored)?;
+    write_survived_mutants(report, &mut output, colored)?;
 
     Ok(output)
 }
 
 /// Write the report header.
-fn write_header(output: &mut String) -> Result<(), crate::Error> {
-    writeln!(output, "fest mutation testing report")
-        .map_err(|err| crate::Error::Report(format!("failed to format report header: {err}")))?;
+fn write_header(output: &mut String, colored: bool) -> Result<(), crate::Error> {
+    if colored {
+        let title = console::style("fest mutation testing report")
+            .bold()
+            .force_styling(true);
+        writeln!(output, "{title}")
+    } else {
+        writeln!(output, "fest mutation testing report")
+    }
+    .map_err(|err| crate::Error::Report(format!("failed to format report header: {err}")))?;
     writeln!(output, "----------------------------")
         .map_err(|err| crate::Error::Report(format!("failed to format report header: {err}")))?;
     Ok(())
 }
 
 /// Write aggregate statistics.
-fn write_statistics(report: &MutationReport, output: &mut String) -> Result<(), crate::Error> {
+fn write_statistics(
+    report: &MutationReport,
+    output: &mut String,
+    colored: bool,
+) -> Result<(), crate::Error> {
     let score = report.mutation_score();
 
     writeln!(output, "Files scanned:      {}", report.files_scanned)
@@ -57,8 +68,8 @@ fn write_statistics(report: &MutationReport, output: &mut String) -> Result<(), 
             .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
     }
 
-    write_score_line("Killed:", report.killed, score, output)?;
-    write_survived_line(report, output)?;
+    write_score_line("Killed:", report.killed, score, output, colored)?;
+    write_survived_line(report, output, colored)?;
 
     writeln!(output, "Timeout:            {}", report.timeouts)
         .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
@@ -74,14 +85,25 @@ fn write_score_line(
     count: usize,
     score: f64,
     output: &mut String,
+    colored: bool,
 ) -> Result<(), crate::Error> {
-    writeln!(output, "{label:<20}{count}  ({score:.1}%)")
-        .map_err(|err| crate::Error::Report(format!("failed to format score line: {err}")))?;
+    if colored {
+        let score_str = format!("{score:.1}%");
+        let styled = crate::progress::styled_score(&score_str, score, true);
+        writeln!(output, "{label:<20}{count}  ({styled})")
+    } else {
+        writeln!(output, "{label:<20}{count}  ({score:.1}%)")
+    }
+    .map_err(|err| crate::Error::Report(format!("failed to format score line: {err}")))?;
     Ok(())
 }
 
 /// Write the "Survived" line with the complement percentage.
-fn write_survived_line(report: &MutationReport, output: &mut String) -> Result<(), crate::Error> {
+fn write_survived_line(
+    report: &MutationReport,
+    output: &mut String,
+    colored: bool,
+) -> Result<(), crate::Error> {
     let survived_pct = if report.mutants_tested == 0 {
         0.0_f64
     } else {
@@ -92,11 +114,20 @@ fn write_survived_line(report: &MutationReport, output: &mut String) -> Result<(
         let pct = (report.survived as f64) / (report.mutants_tested as f64) * 100.0_f64;
         pct
     };
-    writeln!(
-        output,
-        "{:<20}{}  ({:.1}%)",
-        "Survived:", report.survived, survived_pct
-    )
+    if colored && report.survived > 0 {
+        let label = console::style("Survived:").red().bold().force_styling(true);
+        writeln!(
+            output,
+            "{label:<28}{}  ({survived_pct:.1}%)",
+            report.survived
+        )
+    } else {
+        writeln!(
+            output,
+            "{:<20}{}  ({survived_pct:.1}%)",
+            "Survived:", report.survived
+        )
+    }
     .map_err(|err| crate::Error::Report(format!("failed to format survived line: {err}")))?;
     Ok(())
 }
@@ -105,6 +136,7 @@ fn write_survived_line(report: &MutationReport, output: &mut String) -> Result<(
 fn write_survived_mutants(
     report: &MutationReport,
     output: &mut String,
+    colored: bool,
 ) -> Result<(), crate::Error> {
     let survived: Vec<_> = report
         .results
@@ -123,15 +155,30 @@ fn write_survived_mutants(
 
     for result in survived {
         let mutant = &result.mutant;
-        writeln!(
-            output,
-            "  {}:{}    {}    `{}` -> `{}`",
-            mutant.file_path.display(),
-            mutant.line,
-            mutant.mutator_name,
-            mutant.original_text,
-            mutant.mutated_text,
-        )
+        if colored {
+            let location =
+                console::style(format!("{}:{}", mutant.file_path.display(), mutant.line))
+                    .cyan()
+                    .force_styling(true);
+            let mutator = console::style(&mutant.mutator_name)
+                .dim()
+                .force_styling(true);
+            writeln!(
+                output,
+                "  {location}    {mutator}    `{}` -> `{}`",
+                mutant.original_text, mutant.mutated_text,
+            )
+        } else {
+            writeln!(
+                output,
+                "  {}:{}    {}    `{}` -> `{}`",
+                mutant.file_path.display(),
+                mutant.line,
+                mutant.mutator_name,
+                mutant.original_text,
+                mutant.mutated_text,
+            )
+        }
         .map_err(|err| crate::Error::Report(format!("failed to format survived mutant: {err}")))?;
     }
 

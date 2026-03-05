@@ -18,6 +18,9 @@ use crate::{Error, config::OutputFormat};
 
 /// Format a mutation report in the given output format.
 ///
+/// When `colored` is true **and** the format supports it (currently only
+/// [`OutputFormat::Text`]), ANSI colors are used to highlight the output.
+///
 /// Returns the formatted report as a [`String`]. The caller decides where
 /// to write the output (stdout, file, etc.).
 ///
@@ -26,9 +29,13 @@ use crate::{Error, config::OutputFormat};
 /// Returns [`Error::Report`] if formatting or serialization fails.
 /// Returns [`Error::Report`] if the requested format is not yet implemented.
 #[inline]
-pub fn format_report(report: &MutationReport, format: &OutputFormat) -> Result<String, Error> {
+pub fn format_report(
+    report: &MutationReport,
+    format: &OutputFormat,
+    colored: bool,
+) -> Result<String, Error> {
     match *format {
-        OutputFormat::Text => text::format_text(report),
+        OutputFormat::Text => text::format_text(report, colored),
         OutputFormat::Json => json::format_json(report),
         OutputFormat::Html => html::format_html(report),
     }
@@ -259,7 +266,7 @@ mod tests {
     fn text_report_contains_header() {
         let report =
             MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
-        let output = text::format_text(&report).expect("should format text");
+        let output = text::format_text(&report, false).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
         assert!(output.contains("----------------------------"));
     }
@@ -285,7 +292,7 @@ mod tests {
         ];
         let report =
             MutationReport::from_results(results, 12_usize, 347_usize, Duration::from_secs(30_u64));
-        let output = text::format_text(&report).expect("should format text");
+        let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("Files scanned:"));
         assert!(output.contains("12"));
@@ -304,7 +311,7 @@ mod tests {
         )];
         let report =
             MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
-        let output = text::format_text(&report).expect("should format text");
+        let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("Survived mutants:"));
         assert!(output.contains("src/parser.py:42"));
@@ -321,7 +328,7 @@ mod tests {
         )];
         let report =
             MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
-        let output = text::format_text(&report).expect("should format text");
+        let output = text::format_text(&report, false).expect("should format text");
 
         assert!(!output.contains("Survived mutants:"));
     }
@@ -341,7 +348,7 @@ mod tests {
         ];
         let report =
             MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
-        let output = text::format_text(&report).expect("should format text");
+        let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("no coverage"));
     }
@@ -426,7 +433,8 @@ mod tests {
     fn format_report_text() {
         let report =
             MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
-        let output = format_report(&report, &OutputFormat::Text).expect("should format text");
+        let output =
+            format_report(&report, &OutputFormat::Text, false).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
     }
 
@@ -435,7 +443,8 @@ mod tests {
     fn format_report_json() {
         let report =
             MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
-        let output = format_report(&report, &OutputFormat::Json).expect("should format JSON");
+        let output =
+            format_report(&report, &OutputFormat::Json, false).expect("should format JSON");
         let _value: serde_json::Value =
             serde_json::from_str(&output).expect("should be valid JSON");
     }
@@ -445,7 +454,8 @@ mod tests {
     fn format_report_html() {
         let report =
             MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
-        let output = format_report(&report, &OutputFormat::Html).expect("should format HTML");
+        let output =
+            format_report(&report, &OutputFormat::Html, false).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
         assert!(output.contains("fest mutation testing report"));
     }

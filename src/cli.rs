@@ -11,6 +11,28 @@ use clap::Parser;
 use crate::config::{FestConfig, OutputFormat, RunnerBackend};
 
 // ---------------------------------------------------------------------------
+// Progress style
+// ---------------------------------------------------------------------------
+
+/// Progress output style for the CLI.
+///
+/// Controls how pipeline progress is displayed on stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ProgressStyle {
+    /// Automatically select fancy on TTY stderr, quiet otherwise.
+    #[default]
+    Auto,
+    /// Rich output: phase animations, progress bar, colored summary.
+    Fancy,
+    /// Uncolored plain-text output with timing (no overwrite, no bar).
+    Plain,
+    /// Colored per-mutant lines and phase checkmarks (no progress bar).
+    Verbose,
+    /// Suppress all stderr progress output.
+    Quiet,
+}
+
+// ---------------------------------------------------------------------------
 // Top-level CLI
 // ---------------------------------------------------------------------------
 
@@ -117,6 +139,15 @@ pub struct RunArgs {
     /// Overrides `backend` in the config file.
     #[arg(short, long)]
     pub backend: Option<RunnerBackend>,
+
+    /// Progress output style: auto, fancy, plain, verbose, quiet.
+    ///
+    /// `auto` selects `fancy` on TTY stderr, `quiet` otherwise.
+    /// `plain` forces uncolored plain-text output.
+    /// `verbose` shows one colored line per mutant.
+    /// `quiet` suppresses all progress output.
+    #[arg(long, default_value = "auto")]
+    pub progress: ProgressStyle,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +184,7 @@ pub fn run_args(args: Args) -> RunArgs {
             coverage_from: None,
             no_fast_coverage: false,
             backend: None,
+            progress: ProgressStyle::Auto,
         },
     }
 }
@@ -209,11 +241,10 @@ pub fn merge_config(args: &RunArgs, mut config: FestConfig) -> FestConfig {
 mod tests {
     use super::*;
 
-    /// When no CLI overrides are given, config is returned unchanged.
-    #[test]
-    fn merge_no_overrides_returns_config_unchanged() {
-        let config = FestConfig::default();
-        let args = RunArgs {
+    /// Build a `RunArgs` with all defaults — override individual fields
+    /// via struct update syntax in each test.
+    fn default_args() -> RunArgs {
+        RunArgs {
             verbose: false,
             source: None,
             exclude: None,
@@ -227,201 +258,108 @@ mod tests {
             coverage_from: None,
             no_fast_coverage: false,
             backend: None,
-        };
+            progress: ProgressStyle::Auto,
+        }
+    }
 
-        let merged = merge_config(&args, config.clone());
+    /// When no CLI overrides are given, config is returned unchanged.
+    #[test]
+    fn merge_no_overrides_returns_config_unchanged() {
+        let config = FestConfig::default();
+        let merged = merge_config(&default_args(), config.clone());
         assert_eq!(merged, config);
     }
 
     /// CLI `--source` replaces the config source list.
     #[test]
     fn merge_source_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
             source: Some(vec!["tests/**/*.py".to_owned()]),
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.source, vec!["tests/**/*.py"]);
     }
 
     /// CLI `--exclude` replaces the config exclude list.
     #[test]
     fn merge_exclude_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
             exclude: Some(vec!["vendor/**".to_owned()]),
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.exclude, vec!["vendor/**"]);
     }
 
     /// CLI `--workers` overrides the config workers field.
     #[test]
     fn merge_workers_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
             workers: Some(16_usize),
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.workers, Some(16_usize));
     }
 
     /// CLI `--workers-cpu-ratio` overrides the config ratio.
     #[test]
     fn merge_workers_cpu_ratio_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
             workers_cpu_ratio: Some(0.5),
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert!((merged.workers_cpu_ratio - 0.5).abs() < f64::EPSILON);
     }
 
     /// CLI `--timeout` overrides the config timeout.
     #[test]
     fn merge_timeout_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
             timeout: Some(120_u64),
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.timeout, 120_u64);
     }
 
     /// CLI `--fail-under` overrides the config fail_under.
     #[test]
     fn merge_fail_under_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
             fail_under: Some(90.0),
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert!((merged.fail_under.unwrap_or(0.0) - 90.0).abs() < f64::EPSILON);
     }
 
     /// CLI `--output` overrides the config output format.
     #[test]
     fn merge_output_override() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
             output: Some(OutputFormat::Json),
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.output, OutputFormat::Json);
     }
 
     /// Multiple CLI overrides are all applied simultaneously.
     #[test]
     fn merge_multiple_overrides() {
-        let config = FestConfig::default();
         let args = RunArgs {
-            verbose: false,
             source: Some(vec!["lib/**/*.py".to_owned()]),
             exclude: Some(vec!["lib/generated/**".to_owned()]),
             workers: Some(4_usize),
-            workers_cpu_ratio: None,
             timeout: Some(30_u64),
             fail_under: Some(85.0),
             output: Some(OutputFormat::Html),
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
-        let merged = merge_config(&args, config);
+        let merged = merge_config(&args, FestConfig::default());
         assert_eq!(merged.source, vec!["lib/**/*.py"]);
         assert_eq!(merged.exclude, vec!["lib/generated/**"]);
         assert_eq!(merged.workers, Some(4_usize));
@@ -439,21 +377,9 @@ mod tests {
         assert_eq!(config.backend, RunnerBackend::Plugin);
 
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
             backend: Some(RunnerBackend::Plugin),
+            ..default_args()
         };
-
         let merged = merge_config(&args, config);
         assert_eq!(merged.backend, RunnerBackend::Plugin);
     }
@@ -467,21 +393,11 @@ mod tests {
         config.output = OutputFormat::Json;
 
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
             workers: Some(8_usize),
-            workers_cpu_ratio: None,
             timeout: Some(120_u64),
-            fail_under: None,
             output: Some(OutputFormat::Text),
-            config: None,
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
         let merged = merge_config(&args, config);
         assert_eq!(merged.workers, Some(8_usize));
         assert_eq!(merged.timeout, 120_u64);
@@ -495,21 +411,9 @@ mod tests {
         assert!(config.coverage_cache);
 
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
             no_coverage_cache: true,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
         let merged = merge_config(&args, config);
         assert!(!merged.coverage_cache);
     }
@@ -521,21 +425,9 @@ mod tests {
         assert!(config.coverage_from.is_none());
 
         let args = RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: None,
-            no_coverage_cache: false,
             coverage_from: Some(PathBuf::from("my/.coverage.json")),
-            no_fast_coverage: false,
-            backend: None,
+            ..default_args()
         };
-
         let merged = merge_config(&args, config);
         assert_eq!(
             merged.coverage_from,

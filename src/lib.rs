@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
-    io::Write as _,
+    io::{IsTerminal as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -34,7 +34,7 @@ struct RunContext<'ctx> {
     /// Tokio async runtime for running test processes.
     runtime: &'ctx tokio::runtime::Runtime,
     /// Progress reporter for user feedback.
-    progress: &'ctx progress::ProgressReporter,
+    progress: progress::ProgressReporter,
     /// Cancellation flag set by signal handlers.
     cancel: &'ctx signal::CancellationState,
 }
@@ -66,76 +66,167 @@ struct RunContext<'ctx> {
     reason = "RunArgs is consumed; pass-by-value is intentional for the public API"
 )]
 pub fn run(args: cli::RunArgs) -> Result<(), Error> {
-    let mut reporter = progress::ProgressReporter::new(args.verbose);
-
     // Create the tokio runtime early so signal handlers can be installed.
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| Error::Runner(format!("failed to create tokio runtime: {err}")))?;
+
+    // Resolve the render mode and spawn the render task.
+    let mode = progress::resolve_render_mode(args.verbose, args.progress);
+    let render = progress::RenderHandle::new(&runtime, mode);
+    let reporter = render.reporter();
 
     // Install signal handlers for graceful cancellation.
     let cancel = signal::CancellationState::new();
     signal::install_signal_handlers(&runtime, &cancel)?;
 
-    // 1. Determine the project directory and load configuration.
-    reporter.phase("[1/7] Loading configuration...");
-    let project_dir = resolve_project_dir(&args)?;
-    let file_config = config::load(&project_dir)?;
-    let config = cli::merge_config(&args, file_config);
+    // Run preparation phases (config, discovery, coverage).
+    let (config, mutants, coverage_map, files_scanned) = run_preparation_phases(&args, &reporter)?;
 
-    // 2. Build the mutator registry from config.
-    reporter.phase("[2/7] Building mutator registry...");
-    let registry = mutation::build_registry(&config.mutators);
-
-    // 3. Discover source files and generate mutants.
-    reporter.phase("[3/7] Discovering source files...");
-    let files = mutation::discover_files(&config.source, &config.exclude, &project_dir)?;
-    let files_scanned = files.len();
-    reporter.phase("[4/7] Generating mutants...");
-    let mutants = mutation::generate_mutants_for_files(&files, &registry)?;
-    let mutants_generated = mutants.len();
-
-    // 4. Collect coverage.
-    reporter.phase("[5/7] Collecting coverage...");
-    let coverage_map = resolve_coverage(&config, &project_dir)?;
-
-    // 5. Run each mutant against the test suite.
-    reporter.phase(&format!(
-        "[6/7] Running {mutants_generated} mutants against the test suite (backend: {:?})...",
-        config.backend,
-    ));
-    let total_u64 = u64::try_from(mutants_generated).unwrap_or(u64::MAX);
+    // Run mutants against the test suite.
+    let total_u64 = u64::try_from(mutants.len()).unwrap_or(u64::MAX);
+    reporter.phase_start("Running mutants");
     reporter.start_mutants(total_u64);
 
     let ctx = RunContext {
         runtime: &runtime,
-        progress: &reporter,
+        progress: reporter.clone(),
         cancel: &cancel,
     };
+    let mutants_generated = mutants.len();
     let start = std::time::Instant::now();
     let (results, was_cancelled) = run_mutants(&mutants, &coverage_map, &config, &ctx)?;
     let duration = start.elapsed();
+    reporter.finish_mutants(was_cancelled);
 
-    if was_cancelled {
-        reporter.abandon();
-    } else {
-        reporter.finish();
-    }
+    let tested = results.len();
+    reporter.phase_complete(
+        "Mutants tested",
+        Some(&format!("{tested} mutants")),
+        start.elapsed(),
+    );
 
-    // 6. Build and format the report.
-    reporter.phase("[7/7] Building report...");
+    // Build the report and emit the summary scoreboard.
     let report =
         report::MutationReport::from_results(results, files_scanned, mutants_generated, duration);
-    let formatted = report::format_report(&report, &config.output)?;
+    emit_summary(&reporter, &report, duration);
+
+    // Shut down the render task before writing the stdout report.
+    runtime.block_on(render.shutdown());
+
+    let colored = matches!(
+        mode,
+        progress::RenderMode::Fancy | progress::RenderMode::Verbose
+    ) && std::io::stdout().is_terminal();
+    let formatted = report::format_report(&report, &config.output, colored)?;
     write_output(&formatted)?;
 
-    // If cancelled, return an error after printing the partial report.
+    check_final_status(was_cancelled, &report, &config)
+}
+
+/// Run the preparation phases of the pipeline: configuration, discovery,
+/// mutant generation, and coverage collection.
+///
+/// Returns the merged config, generated mutants, coverage map, and file
+/// count so that the caller can proceed with mutant execution.
+///
+/// # Errors
+///
+/// Returns [`Error`] if any preparation phase fails.
+fn run_preparation_phases(
+    args: &cli::RunArgs,
+    reporter: &progress::ProgressReporter,
+) -> Result<
+    (
+        config::FestConfig,
+        Vec<mutation::Mutant>,
+        coverage::CoverageMap,
+        usize,
+    ),
+    Error,
+> {
+    // 1. Load configuration.
+    reporter.phase_start("Loading configuration");
+    let t0 = std::time::Instant::now();
+    let project_dir = resolve_project_dir(args)?;
+    let file_config = config::load(&project_dir)?;
+    let config = cli::merge_config(args, file_config);
+    reporter.phase_complete("Configuration loaded", Some("fest.toml"), t0.elapsed());
+
+    // 2. Build the mutator registry.
+    reporter.phase_start("Building mutator registry");
+    let t1 = std::time::Instant::now();
+    let registry = mutation::build_registry(&config.mutators);
+    let registry_count = registry.len();
+    reporter.phase_complete(
+        "Mutator registry built",
+        Some(&format!("{registry_count} mutators")),
+        t1.elapsed(),
+    );
+
+    // 3. Discover source files and generate mutants.
+    reporter.phase_start("Discovering source files");
+    let t2 = std::time::Instant::now();
+    let files = mutation::discover_files(&config.source, &config.exclude, &project_dir)?;
+    let files_scanned = files.len();
+    reporter.phase_complete(
+        "Source files discovered",
+        Some(&format!("{files_scanned} files")),
+        t2.elapsed(),
+    );
+
+    reporter.phase_start("Generating mutants");
+    let t3 = std::time::Instant::now();
+    let mutants = mutation::generate_mutants_for_files(&files, &registry)?;
+    let mutants_generated = mutants.len();
+    reporter.phase_complete(
+        "Mutants generated",
+        Some(&format!("{mutants_generated} mutants")),
+        t3.elapsed(),
+    );
+
+    // 4. Collect coverage.
+    reporter.phase_start("Collecting coverage");
+    let t4 = std::time::Instant::now();
+    let coverage_map = resolve_coverage(&config, &project_dir)?;
+    reporter.phase_complete("Coverage collected", None, t4.elapsed());
+
+    Ok((config, mutants, coverage_map, files_scanned))
+}
+
+/// Send the summary scoreboard event to the render task.
+fn emit_summary(
+    reporter: &progress::ProgressReporter,
+    report: &report::MutationReport,
+    duration: core::time::Duration,
+) {
+    reporter.summary(progress::SummaryInfo {
+        score: report.mutation_score(),
+        killed: report.killed,
+        survived: report.survived,
+        timeouts: report.timeouts,
+        errors: report.errors,
+        no_coverage: report.no_coverage,
+        duration,
+    });
+}
+
+/// Check for cancellation and threshold violations after the report is
+/// written.
+///
+/// # Errors
+///
+/// Returns [`Error::Cancelled`] if the run was interrupted by a signal,
+/// or [`Error::Threshold`] if the mutation score is below `fail_under`.
+fn check_final_status(
+    was_cancelled: bool,
+    report: &report::MutationReport,
+    config: &config::FestConfig,
+) -> Result<(), Error> {
     if was_cancelled {
         return Err(Error::Cancelled(
             "run interrupted by signal; partial results reported above".to_owned(),
         ));
     }
-
-    // 7. Check the fail_under threshold.
     if let Some(threshold) = config.fail_under
         && !report.passes_threshold(threshold)
     {
@@ -145,7 +236,6 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
             threshold,
         )));
     }
-
     Ok(())
 }
 
@@ -349,8 +439,8 @@ mod tests {
     struct TestRunContext {
         /// Tokio runtime.
         runtime: tokio::runtime::Runtime,
-        /// Quiet progress reporter (no stderr output in tests).
-        progress: progress::ProgressReporter,
+        /// Render handle for the quiet-mode render task.
+        render: Option<progress::RenderHandle>,
         /// Cancellation state.
         cancel: signal::CancellationState,
     }
@@ -358,9 +448,11 @@ mod tests {
     impl TestRunContext {
         /// Create a new test context with quiet progress.
         fn new() -> Self {
+            let runtime = tokio::runtime::Runtime::new().expect("should create runtime");
+            let render = progress::RenderHandle::new(&runtime, progress::RenderMode::Quiet);
             Self {
-                runtime: tokio::runtime::Runtime::new().expect("should create runtime"),
-                progress: progress::ProgressReporter::new(false),
+                runtime,
+                render: Some(render),
                 cancel: signal::CancellationState::new(),
             }
         }
@@ -369,39 +461,24 @@ mod tests {
         fn as_ctx(&self) -> RunContext<'_> {
             RunContext {
                 runtime: &self.runtime,
-                progress: &self.progress,
+                progress: self.render.as_ref().expect("render handle").reporter(),
                 cancel: &self.cancel,
             }
         }
     }
 
-    /// `resolve_project_dir` returns the parent of a config path.
-    #[test]
-    fn resolve_project_dir_from_config_path() {
-        let args = cli::RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
-            config: Some(PathBuf::from("/home/user/project/fest.toml")),
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
-        };
-
-        let dir = resolve_project_dir(&args).expect("should resolve");
-        assert_eq!(dir, PathBuf::from("/home/user/project"));
+    impl Drop for TestRunContext {
+        fn drop(&mut self) {
+            if let Some(handle) = self.render.take() {
+                self.runtime.block_on(handle.shutdown());
+            }
+        }
     }
 
-    /// `resolve_project_dir` falls back to the current working directory.
-    #[test]
-    fn resolve_project_dir_cwd_fallback() {
-        let args = cli::RunArgs {
+    /// Build a `cli::RunArgs` with all defaults — override individual fields
+    /// via struct update syntax in each test.
+    fn default_run_args() -> cli::RunArgs {
+        cli::RunArgs {
             verbose: false,
             source: None,
             exclude: None,
@@ -415,9 +492,41 @@ mod tests {
             coverage_from: None,
             no_fast_coverage: false,
             backend: None,
+            progress: cli::ProgressStyle::Auto,
+        }
+    }
+
+    /// Build a test `Mutant` with sensible defaults — override fields via
+    /// struct update syntax.
+    fn test_mutant() -> mutation::Mutant {
+        mutation::Mutant {
+            file_path: PathBuf::from("src/app.py"),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 1_usize,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic_op".to_owned(),
+        }
+    }
+
+    /// `resolve_project_dir` returns the parent of a config path.
+    #[test]
+    fn resolve_project_dir_from_config_path() {
+        let args = cli::RunArgs {
+            config: Some(PathBuf::from("/home/user/project/fest.toml")),
+            ..default_run_args()
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
+        assert_eq!(dir, PathBuf::from("/home/user/project"));
+    }
+
+    /// `resolve_project_dir` falls back to the current working directory.
+    #[test]
+    fn resolve_project_dir_cwd_fallback() {
+        let dir = resolve_project_dir(&default_run_args()).expect("should resolve");
         let cwd = std::env::current_dir().expect("should get cwd");
         assert_eq!(dir, cwd);
     }
@@ -427,19 +536,8 @@ mod tests {
     #[test]
     fn resolve_project_dir_bare_filename() {
         let args = cli::RunArgs {
-            verbose: false,
-            source: None,
-            exclude: None,
-            workers: None,
-            workers_cpu_ratio: None,
-            timeout: None,
-            fail_under: None,
-            output: None,
             config: Some(PathBuf::from("fest.toml")),
-            no_coverage_cache: false,
-            coverage_from: None,
-            no_fast_coverage: false,
-            backend: None,
+            ..default_run_args()
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -463,13 +561,9 @@ mod tests {
 
         let mutant = mutation::Mutant {
             file_path: py_file.clone(),
-            line: 1_u32,
             column: 5_u32,
             byte_offset: 4_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
+            ..test_mutant()
         };
 
         let mut coverage_map = coverage::CoverageMap::new();
@@ -485,19 +579,8 @@ mod tests {
     /// `build_source_cache` skips files with no coverage.
     #[test]
     fn build_source_cache_skips_uncovered() {
-        let mutant = mutation::Mutant {
-            file_path: PathBuf::from("src/app.py"),
-            line: 1_u32,
-            column: 1_u32,
-            byte_offset: 0_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
-        };
-
         let coverage_map = coverage::CoverageMap::new();
-        let cache = build_source_cache(&[mutant], &coverage_map).expect("should build");
+        let cache = build_source_cache(&[test_mutant()], &coverage_map).expect("should build");
         assert!(cache.is_empty());
     }
 
@@ -506,13 +589,7 @@ mod tests {
     fn build_source_cache_missing_file_errors() {
         let mutant = mutation::Mutant {
             file_path: PathBuf::from("/nonexistent/path/missing.py"),
-            line: 1_u32,
-            column: 1_u32,
-            byte_offset: 0_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
+            ..test_mutant()
         };
 
         let mut coverage_map = coverage::CoverageMap::new();
@@ -529,23 +606,12 @@ mod tests {
     /// is empty.
     #[test]
     fn run_mutants_no_coverage_when_map_empty() {
-        let mutant = mutation::Mutant {
-            file_path: PathBuf::from("src/app.py"),
-            line: 1_u32,
-            column: 1_u32,
-            byte_offset: 0_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
-        };
-
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
         let test_ctx = TestRunContext::new();
 
         let (results, cancelled) =
-            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
+            run_mutants(&[test_mutant()], &coverage_map, &config, &test_ctx.as_ctx())
                 .expect("should succeed");
 
         assert!(!cancelled);
@@ -559,14 +625,9 @@ mod tests {
     #[test]
     fn run_mutants_no_coverage_when_line_not_covered() {
         let mutant = mutation::Mutant {
-            file_path: PathBuf::from("src/app.py"),
             line: 10_u32,
-            column: 1_u32,
             byte_offset: 50_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
+            ..test_mutant()
         };
 
         let mut coverage_map = coverage::CoverageMap::new();
@@ -592,17 +653,6 @@ mod tests {
     /// list is empty.
     #[test]
     fn run_mutants_no_coverage_when_test_list_empty() {
-        let mutant = mutation::Mutant {
-            file_path: PathBuf::from("src/app.py"),
-            line: 1_u32,
-            column: 1_u32,
-            byte_offset: 0_usize,
-            byte_length: 1_usize,
-            original_text: "+".to_owned(),
-            mutated_text: "-".to_owned(),
-            mutator_name: "arithmetic_op".to_owned(),
-        };
-
         let mut coverage_map = coverage::CoverageMap::new();
         // Entry exists but with empty test list.
         let _prev = coverage_map.insert((PathBuf::from("src/app.py"), 1_u32), Vec::new());
@@ -611,7 +661,7 @@ mod tests {
         let test_ctx = TestRunContext::new();
 
         let (results, cancelled) =
-            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
+            run_mutants(&[test_mutant()], &coverage_map, &config, &test_ctx.as_ctx())
                 .expect("should succeed");
 
         assert!(!cancelled);
@@ -638,14 +688,8 @@ mod tests {
     fn run_mutants_cancelled_returns_partial() {
         let mutants: Vec<mutation::Mutant> = (0_u32..5_u32)
             .map(|idx| mutation::Mutant {
-                file_path: PathBuf::from("src/app.py"),
                 line: idx + 1_u32,
-                column: 1_u32,
-                byte_offset: 0_usize,
-                byte_length: 1_usize,
-                original_text: "+".to_owned(),
-                mutated_text: "-".to_owned(),
-                mutator_name: "arithmetic_op".to_owned(),
+                ..test_mutant()
             })
             .collect();
 
@@ -672,12 +716,7 @@ mod tests {
             .map(|idx| mutation::Mutant {
                 file_path: PathBuf::from(format!("src/mod_{idx}.py")),
                 line: idx + 1_u32,
-                column: 1_u32,
-                byte_offset: 0_usize,
-                byte_length: 1_usize,
-                original_text: "+".to_owned(),
-                mutated_text: "-".to_owned(),
-                mutator_name: "arithmetic_op".to_owned(),
+                ..test_mutant()
             })
             .collect();
 
