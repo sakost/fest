@@ -59,17 +59,23 @@ pub trait Runner: Send + Sync {
 // requiring callers to import it themselves.
 use core::future::Future;
 
+/// Platform-specific `PYTHONPATH` separator.
+///
+/// Unix uses `:`, Windows uses `;`.
+const PYTHON_PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 /// Build a `PYTHONPATH` string that prepends `dir` to any existing value.
 ///
 /// Both [`SubprocessRunner`] and [`PytestPluginRunner`] need to set
 /// `PYTHONPATH` so that the mutated file (or plugin) takes import
 /// priority. This shared helper keeps that logic in one place.
+#[inline]
 pub(crate) fn build_python_path(dir: &std::path::Path) -> String {
     let dir_str = dir.display().to_string();
 
     match std::env::var("PYTHONPATH") {
         Ok(existing) if !existing.is_empty() => {
-            format!("{dir_str}:{existing}")
+            format!("{dir_str}{PYTHON_PATH_SEPARATOR}{existing}")
         }
         _ => dir_str,
     }

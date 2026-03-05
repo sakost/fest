@@ -34,6 +34,26 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Name of the plugin file written to the temp directory.
 const PLUGIN_FILENAME: &str = "_fest_plugin.py";
 
+/// Holds the prepared temporary environment for a pytest plugin run.
+///
+/// Groups the temp directory, socket listener, and derived paths created
+/// during the preparation phase so they can be passed between functions
+/// without exceeding the argument limit.
+struct TempRunEnv {
+    /// Temporary directory that owns the plugin file and socket.
+    /// Kept alive so the directory is not cleaned up prematurely.
+    _temp_dir: tempfile::TempDir,
+
+    /// Bound Unix listener waiting for the plugin to connect.
+    listener: UnixListener,
+
+    /// `PYTHONPATH` value that prepends the temp directory.
+    python_path: String,
+
+    /// Stringified socket path for the `--fest-socket` CLI argument.
+    socket_path_str: String,
+}
+
 /// Configuration for the pytest plugin runner.
 ///
 /// Holds tunable parameters such as the per-mutant timeout.
@@ -53,99 +73,6 @@ impl PytestPluginRunner {
             timeout: Duration::from_secs(timeout_secs),
         }
     }
-
-    /// Inner implementation that performs the actual socket-based communication.
-    ///
-    /// Separated from [`run_mutant`](Runner::run_mutant) so that the
-    /// timeout wrapper can catch both spawn failures and protocol errors.
-    async fn run_mutant_inner(
-        &self,
-        mutant: &Mutant,
-        source: &str,
-        tests: &[String],
-    ) -> Result<MutantStatus, Error> {
-        // 1. Create a temp directory for the plugin and socket.
-        let temp_dir = tempfile::tempdir()
-            .map_err(|err| Error::Runner(format!("failed to create temp dir: {err}")))?;
-
-        // 2. Write the embedded plugin file.
-        let plugin_path = temp_dir.path().join(PLUGIN_FILENAME);
-        std::fs::write(&plugin_path, FEST_PLUGIN_SOURCE).map_err(|err| {
-            Error::Runner(format!(
-                "failed to write plugin to {}: {err}",
-                plugin_path.display()
-            ))
-        })?;
-
-        // 3. Create the Unix socket.
-        let socket_path = temp_dir.path().join("fest.sock");
-        let listener = UnixListener::bind(&socket_path).map_err(|err| {
-            Error::Runner(format!(
-                "failed to bind Unix socket at {}: {err}",
-                socket_path.display()
-            ))
-        })?;
-
-        // 4. Build PYTHONPATH so pytest can import the plugin.
-        let python_path = super::build_python_path(temp_dir.path());
-
-        // 5. Spawn pytest with the plugin.
-        let socket_path_str = socket_path.display().to_string();
-        let mut child = Command::new("python")
-            .args([
-                "-m",
-                "pytest",
-                "-p",
-                "_fest_plugin",
-                "--fest-socket",
-                &socket_path_str,
-                "-x",
-                "--no-header",
-                "-q",
-            ])
-            .args(tests)
-            .env("PYTHONPATH", &python_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|err| Error::Runner(format!("failed to spawn pytest: {err}")))?;
-
-        // 6. Accept the connection from the plugin.
-        let (stream, _addr) = listener.accept().await.map_err(|err| {
-            Error::Runner(format!("failed to accept connection on socket: {err}"))
-        })?;
-
-        let (reader, mut writer) = tokio::io::split(stream);
-        let mut buf_reader = BufReader::new(reader);
-
-        // 7. Wait for the READY message.
-        let ready_msg = read_message(&mut buf_reader).await?;
-        let ready_type = extract_type(&ready_msg)?;
-        if ready_type != "ready" {
-            return Err(Error::Runner(format!(
-                "expected 'ready' message, got '{ready_type}'"
-            )));
-        }
-
-        // 8. Apply the mutation and send the MUTANT message.
-        let mutated_source = mutant.apply_to_source(source);
-        let mutant_msg = build_mutant_message(mutant, &mutated_source, tests);
-        write_message(&mut writer, &mutant_msg).await?;
-
-        // 9. Read back the RESULT.
-        let result_msg = read_message(&mut buf_reader).await?;
-        let status = parse_result_status(&result_msg)?;
-
-        // 10. Send SHUTDOWN.
-        let shutdown_msg = r#"{"type":"shutdown"}"#;
-        // Best-effort shutdown -- ignore write errors.
-        let _shutdown_result = write_message(&mut writer, shutdown_msg).await;
-
-        // 11. Wait for the child process to exit (best-effort).
-        let _wait_result = child.wait().await;
-
-        Ok(status)
-    }
 }
 
 impl Default for PytestPluginRunner {
@@ -158,12 +85,10 @@ impl Default for PytestPluginRunner {
 impl Runner for PytestPluginRunner {
     /// Run pytest against a single mutant via the plugin backend.
     ///
-    /// 1. Write the embedded plugin to a temp directory.
-    /// 2. Create a Unix socket in the temp directory.
-    /// 3. Spawn pytest with the plugin and socket path.
-    /// 4. Accept the connection and wait for `READY`.
-    /// 5. Send a `MUTANT` message, read back the `RESULT`.
-    /// 6. Send `SHUTDOWN` and clean up.
+    /// 1. Prepare the temp environment (plugin file, socket, PYTHONPATH).
+    /// 2. Spawn pytest outside the timeout boundary.
+    /// 3. Run the socket protocol under a timeout.
+    /// 4. On timeout, explicitly kill the child process.
     #[inline]
     async fn run_mutant(
         &self,
@@ -174,10 +99,16 @@ impl Runner for PytestPluginRunner {
         let start = tokio::time::Instant::now();
         let tests_run: Vec<String> = tests.iter().map(ToString::to_string).collect();
 
-        let outcome = tokio::time::timeout(self.timeout, async {
-            self.run_mutant_inner(mutant, source, tests).await
-        })
-        .await;
+        let env = prepare_temp_env()?;
+        let mut child = spawn_pytest(&env, tests)?;
+
+        let outcome =
+            tokio::time::timeout(self.timeout, run_protocol(env.listener, mutant, source, tests))
+                .await;
+
+        // On timeout (or any exit path), ensure the child is killed.
+        let _kill_result = child.kill().await;
+        let _wait_result = child.wait().await;
 
         let elapsed = start.elapsed();
 
@@ -194,6 +125,120 @@ impl Runner for PytestPluginRunner {
             duration: elapsed,
         })
     }
+}
+
+/// Prepare the temporary environment for a pytest plugin run.
+///
+/// Creates the temp directory, writes the embedded plugin file, binds
+/// the Unix socket, and builds the `PYTHONPATH` value.
+///
+/// # Errors
+///
+/// Returns [`Error::Runner`] if any filesystem or socket operation fails.
+fn prepare_temp_env() -> Result<TempRunEnv, Error> {
+    let temp_dir = tempfile::tempdir()
+        .map_err(|err| Error::Runner(format!("failed to create temp dir: {err}")))?;
+
+    let plugin_path = temp_dir.path().join(PLUGIN_FILENAME);
+    std::fs::write(&plugin_path, FEST_PLUGIN_SOURCE).map_err(|err| {
+        Error::Runner(format!(
+            "failed to write plugin to {}: {err}",
+            plugin_path.display()
+        ))
+    })?;
+
+    let socket_path = temp_dir.path().join("fest.sock");
+    let listener = UnixListener::bind(&socket_path).map_err(|err| {
+        Error::Runner(format!(
+            "failed to bind Unix socket at {}: {err}",
+            socket_path.display()
+        ))
+    })?;
+
+    let python_path = super::build_python_path(temp_dir.path());
+    let socket_path_str = socket_path.display().to_string();
+
+    Ok(TempRunEnv {
+        _temp_dir: temp_dir,
+        listener,
+        python_path,
+        socket_path_str,
+    })
+}
+
+/// Spawn pytest with the plugin and the given test IDs.
+///
+/// # Errors
+///
+/// Returns [`Error::Runner`] if the process cannot be spawned.
+fn spawn_pytest(
+    env: &TempRunEnv,
+    tests: &[String],
+) -> Result<tokio::process::Child, Error> {
+    Command::new("python")
+        .args([
+            "-m",
+            "pytest",
+            "-p",
+            "_fest_plugin",
+            "--fest-socket",
+            &env.socket_path_str,
+            "-x",
+            "--no-header",
+            "-q",
+        ])
+        .args(tests)
+        .env("PYTHONPATH", &env.python_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| Error::Runner(format!("failed to spawn pytest: {err}")))
+}
+
+/// Perform the socket-based protocol exchange with the plugin.
+///
+/// Accepts the connection, waits for `READY`, sends `MUTANT`, reads
+/// `RESULT`, and sends `SHUTDOWN`.
+///
+/// # Errors
+///
+/// Returns [`Error::Runner`] if any protocol step fails.
+async fn run_protocol(
+    listener: UnixListener,
+    mutant: &Mutant,
+    source: &str,
+    tests: &[String],
+) -> Result<MutantStatus, Error> {
+    let (stream, _addr) = listener.accept().await.map_err(|err| {
+        Error::Runner(format!("failed to accept connection on socket: {err}"))
+    })?;
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(reader);
+
+    // Wait for the READY message.
+    let ready_msg = read_message(&mut buf_reader).await?;
+    let ready_type = extract_type(&ready_msg)?;
+    if ready_type != "ready" {
+        return Err(Error::Runner(format!(
+            "expected 'ready' message, got '{ready_type}'"
+        )));
+    }
+
+    // Apply the mutation and send the MUTANT message.
+    let mutated_source = mutant.apply_to_source(source);
+    let mutant_msg = build_mutant_message(mutant, &mutated_source, tests);
+    write_message(&mut writer, &mutant_msg).await?;
+
+    // Read back the RESULT.
+    let result_msg = read_message(&mut buf_reader).await?;
+    let status = parse_result_status(&result_msg)?;
+
+    // Send SHUTDOWN (best-effort).
+    let shutdown_msg = r#"{"type":"shutdown"}"#;
+    let _shutdown_result = write_message(&mut writer, shutdown_msg).await;
+
+    Ok(status)
 }
 
 /// Read a single newline-delimited JSON message from the reader.
@@ -222,6 +267,9 @@ where
 
 /// Write a JSON message followed by a newline to the writer.
 ///
+/// Writes the message bytes directly, appending a newline byte only
+/// when the message does not already end with one.
+///
 /// # Errors
 ///
 /// Returns [`Error::Runner`] if writing fails.
@@ -229,18 +277,17 @@ async fn write_message<W>(writer: &mut W, msg: &str) -> Result<(), Error>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let data = if msg.ends_with('\n') {
-        msg.to_owned()
-    } else {
-        let mut owned = msg.to_owned();
-        owned.push('\n');
-        owned
-    };
-
     writer
-        .write_all(data.as_bytes())
+        .write_all(msg.as_bytes())
         .await
         .map_err(|err| Error::Runner(format!("failed to write to socket: {err}")))?;
+
+    if !msg.ends_with('\n') {
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|err| Error::Runner(format!("failed to write newline to socket: {err}")))?;
+    }
 
     writer
         .flush()
@@ -293,7 +340,7 @@ fn parse_result_status(msg: &str) -> Result<MutantStatus, Error> {
     let msg_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+        .ok_or_else(|| Error::Runner("result missing 'type' field".to_owned()))?;
 
     if msg_type != "result" {
         return Err(Error::Runner(format!(
@@ -500,6 +547,14 @@ mod tests {
     #[test]
     fn parse_result_missing_status() {
         let msg = r#"{"type": "result"}"#;
+        let result = parse_result_status(msg);
+        assert!(result.is_err());
+    }
+
+    /// `parse_result_status` returns error when type field is missing.
+    #[test]
+    fn parse_result_missing_type() {
+        let msg = r#"{"status": "killed"}"#;
         let result = parse_result_status(msg);
         assert!(result.is_err());
     }
@@ -711,7 +766,8 @@ mod tests {
             // Read MUTANT
             let mut line = String::new();
             let _bytes = buf_reader.read_line(&mut line).await.expect("read mutant");
-            let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse mutant json");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("parse mutant json");
             assert_eq!(
                 parsed.get("type").and_then(|val| val.as_str()),
                 Some("mutant")

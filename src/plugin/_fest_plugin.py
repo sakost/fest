@@ -42,16 +42,11 @@ def pytest_sessionstart(session: Any) -> None:
     try:
         conn.connect(socket_path)
     except OSError as exc:
-        _send(
-            conn,
-            {
-                "type": "result",
-                "status": "error",
-                "error_message": f"connect failed: {exc}",
-            },
-        )
+        print(f"fest: connect failed: {exc}", file=sys.stderr)
+        conn.close()
         return
 
+    conn.settimeout(60.0)
     _send(conn, {"type": "ready"})
 
     buf = b""
