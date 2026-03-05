@@ -31,6 +31,10 @@ pub enum Error {
     #[error("report error: {0}")]
     Report(String),
 
+    /// The run was cancelled by a signal (SIGINT / SIGTERM / SIGQUIT).
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

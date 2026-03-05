@@ -19,6 +19,7 @@ pub mod plugin;
 pub mod progress;
 pub mod report;
 pub mod runner;
+pub mod signal;
 
 pub use error::Error;
 use runner::Runner as _;
