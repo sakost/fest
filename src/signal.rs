@@ -8,10 +8,10 @@
 //! A second signal forces an immediate exit with code 130 (the conventional
 //! exit code for SIGINT termination).
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared cancellation flag polled by the pipeline.
 #[derive(Debug, Clone)]
@@ -36,6 +36,12 @@ impl CancellationState {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
+
+    /// Set the cancellation flag. Only available in test builds.
+    #[cfg(test)]
+    pub fn set_cancelled_for_test(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Default for CancellationState {
@@ -47,8 +53,8 @@ impl Default for CancellationState {
 
 /// Install signal handlers for SIGINT, SIGTERM, and SIGQUIT.
 ///
-/// - First signal: sets `state.cancelled` → the pipeline finishes the current
-///   mutant, builds a partial report, then returns `Error::Cancelled`.
+/// - First signal: sets `state.cancelled` → the pipeline finishes the current mutant, builds a
+///   partial report, then returns `Error::Cancelled`.
 /// - Second signal: calls [`std::process::exit(130)`].
 ///
 /// The handlers are spawned as a tokio task on the provided `runtime`.
@@ -57,22 +63,22 @@ impl Default for CancellationState {
 ///
 /// Returns [`crate::Error::Runner`] if any Unix signal listener cannot be
 /// created.
+#[inline]
 pub fn install_signal_handlers(
     runtime: &tokio::runtime::Runtime,
     state: &CancellationState,
 ) -> Result<(), crate::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // Enter the runtime context so `signal()` can register with the reactor.
+    let _guard = runtime.enter();
+
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|err| crate::Error::Runner(format!("failed to install SIGINT handler: {err}")))?;
     let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|err| {
-            crate::Error::Runner(format!("failed to install SIGTERM handler: {err}"))
-        })?;
+        .map_err(|err| crate::Error::Runner(format!("failed to install SIGTERM handler: {err}")))?;
     let mut sigquit = signal(SignalKind::quit())
-        .map_err(|err| {
-            crate::Error::Runner(format!("failed to install SIGQUIT handler: {err}"))
-        })?;
+        .map_err(|err| crate::Error::Runner(format!("failed to install SIGQUIT handler: {err}")))?;
 
     let cancelled = Arc::clone(&state.cancelled);
 

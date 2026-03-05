@@ -24,6 +24,19 @@ pub mod signal;
 pub use error::Error;
 use runner::Runner as _;
 
+/// Shared context passed into the mutant execution loop.
+///
+/// Bundles the tokio runtime, progress reporter, and cancellation state
+/// so that [`run_mutants`] stays within the 5-argument limit.
+struct RunContext<'ctx> {
+    /// Tokio async runtime for running test processes.
+    runtime: &'ctx tokio::runtime::Runtime,
+    /// Progress reporter for user feedback.
+    progress: &'ctx progress::ProgressReporter,
+    /// Cancellation flag set by signal handlers.
+    cancel: &'ctx signal::CancellationState,
+}
+
 /// Run the fest pipeline to completion.
 ///
 /// This is the top-level entry point invoked by the CLI binary.
@@ -43,40 +56,81 @@ use runner::Runner as _;
 /// # Errors
 ///
 /// Returns [`Error`] if any stage of the pipeline fails (configuration,
-/// mutation, coverage, test-running, or report generation).
+/// mutation, coverage, test-running, or report generation), or
+/// [`Error::Cancelled`] if interrupted by a signal.
 #[inline]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "RunArgs is consumed; pass-by-value is intentional for the public API"
 )]
 pub fn run(args: cli::RunArgs) -> Result<(), Error> {
+    let mut reporter = progress::ProgressReporter::new(args.verbose);
+
+    // Create the tokio runtime early so signal handlers can be installed.
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|err| Error::Runner(format!("failed to create tokio runtime: {err}")))?;
+
+    // Install signal handlers for graceful cancellation.
+    let cancel = signal::CancellationState::new();
+    signal::install_signal_handlers(&runtime, &cancel)?;
+
     // 1. Determine the project directory and load configuration.
+    reporter.phase("[1/7] Loading configuration...");
     let project_dir = resolve_project_dir(&args)?;
     let file_config = config::load(&project_dir)?;
     let config = cli::merge_config(&args, file_config);
 
     // 2. Build the mutator registry from config.
+    reporter.phase("[2/7] Building mutator registry...");
     let registry = mutation::build_registry(&config.mutators);
 
     // 3. Discover source files and generate mutants.
+    reporter.phase("[3/7] Discovering source files...");
     let files = mutation::discover_files(&config.source, &config.exclude, &project_dir)?;
     let files_scanned = files.len();
+    reporter.phase("[4/7] Generating mutants...");
     let mutants = mutation::generate_mutants_for_files(&files, &registry)?;
     let mutants_generated = mutants.len();
 
     // 4. Collect coverage.
+    reporter.phase("[5/7] Collecting coverage...");
     let coverage_map = coverage::collect_coverage(&project_dir, &config.source)?;
 
     // 5. Run each mutant against the test suite.
+    reporter.phase(&format!(
+        "[6/7] Running {mutants_generated} mutants against the test suite..."
+    ));
+    let total_u64 = u64::try_from(mutants_generated).unwrap_or(u64::MAX);
+    reporter.start_mutants(total_u64);
+
+    let ctx = RunContext {
+        runtime: &runtime,
+        progress: &reporter,
+        cancel: &cancel,
+    };
     let start = std::time::Instant::now();
-    let results = run_mutants(&mutants, &coverage_map, &config)?;
+    let (results, was_cancelled) = run_mutants(&mutants, &coverage_map, &config, &ctx)?;
     let duration = start.elapsed();
 
+    if was_cancelled {
+        reporter.abandon();
+    } else {
+        reporter.finish();
+    }
+
     // 6. Build and format the report.
+    reporter.phase("[7/7] Building report...");
     let report =
         report::MutationReport::from_results(results, files_scanned, mutants_generated, duration);
     let formatted = report::format_report(&report, &config.output)?;
     write_output(&formatted)?;
+
+    // If cancelled, return an error after printing the partial report.
+    if was_cancelled {
+        return Err(Error::Cancelled(
+            "run interrupted by signal; partial results reported above".to_owned(),
+        ));
+    }
 
     // 7. Check the fail_under threshold.
     if let Some(threshold) = config.fail_under
@@ -120,26 +174,34 @@ fn resolve_project_dir(args: &cli::RunArgs) -> Result<PathBuf, Error> {
 /// as [`mutation::MutantStatus::NoCoverage`] without reading the source
 /// file. Covered mutants have their source read (once per unique file,
 /// cached in a [`HashMap`]) and are executed via
-/// [`runner::SubprocessRunner`] in a tokio runtime.
+/// [`runner::SubprocessRunner`].
+///
+/// Returns the collected results and a boolean indicating whether the run
+/// was cancelled by a signal. When cancelled, the results contain only the
+/// mutants processed before the signal was received.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] if a source file cannot be read or the tokio runtime
-/// cannot be created.
+/// Returns [`Error`] if a source file cannot be read.
 fn run_mutants(
     mutants: &[mutation::Mutant],
     coverage_map: &coverage::CoverageMap,
     config: &config::FestConfig,
-) -> Result<Vec<mutation::MutantResult>, Error> {
+    ctx: &RunContext<'_>,
+) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
     // TODO: add runner selection config to choose between SubprocessRunner and PytestPluginRunner.
     let runner = runner::SubprocessRunner::new(config.timeout);
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|err| Error::Runner(format!("failed to create tokio runtime: {err}")))?;
 
     let mut source_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut results: Vec<mutation::MutantResult> = Vec::with_capacity(mutants.len());
+    let total = mutants.len();
 
-    for mutant in mutants {
+    for (index, mutant) in mutants.iter().enumerate() {
+        // Check for cancellation between mutants.
+        if ctx.cancel.is_cancelled() {
+            return Ok((results, true));
+        }
+
         // Look up coverage for this mutant's file and line.
         let coverage_key = (mutant.file_path.clone(), mutant.line);
         let covering_tests = coverage_map.get(&coverage_key);
@@ -148,7 +210,8 @@ fn run_mutants(
             Some(tests) if !tests.is_empty() => {
                 // Only read the source file when we actually need to run the mutant.
                 let source = read_source_cached(&mut source_cache, &mutant.file_path)?;
-                runtime.block_on(runner.run_mutant(mutant, source, tests))?
+                ctx.runtime
+                    .block_on(runner.run_mutant(mutant, source, tests))?
             }
             _ => mutation::MutantResult {
                 mutant: mutant.clone(),
@@ -158,10 +221,11 @@ fn run_mutants(
             },
         };
 
+        ctx.progress.report_mutant(index, total, &result);
         results.push(result);
     }
 
-    Ok(results)
+    Ok((results, false))
 }
 
 /// Read a source file, caching its contents for subsequent lookups.
@@ -210,6 +274,37 @@ fn write_output(output: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper to build a `RunContext` with a default runtime, quiet reporter,
+    /// and fresh cancellation state. Returns owned values and the context.
+    struct TestRunContext {
+        /// Tokio runtime.
+        runtime: tokio::runtime::Runtime,
+        /// Quiet progress reporter (no stderr output in tests).
+        progress: progress::ProgressReporter,
+        /// Cancellation state.
+        cancel: signal::CancellationState,
+    }
+
+    impl TestRunContext {
+        /// Create a new test context with quiet progress.
+        fn new() -> Self {
+            Self {
+                runtime: tokio::runtime::Runtime::new().expect("should create runtime"),
+                progress: progress::ProgressReporter::new(false),
+                cancel: signal::CancellationState::new(),
+            }
+        }
+
+        /// Borrow as a `RunContext`.
+        fn as_ctx(&self) -> RunContext<'_> {
+            RunContext {
+                runtime: &self.runtime,
+                progress: &self.progress,
+                cancel: &self.cancel,
+            }
+        }
+    }
 
     /// `resolve_project_dir` returns the parent of a config path.
     #[test]
@@ -324,9 +419,13 @@ mod tests {
 
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
 
-        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let (results, cancelled) =
+            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
+                .expect("should succeed");
 
+        assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
         assert!(results[0_usize].tests_run.is_empty());
@@ -355,9 +454,13 @@ mod tests {
         );
 
         let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
 
-        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let (results, cancelled) =
+            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
+                .expect("should succeed");
 
+        assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
     }
@@ -382,9 +485,13 @@ mod tests {
         let _prev = coverage_map.insert((PathBuf::from("src/app.py"), 1_u32), Vec::new());
 
         let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
 
-        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let (results, cancelled) =
+            run_mutants(&[mutant], &coverage_map, &config, &test_ctx.as_ctx())
+                .expect("should succeed");
 
+        assert!(!cancelled);
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
     }
@@ -394,9 +501,44 @@ mod tests {
     fn run_mutants_empty_slice() {
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
 
-        let results = run_mutants(&[], &coverage_map, &config).expect("should succeed");
+        let (results, cancelled) =
+            run_mutants(&[], &coverage_map, &config, &test_ctx.as_ctx()).expect("should succeed");
 
+        assert!(!cancelled);
+        assert!(results.is_empty());
+    }
+
+    /// `run_mutants` returns partial results when cancelled.
+    #[test]
+    fn run_mutants_cancelled_returns_partial() {
+        let mutants: Vec<mutation::Mutant> = (0_u32..5_u32)
+            .map(|idx| mutation::Mutant {
+                file_path: PathBuf::from("src/app.py"),
+                line: idx + 1_u32,
+                column: 1_u32,
+                byte_offset: 0_usize,
+                byte_length: 1_usize,
+                original_text: "+".to_owned(),
+                mutated_text: "-".to_owned(),
+                mutator_name: "arithmetic_op".to_owned(),
+            })
+            .collect();
+
+        let coverage_map = coverage::CoverageMap::new();
+        let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
+
+        // Pre-cancel before running.
+        test_ctx.cancel.set_cancelled_for_test();
+
+        let (results, cancelled) =
+            run_mutants(&mutants, &coverage_map, &config, &test_ctx.as_ctx())
+                .expect("should succeed");
+
+        assert!(cancelled);
+        // Should have 0 results since cancellation is checked at loop top.
         assert!(results.is_empty());
     }
 }

@@ -16,7 +16,7 @@ pub enum ProgressMode {
     /// Print one line per mutant to stderr.
     Verbose,
     /// Show an indicatif progress bar (when stderr is a TTY).
-    Bar,
+    ProgressBar,
     /// No output at all (CI / piped stderr).
     Quiet,
 }
@@ -26,15 +26,15 @@ pub enum ProgressMode {
 pub struct ProgressReporter {
     /// Active display mode.
     mode: ProgressMode,
-    /// Optional progress bar (only present in [`ProgressMode::Bar`]).
-    bar: Option<ProgressBar>,
+    /// Optional progress bar (only present in [`ProgressMode::ProgressBar`]).
+    progress_bar: Option<ProgressBar>,
 }
 
 impl ProgressReporter {
     /// Create a new reporter.
     ///
     /// - `verbose = true` → [`ProgressMode::Verbose`]
-    /// - stderr is a TTY  → [`ProgressMode::Bar`]
+    /// - stderr is a TTY  → [`ProgressMode::ProgressBar`]
     /// - otherwise         → [`ProgressMode::Quiet`]
     #[inline]
     #[must_use]
@@ -42,18 +42,24 @@ impl ProgressReporter {
         let mode = if verbose {
             ProgressMode::Verbose
         } else if std::io::stderr().is_terminal() {
-            ProgressMode::Bar
+            ProgressMode::ProgressBar
         } else {
             ProgressMode::Quiet
         };
-        Self { mode, bar: None }
+        Self {
+            mode,
+            progress_bar: None,
+        }
     }
 
     /// Create a reporter with an explicit mode (useful for testing).
     #[cfg(test)]
     #[must_use]
     fn with_mode(mode: ProgressMode) -> Self {
-        Self { mode, bar: None }
+        Self {
+            mode,
+            progress_bar: None,
+        }
     }
 
     /// Print a phase header to stderr.
@@ -72,17 +78,17 @@ impl ProgressReporter {
     /// Initialise progress tracking for the mutant execution phase.
     #[inline]
     pub fn start_mutants(&mut self, total: u64) {
-        if self.mode != ProgressMode::Bar {
+        if self.mode != ProgressMode::ProgressBar {
             return;
         }
-        let bar = ProgressBar::new(total);
-        let style = ProgressStyle::with_template(
+        let pb = ProgressBar::new(total);
+        let template = ProgressStyle::with_template(
             "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} mutants ({eta} remaining)",
         );
-        if let Ok(style) = style {
-            bar.set_style(style.progress_chars("#>-"));
+        if let Ok(styled) = template {
+            pb.set_style(styled.progress_chars("#>-"));
         }
-        self.bar = Some(bar);
+        self.progress_bar = Some(pb);
     }
 
     /// Report the result of a single mutant.
@@ -94,10 +100,10 @@ impl ProgressReporter {
                 let mut stderr = std::io::stderr().lock();
                 let _result = writeln!(stderr, "{line}");
             }
-            ProgressMode::Bar => {
-                if let Some(bar) = self.bar.as_ref() {
-                    bar.set_message(format_status_tag(result.status.clone()));
-                    bar.inc(1_u64);
+            ProgressMode::ProgressBar => {
+                if let Some(pb) = self.progress_bar.as_ref() {
+                    pb.set_message(format_status_tag(&result.status));
+                    pb.inc(1_u64);
                 }
             }
             ProgressMode::Quiet => {}
@@ -107,16 +113,16 @@ impl ProgressReporter {
     /// Mark progress as successfully finished.
     #[inline]
     pub fn finish(&self) {
-        if let Some(bar) = self.bar.as_ref() {
-            bar.finish_and_clear();
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.finish_and_clear();
         }
     }
 
     /// Mark progress as abandoned (e.g. due to cancellation).
     #[inline]
     pub fn abandon(&self) {
-        if let Some(bar) = self.bar.as_ref() {
-            bar.abandon_with_message("cancelled");
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.abandon_with_message("cancelled");
         }
     }
 }
@@ -127,10 +133,11 @@ impl ProgressReporter {
 
 /// Format a single mutant result line for verbose output.
 ///
-/// Example: `[42/847] KILLED    src/app.py:5  arithmetic_op  \`+\` -> \`-\`  (125ms)`
+/// Produces lines like: `[42/847] KILLED     src/app.py:5  arithmetic_op  ...  (125ms)`
+#[inline]
 #[must_use]
 pub fn format_mutant_line(index: usize, total: usize, result: &MutantResult) -> String {
-    let status_tag = format_status_tag(result.status.clone());
+    let status_tag = format_status_tag(&result.status);
     let path = result.mutant.file_path.display();
     let line = result.mutant.line;
     let mutator = &result.mutant.mutator_name;
@@ -145,9 +152,10 @@ pub fn format_mutant_line(index: usize, total: usize, result: &MutantResult) -> 
 }
 
 /// Format a status tag (e.g. `KILLED`, `SURVIVED`).
+#[inline]
 #[must_use]
-pub fn format_status_tag(status: MutantStatus) -> String {
-    match status {
+pub fn format_status_tag(status: &MutantStatus) -> String {
+    match *status {
         MutantStatus::Killed => "KILLED".to_owned(),
         MutantStatus::Survived => "SURVIVED".to_owned(),
         MutantStatus::Timeout => "TIMEOUT".to_owned(),
@@ -189,12 +197,12 @@ mod tests {
     /// `format_status_tag` maps each variant correctly.
     #[test]
     fn status_tag_mapping() {
-        assert_eq!(format_status_tag(MutantStatus::Killed), "KILLED");
-        assert_eq!(format_status_tag(MutantStatus::Survived), "SURVIVED");
-        assert_eq!(format_status_tag(MutantStatus::Timeout), "TIMEOUT");
-        assert_eq!(format_status_tag(MutantStatus::NoCoverage), "NO_COV");
+        assert_eq!(format_status_tag(&MutantStatus::Killed), "KILLED");
+        assert_eq!(format_status_tag(&MutantStatus::Survived), "SURVIVED");
+        assert_eq!(format_status_tag(&MutantStatus::Timeout), "TIMEOUT");
+        assert_eq!(format_status_tag(&MutantStatus::NoCoverage), "NO_COV");
         assert_eq!(
-            format_status_tag(MutantStatus::Error("oops".to_owned())),
+            format_status_tag(&MutantStatus::Error("oops".to_owned())),
             "ERROR"
         );
     }
@@ -224,7 +232,7 @@ mod tests {
     #[test]
     fn reporter_construction() {
         let _verbose = ProgressReporter::with_mode(ProgressMode::Verbose);
-        let _bar = ProgressReporter::with_mode(ProgressMode::Bar);
+        let _progress_bar = ProgressReporter::with_mode(ProgressMode::ProgressBar);
         let _quiet = ProgressReporter::with_mode(ProgressMode::Quiet);
     }
 

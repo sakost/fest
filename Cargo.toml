@@ -131,7 +131,7 @@ use_debug = "deny"
 wildcard_dependencies = "deny"
 
 [package.metadata.cargo-machete]
-ignored = ["clap", "indicatif", "rayon", "ruff_python_ast", "ruff_python_parser", "ruff_text_size", "serde", "serde_json", "thiserror", "tokio"]
+ignored = ["clap", "rayon", "ruff_python_ast", "ruff_python_parser", "ruff_text_size", "serde", "serde_json", "thiserror", "tokio"]
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
