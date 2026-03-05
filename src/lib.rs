@@ -4,9 +4,11 @@
 //! generating mutants from Python source code, running a test suite
 //! against each mutant, and reporting which mutants survived.
 
-use std::collections::HashMap;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 pub mod cli;
 pub mod config;
@@ -16,9 +18,8 @@ pub mod mutation;
 pub mod report;
 pub mod runner;
 
-use runner::Runner as _;
-
 pub use error::Error;
+use runner::Runner as _;
 
 /// Run the fest pipeline to completion.
 ///
@@ -31,8 +32,8 @@ pub use error::Error;
 /// 2. Build the mutator registry from the enabled mutator flags.
 /// 3. Discover and count Python source files, then generate mutants.
 /// 4. Collect per-line test coverage from `pytest-cov`.
-/// 5. For each mutant, look up coverage and either mark as `NoCoverage`
-///    or run the test suite via [`runner::SubprocessRunner`].
+/// 5. For each mutant, look up coverage and either mark as `NoCoverage` or run the test suite via
+///    [`runner::SubprocessRunner`].
 /// 6. Build a [`report::MutationReport`] and format it for output.
 /// 7. Optionally check the mutation score against a `fail_under` threshold.
 ///
@@ -143,8 +144,7 @@ fn run_mutants(
             Some(tests) if !tests.is_empty() => {
                 // Only read the source file when we actually need to run the mutant.
                 let source = read_source_cached(&mut source_cache, &mutant.file_path)?;
-                runtime
-                    .block_on(runner.run_mutant(mutant, source, tests))?
+                runtime.block_on(runner.run_mutant(mutant, source, tests))?
             }
             _ => mutation::MutantResult {
                 mutant: mutant.clone(),
@@ -175,7 +175,10 @@ fn read_source_cached<'cache>(
 ) -> Result<&'cache str, Error> {
     if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(path.to_path_buf()) {
         let content = std::fs::read_to_string(path).map_err(|err| {
-            Error::Mutation(format!("failed to read source file {}: {err}", path.display()))
+            Error::Mutation(format!(
+                "failed to read source file {}: {err}",
+                path.display()
+            ))
         })?;
         let _inserted = entry.insert(content);
     }
@@ -315,8 +318,7 @@ mod tests {
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
 
-        let results =
-            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -347,8 +349,7 @@ mod tests {
 
         let config = config::FestConfig::default();
 
-        let results =
-            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -371,15 +372,11 @@ mod tests {
 
         let mut coverage_map = coverage::CoverageMap::new();
         // Entry exists but with empty test list.
-        let _prev = coverage_map.insert(
-            (PathBuf::from("src/app.py"), 1_u32),
-            Vec::new(),
-        );
+        let _prev = coverage_map.insert((PathBuf::from("src/app.py"), 1_u32), Vec::new());
 
         let config = config::FestConfig::default();
 
-        let results =
-            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
+        let results = run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -391,8 +388,7 @@ mod tests {
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
 
-        let results =
-            run_mutants(&[], &coverage_map, &config).expect("should succeed");
+        let results = run_mutants(&[], &coverage_map, &config).expect("should succeed");
 
         assert!(results.is_empty());
     }

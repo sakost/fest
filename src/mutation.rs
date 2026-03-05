@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::Error;
-use crate::config::MutatorConfig;
+use crate::{Error, config::MutatorConfig};
 
 /// Built-in mutation operators shipped with fest.
 pub mod builtin;

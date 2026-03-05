@@ -3,6 +3,8 @@
 //! Supports multiple output formats (text summary, JSON, etc.) and
 //! returns formatted strings that the caller can write wherever needed.
 
+/// HTML report formatter.
+pub mod html;
 /// JSON report formatter.
 pub mod json;
 /// Plain-text report formatter.
@@ -28,9 +30,7 @@ pub fn format_report(report: &MutationReport, format: &OutputFormat) -> Result<S
     match *format {
         OutputFormat::Text => text::format_text(report),
         OutputFormat::Json => json::format_json(report),
-        OutputFormat::Html => Err(Error::Report(
-            "HTML report format is not yet implemented".to_owned(),
-        )),
+        OutputFormat::Html => html::format_html(report),
     }
 }
 
@@ -440,12 +440,370 @@ mod tests {
             serde_json::from_str(&output).expect("should be valid JSON");
     }
 
-    /// `format_report` returns an error for HTML (not yet implemented).
+    /// `format_report` dispatches to HTML formatter.
     #[test]
-    fn format_report_html_not_implemented() {
+    fn format_report_html() {
         let report =
             MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
-        let result = format_report(&report, &OutputFormat::Html);
-        assert!(result.is_err());
+        let output = format_report(&report, &OutputFormat::Html).expect("should format HTML");
+        assert!(output.contains("<!DOCTYPE html>"));
+        assert!(output.contains("fest mutation testing report"));
+    }
+
+    // -- HTML reporter tests -------------------------------------------------
+
+    /// HTML report contains the DOCTYPE declaration.
+    #[test]
+    fn html_report_contains_doctype() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("<!DOCTYPE html>"));
+    }
+
+    /// HTML report contains the page title.
+    #[test]
+    fn html_report_contains_title() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("<title>fest mutation testing report</title>"));
+    }
+
+    /// HTML report contains inline CSS styles.
+    #[test]
+    fn html_report_contains_inline_css() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("<style>"));
+        assert!(output.contains(".killed"));
+        assert!(output.contains(".survived"));
+        assert!(output.contains(".no-coverage"));
+        assert!(output.contains("</style>"));
+    }
+
+    /// HTML report contains summary statistics.
+    #[test]
+    fn html_report_contains_summary() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 2_u32, "op", "-", "+"),
+                MutantStatus::Survived,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 3_usize, 10_usize, Duration::from_secs(5_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+
+        assert!(output.contains("Files scanned"));
+        assert!(output.contains("Mutants generated"));
+        assert!(output.contains("Killed"));
+        assert!(output.contains("Survived"));
+        assert!(output.contains("Mutation score"));
+    }
+
+    /// HTML report contains the mutation score as a percentage.
+    #[test]
+    fn html_report_contains_score_percentage() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("100.0%"));
+    }
+
+    /// HTML report shows file path in file section.
+    #[test]
+    fn html_report_shows_file_path() {
+        let results = vec![make_result(
+            make_mutant("src/parser.py", 10_u32, "ArithmeticOp", "+", "-"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("src/parser.py"));
+    }
+
+    /// HTML report uses green class for killed mutants.
+    #[test]
+    fn html_report_killed_line_green() {
+        let results = vec![make_result(
+            make_mutant("a.py", 5_u32, "op", "+", "-"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("class=\"line killed\""));
+    }
+
+    /// HTML report uses red class for survived mutants.
+    #[test]
+    fn html_report_survived_line_red() {
+        let results = vec![make_result(
+            make_mutant("a.py", 5_u32, "op", "+", "-"),
+            MutantStatus::Survived,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("class=\"line survived\""));
+    }
+
+    /// HTML report uses grey class for no-coverage mutants.
+    #[test]
+    fn html_report_no_coverage_line_grey() {
+        let results = vec![make_result(
+            make_mutant("a.py", 5_u32, "op", "+", "-"),
+            MutantStatus::NoCoverage,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("class=\"line no-coverage\""));
+    }
+
+    /// A line with mixed killed and survived uses survived (red) class.
+    #[test]
+    fn html_report_mixed_survived_takes_priority() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 5_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 5_u32, "op", "-", "+"),
+                MutantStatus::Survived,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("class=\"line survived\""));
+    }
+
+    /// A line with killed and no-coverage uses no-coverage (grey) class.
+    #[test]
+    fn html_report_mixed_killed_and_no_coverage_uses_grey() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 5_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 5_u32, "op", "-", "+"),
+                MutantStatus::NoCoverage,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        // Not all killed, so should be grey (no-coverage class).
+        assert!(output.contains("class=\"line no-coverage\""));
+    }
+
+    /// HTML report shows mutation detail with mutator name and texts.
+    #[test]
+    fn html_report_shows_mutation_detail() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "ArithmeticOp", "+", "-"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("ArithmeticOp"));
+        assert!(output.contains("[KILLED]"));
+        assert!(output.contains("<code>+</code>"));
+        assert!(output.contains("<code>-</code>"));
+    }
+
+    /// HTML report shows survived mutation detail label.
+    #[test]
+    fn html_report_shows_survived_label() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::Survived,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("[SURVIVED]"));
+    }
+
+    /// HTML report shows timeout mutation detail label.
+    #[test]
+    fn html_report_shows_timeout_label() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::Timeout,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("[TIMEOUT]"));
+    }
+
+    /// HTML report shows error mutation detail label.
+    #[test]
+    fn html_report_shows_error_label() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::Error("segfault".to_owned()),
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("[ERROR]"));
+    }
+
+    /// HTML report escapes HTML special characters in source text.
+    #[test]
+    fn html_report_escapes_html_chars() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "a < b", "a > b"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("a &lt; b"));
+        assert!(output.contains("a &gt; b"));
+    }
+
+    /// HTML report escapes ampersands in source text.
+    #[test]
+    fn html_report_escapes_ampersand() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "a & b", "a | b"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("a &amp; b"));
+    }
+
+    /// HTML report groups mutations by file.
+    #[test]
+    fn html_report_groups_by_file() {
+        let results = vec![
+            make_result(
+                make_mutant("alpha.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("beta.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Survived,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 2_usize, 2_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("alpha.py"));
+        assert!(output.contains("beta.py"));
+    }
+
+    /// HTML report for empty results produces valid HTML structure.
+    #[test]
+    fn html_report_empty_results() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("<!DOCTYPE html>"));
+        assert!(output.contains("</html>"));
+        assert!(output.contains("0.0%"));
+    }
+
+    /// HTML report is self-contained (no external stylesheets).
+    #[test]
+    fn html_report_self_contained() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        // Should not contain external stylesheet links.
+        assert!(!output.contains("<link rel=\"stylesheet\""));
+        // Should contain inline styles.
+        assert!(output.contains("<style>"));
+    }
+
+    /// HTML report contains closing tags in the right order.
+    #[test]
+    fn html_report_closing_tags() {
+        let report =
+            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("</body>"));
+        assert!(output.contains("</html>"));
+        // Body should close before html.
+        let body_close = output.find("</body>");
+        let html_close = output.find("</html>");
+        assert!(body_close < html_close);
+    }
+
+    /// HTML report shows multiple mutations on the same line.
+    #[test]
+    fn html_report_multiple_mutations_same_line() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 5_u32, "ArithmeticOp", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 5_u32, "ArithmeticOp", "+", "*"),
+                MutantStatus::Killed,
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        // Should show both mutation details.
+        assert!(output.contains("<code>-</code>"));
+        assert!(output.contains("<code>*</code>"));
+        // But only one line header for line 5.
+        let line5_count = output.matches("Line 5</div>").count();
+        assert_eq!(line5_count, 1_usize);
+    }
+
+    /// HTML report handles all status types in summary correctly.
+    #[test]
+    fn html_report_all_statuses_in_summary() {
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Killed,
+            ),
+            make_result(
+                make_mutant("a.py", 2_u32, "op", "-", "+"),
+                MutantStatus::Survived,
+            ),
+            make_result(
+                make_mutant("a.py", 3_u32, "op", "*", "/"),
+                MutantStatus::Timeout,
+            ),
+            make_result(
+                make_mutant("a.py", 4_u32, "op", "/", "*"),
+                MutantStatus::NoCoverage,
+            ),
+            make_result(
+                make_mutant("a.py", 5_u32, "op", "==", "!="),
+                MutantStatus::Error("oops".to_owned()),
+            ),
+        ];
+        let report =
+            MutationReport::from_results(results, 1_usize, 5_usize, Duration::from_secs(2_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("Timeout"));
+        assert!(output.contains("Errors"));
+        assert!(output.contains("No coverage"));
     }
 }
