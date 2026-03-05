@@ -102,9 +102,11 @@ impl Runner for PytestPluginRunner {
         let env = prepare_temp_env()?;
         let mut child = spawn_pytest(&env, tests)?;
 
-        let outcome =
-            tokio::time::timeout(self.timeout, run_protocol(env.listener, mutant, source, tests))
-                .await;
+        let outcome = tokio::time::timeout(
+            self.timeout,
+            run_protocol(env.listener, mutant, source, tests),
+        )
+        .await;
 
         // On timeout (or any exit path), ensure the child is killed.
         let _kill_result = child.kill().await;
@@ -171,10 +173,7 @@ fn prepare_temp_env() -> Result<TempRunEnv, Error> {
 /// # Errors
 ///
 /// Returns [`Error::Runner`] if the process cannot be spawned.
-fn spawn_pytest(
-    env: &TempRunEnv,
-    tests: &[String],
-) -> Result<tokio::process::Child, Error> {
+fn spawn_pytest(env: &TempRunEnv, tests: &[String]) -> Result<tokio::process::Child, Error> {
     Command::new("python")
         .args([
             "-m",
@@ -209,9 +208,10 @@ async fn run_protocol(
     source: &str,
     tests: &[String],
 ) -> Result<MutantStatus, Error> {
-    let (stream, _addr) = listener.accept().await.map_err(|err| {
-        Error::Runner(format!("failed to accept connection on socket: {err}"))
-    })?;
+    let (stream, _addr) = listener
+        .accept()
+        .await
+        .map_err(|err| Error::Runner(format!("failed to accept connection on socket: {err}")))?;
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
@@ -766,8 +766,7 @@ mod tests {
             // Read MUTANT
             let mut line = String::new();
             let _bytes = buf_reader.read_line(&mut line).await.expect("read mutant");
-            let parsed: serde_json::Value =
-                serde_json::from_str(&line).expect("parse mutant json");
+            let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse mutant json");
             assert_eq!(
                 parsed.get("type").and_then(|val| val.as_str()),
                 Some("mutant")

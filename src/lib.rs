@@ -129,6 +129,7 @@ fn run_mutants(
     coverage_map: &coverage::CoverageMap,
     config: &config::FestConfig,
 ) -> Result<Vec<mutation::MutantResult>, Error> {
+    // TODO: add runner selection config to choose between SubprocessRunner and PytestPluginRunner.
     let runner = runner::SubprocessRunner::new(config.timeout);
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|err| Error::Runner(format!("failed to create tokio runtime: {err}")))?;
