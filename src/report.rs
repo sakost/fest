@@ -693,6 +693,32 @@ mod tests {
         assert!(output.contains("a &amp; b"));
     }
 
+    /// HTML report escapes double quotes in source text.
+    #[test]
+    fn html_report_escapes_double_quotes() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "x == \"hello\"", "x != \"hello\""),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("&quot;hello&quot;"));
+    }
+
+    /// HTML report escapes single quotes in source text.
+    #[test]
+    fn html_report_escapes_single_quotes() {
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "x == 'world'", "x != 'world'"),
+            MutantStatus::Killed,
+        )];
+        let report =
+            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("&#39;world&#39;"));
+    }
+
     /// HTML report groups mutations by file.
     #[test]
     fn html_report_groups_by_file() {
@@ -769,8 +795,8 @@ mod tests {
         // Should show both mutation details.
         assert!(output.contains("<code>-</code>"));
         assert!(output.contains("<code>*</code>"));
-        // But only one line header for line 5.
-        let line5_count = output.matches("Line 5</div>").count();
+        // But only one line header for line 5 (showing the original source text).
+        let line5_count = output.matches("<span class=\"line-num\">5</span>").count();
         assert_eq!(line5_count, 1_usize);
     }
 

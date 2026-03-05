@@ -224,22 +224,31 @@ fn write_annotated_lines(
 ) -> Result<(), crate::Error> {
     for (line_num, line_results) in by_line {
         let css_class = determine_line_class(line_results);
-        write_line_header(*line_num, css_class, output)?;
+        write_line_header(*line_num, css_class, line_results, output)?;
         write_line_mutations(line_results, output)?;
     }
     Ok(())
 }
 
-/// Write the line number and status indicator for an annotated line.
+/// Write the line number and source text for an annotated line.
+///
+/// Displays the `original_text` from the first mutation on the line
+/// as inline `<code>`, giving the user context about the source code.
 fn write_line_header(
     line_num: u32,
     css_class: &str,
+    results: &[&MutantResult],
     output: &mut String,
 ) -> Result<(), crate::Error> {
+    let source_text = results
+        .first()
+        .map(|res| escape_html(&res.mutant.original_text));
+    let code_fragment = source_text.as_deref().unwrap_or("");
+
     writeln!(
         output,
-        "<div class=\"line {css_class}\"><span class=\"line-num\">{line_num}</span>Line \
-         {line_num}</div>",
+        "<div class=\"line {css_class}\"><span class=\"line-num\">\
+         {line_num}</span><code>{code_fragment}</code></div>",
     )
     .map_err(fmt_err)
 }
