@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::Error;
+use crate::config::MutatorConfig;
 
 /// Built-in mutation operators shipped with fest.
 pub mod builtin;
@@ -19,6 +20,53 @@ pub mod mutator;
 pub use mutant::{Mutant, MutantResult, MutantStatus};
 pub use mutator::{Mutation, Mutator, MutatorRegistry};
 
+/// Build a [`MutatorRegistry`] from a [`MutatorConfig`].
+///
+/// Reads each boolean flag in the configuration and registers the
+/// corresponding built-in mutator when the flag is `true`.
+///
+/// The mapping is:
+/// - `arithmetic_op` -> [`builtin::arithmetic::ArithmeticOp`]
+/// - `comparison_op` -> [`builtin::comparison::ComparisonOp`]
+/// - `boolean_op` -> [`builtin::boolean::BooleanOp`]
+/// - `return_value` -> [`builtin::return_value::ReturnValue`]
+/// - `negate_condition` -> [`builtin::negate_condition::NegateCondition`]
+/// - `remove_decorator` -> [`builtin::remove_decorator::RemoveDecorator`]
+/// - `constant_replace` -> [`builtin::constant::ConstantReplace`]
+/// - `exception_swallow` -> [`builtin::exception::ExceptionSwallow`]
+#[inline]
+#[must_use]
+pub fn build_registry(config: &MutatorConfig) -> MutatorRegistry {
+    let mut registry = MutatorRegistry::new();
+
+    if config.arithmetic_op {
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+    }
+    if config.comparison_op {
+        registry.register(Box::new(builtin::comparison::ComparisonOp));
+    }
+    if config.boolean_op {
+        registry.register(Box::new(builtin::boolean::BooleanOp));
+    }
+    if config.return_value {
+        registry.register(Box::new(builtin::return_value::ReturnValue));
+    }
+    if config.negate_condition {
+        registry.register(Box::new(builtin::negate_condition::NegateCondition));
+    }
+    if config.remove_decorator {
+        registry.register(Box::new(builtin::remove_decorator::RemoveDecorator));
+    }
+    if config.constant_replace {
+        registry.register(Box::new(builtin::constant::ConstantReplace));
+    }
+    if config.exception_swallow {
+        registry.register(Box::new(builtin::exception::ExceptionSwallow));
+    }
+
+    registry
+}
+
 /// Discover Python source files matching `source_patterns`, excluding any
 /// files that match `exclude_patterns`.
 ///
@@ -27,7 +75,7 @@ pub use mutator::{Mutation, Mutator, MutatorRegistry};
 /// # Errors
 ///
 /// Returns [`Error::Mutation`] if any glob pattern is invalid.
-fn discover_files(
+pub(crate) fn discover_files(
     source_patterns: &[String],
     exclude_patterns: &[String],
     base_dir: &Path,
@@ -447,5 +495,137 @@ mod tests {
 
         assert_eq!(mutants.len(), 1_usize);
         assert_eq!(mutants[0_usize].file_path, keep);
+    }
+
+    // -- build_registry tests -----------------------------------------------
+
+    /// Default `MutatorConfig` registers all 8 built-in mutators.
+    #[test]
+    fn build_registry_default_config_registers_all() {
+        let config = MutatorConfig::default();
+        let registry = build_registry(&config);
+        assert_eq!(registry.len(), 8_usize);
+    }
+
+    /// Disabling all flags produces an empty registry.
+    #[test]
+    fn build_registry_all_disabled_is_empty() {
+        let config = MutatorConfig {
+            arithmetic_op: false,
+            comparison_op: false,
+            boolean_op: false,
+            return_value: false,
+            negate_condition: false,
+            remove_decorator: false,
+            constant_replace: false,
+            exception_swallow: false,
+            custom: Vec::new(),
+            python: Vec::new(),
+            dylib: Vec::new(),
+        };
+        let registry = build_registry(&config);
+        assert!(registry.is_empty());
+    }
+
+    /// Enabling only `arithmetic_op` registers exactly one mutator with
+    /// the correct name.
+    #[test]
+    fn build_registry_single_flag_arithmetic() {
+        let config = MutatorConfig {
+            arithmetic_op: true,
+            comparison_op: false,
+            boolean_op: false,
+            return_value: false,
+            negate_condition: false,
+            remove_decorator: false,
+            constant_replace: false,
+            exception_swallow: false,
+            custom: Vec::new(),
+            python: Vec::new(),
+            dylib: Vec::new(),
+        };
+        let registry = build_registry(&config);
+        assert_eq!(registry.len(), 1_usize);
+        let names: Vec<&str> = registry.iter().map(Mutator::name).collect();
+        assert_eq!(names, vec!["arithmetic_op"]);
+    }
+
+    /// Enabling only `comparison_op` registers exactly one mutator.
+    #[test]
+    fn build_registry_single_flag_comparison() {
+        let config = MutatorConfig {
+            arithmetic_op: false,
+            comparison_op: true,
+            boolean_op: false,
+            return_value: false,
+            negate_condition: false,
+            remove_decorator: false,
+            constant_replace: false,
+            exception_swallow: false,
+            custom: Vec::new(),
+            python: Vec::new(),
+            dylib: Vec::new(),
+        };
+        let registry = build_registry(&config);
+        assert_eq!(registry.len(), 1_usize);
+        let names: Vec<&str> = registry.iter().map(Mutator::name).collect();
+        assert_eq!(names, vec!["comparison_op"]);
+    }
+
+    /// Enabling a subset of flags registers only the matching mutators.
+    #[test]
+    fn build_registry_partial_flags() {
+        let config = MutatorConfig {
+            arithmetic_op: true,
+            comparison_op: false,
+            boolean_op: true,
+            return_value: false,
+            negate_condition: true,
+            remove_decorator: false,
+            constant_replace: false,
+            exception_swallow: true,
+            custom: Vec::new(),
+            python: Vec::new(),
+            dylib: Vec::new(),
+        };
+        let registry = build_registry(&config);
+        assert_eq!(registry.len(), 4_usize);
+
+        let names: Vec<&str> = registry.iter().map(Mutator::name).collect();
+        assert!(names.contains(&"arithmetic_op"));
+        assert!(names.contains(&"boolean_op"));
+        assert!(names.contains(&"negate_condition"));
+        assert!(names.contains(&"exception_swallow"));
+        assert!(!names.contains(&"comparison_op"));
+        assert!(!names.contains(&"return_value"));
+        assert!(!names.contains(&"remove_decorator"));
+        assert!(!names.contains(&"constant_replace"));
+    }
+
+    /// Each flag maps to the correct mutator name.
+    #[test]
+    fn build_registry_flag_name_mapping() {
+        /// Expected mapping from config field name to mutator name.
+        const EXPECTED_NAMES: [&str; 8] = [
+            "arithmetic_op",
+            "comparison_op",
+            "boolean_op",
+            "return_value",
+            "negate_condition",
+            "remove_decorator",
+            "constant_replace",
+            "exception_swallow",
+        ];
+
+        let config = MutatorConfig::default();
+        let registry = build_registry(&config);
+        let names: Vec<&str> = registry.iter().map(Mutator::name).collect();
+
+        for expected in EXPECTED_NAMES {
+            assert!(
+                names.contains(&expected),
+                "expected mutator '{expected}' not found in registry",
+            );
+        }
     }
 }
