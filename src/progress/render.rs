@@ -4,6 +4,8 @@
 //! All stderr writes happen on this single task, so worker threads never
 //! block on I/O.
 
+use core::time::Duration;
+
 use console::Term;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -24,8 +26,8 @@ struct RenderState {
     colored: bool,
     /// Whether the terminal supports line overwriting.
     can_overwrite: bool,
-    /// Whether a phase-start line is currently on screen.
-    phase_line_active: bool,
+    /// Optional phase spinner (Fancy mode only).
+    spinner: Option<ProgressBar>,
     /// Optional progress bar (Fancy mode only).
     bar: Option<ProgressBar>,
 }
@@ -41,7 +43,7 @@ impl RenderState {
             mode,
             colored,
             can_overwrite,
-            phase_line_active: false,
+            spinner: None,
             bar: None,
         }
     }
@@ -83,25 +85,24 @@ impl RenderState {
             return;
         }
         if self.can_overwrite {
-            let spinner = if self.colored { "⠋" } else { "-" };
-            drop(self.term.write_line(&format!("  {spinner} {label}...")));
-            self.phase_line_active = true;
+            let pb = ProgressBar::new_spinner();
+            let template = ProgressStyle::with_template("  {spinner:.green} {msg}...");
+            if let Ok(styled) = template {
+                pb.set_style(styled.tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✔"));
+            }
+            pb.set_message(label.to_owned());
+            pb.enable_steady_tick(Duration::from_millis(80));
+            self.spinner = Some(pb);
         }
     }
 
     /// Handle a phase-complete event.
-    fn on_phase_complete(
-        &mut self,
-        detail: &str,
-        count_detail: Option<&str>,
-        elapsed: core::time::Duration,
-    ) {
+    fn on_phase_complete(&mut self, detail: &str, count_detail: Option<&str>, elapsed: Duration) {
         if self.mode == RenderMode::Quiet {
             return;
         }
-        if self.phase_line_active && self.can_overwrite {
-            drop(self.term.clear_last_lines(1_usize));
-            self.phase_line_active = false;
+        if let Some(pb) = self.spinner.take() {
+            pb.finish_and_clear();
         }
 
         let timing = style::format_duration(elapsed);
@@ -122,9 +123,8 @@ impl RenderState {
         if self.mode != RenderMode::Fancy || !self.term.is_term() {
             return;
         }
-        if self.phase_line_active {
-            drop(self.term.clear_last_lines(1_usize));
-            self.phase_line_active = false;
+        if let Some(pb) = self.spinner.take() {
+            pb.finish_and_clear();
         }
         let pb = ProgressBar::new(total);
         let template = ProgressStyle::with_template(
@@ -138,7 +138,7 @@ impl RenderState {
 
     /// Handle a single mutant-completed event.
     fn on_mutant_completed(
-        &mut self,
+        &self,
         index: usize,
         total: usize,
         summary: &super::event::MutantDisplay,
@@ -150,7 +150,6 @@ impl RenderState {
                 }
             }
             RenderMode::Verbose => {
-                self.phase_line_active = false;
                 let line = style::format_colored_mutant_line(index, total, summary);
                 drop(self.term.write_line(&line));
             }
@@ -226,7 +225,7 @@ mod tests {
         drop(sender.send(RenderEvent::PhaseComplete {
             detail: "Done".to_owned(),
             count_detail: None,
-            elapsed: core::time::Duration::from_millis(10_u64),
+            elapsed: Duration::from_millis(10_u64),
         }));
         drop(sender.send(RenderEvent::Shutdown));
 
