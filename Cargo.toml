@@ -131,7 +131,7 @@ use_debug = "deny"
 wildcard_dependencies = "deny"
 
 [package.metadata.cargo-machete]
-ignored = ["clap", "rayon", "ruff_python_ast", "ruff_python_parser", "ruff_text_size", "serde", "serde_json", "thiserror", "tokio"]
+ignored = ["serde", "thiserror"]
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
@@ -139,6 +139,7 @@ console = "0.16"
 glob = "0.3.3"
 indicatif = "0.18.4"
 rayon = "1.11.0"
+rusqlite = { version = "0.38", features = ["bundled"] }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.11.6", version = "0.0.0" }
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.11.6", version = "0.0.0" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.11.6", version = "0.0.0" }

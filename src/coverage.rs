@@ -6,11 +6,11 @@
 //! The workflow is:
 //! 1. Verify that `pytest-cov` is available in the target Python environment.
 //! 2. Run `pytest --cov --cov-context=test` to produce a `.coverage` database.
-//! 3. Export the database to JSON via `coverage json --show-contexts`.
-//! 4. Parse the JSON into a [`CoverageMap`] that maps `(file, line)` pairs to the test IDs that
-//!    exercised each line.
+//! 3. Read the `.coverage` `SQLite` database directly into a [`CoverageMap`] that maps `(file,
+//!    line)` pairs to the test IDs that exercised each line.
 
 mod json_parser;
+mod sqlite_reader;
 
 use std::{
     collections::HashMap,
@@ -20,15 +20,15 @@ use std::{
 
 use crate::Error;
 
+/// Name of the `.coverage` `SQLite` database produced by `pytest-cov`.
+const COVERAGE_DB_FILENAME: &str = ".coverage";
+
 /// A mapping from `(source_file, line_number)` to the list of test IDs that
 /// covered that line.
 ///
 /// The `PathBuf` is relative to the project directory (matching the paths
 /// emitted by `coverage json`), and the line number is 1-based.
 pub type CoverageMap = HashMap<(PathBuf, u32), Vec<String>>;
-
-/// Name of the JSON file produced by `coverage json`.
-const COVERAGE_JSON_FILENAME: &str = ".coverage.json";
 
 /// Verify that `pytest-cov` is importable in the project's Python environment.
 ///
@@ -150,60 +150,18 @@ fn run_pytest_cov(
     Ok(output.status.success())
 }
 
-/// Export the `.coverage` sqlite database to JSON using `coverage json`.
+/// Check whether the cached `.coverage` database is fresh.
 ///
-/// Produces a file at `<project_dir>/.coverage.json` that contains per-line
-/// context information.
-///
-/// # Errors
-///
-/// Returns [`Error::Coverage`] if the subprocess fails or exits with a
-/// non-zero status.
-fn export_coverage_json(project_dir: &Path) -> Result<PathBuf, Error> {
-    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
-    let json_path_str = json_path.display().to_string();
-
-    // `--fail-under=0` overrides the project's `[tool.coverage.report]
-    // fail_under` setting. Without this, `coverage json` exits with code 2
-    // when the total coverage is below the threshold, even though the JSON
-    // file is produced successfully.
-    let output = Command::new("python")
-        .args([
-            "-m",
-            "coverage",
-            "json",
-            "--show-contexts",
-            "--fail-under=0",
-            "-o",
-        ])
-        .arg(&json_path_str)
-        .current_dir(project_dir)
-        .output()
-        .map_err(|err| Error::Coverage(format!("failed to spawn `coverage json`: {err}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(Error::Coverage(format!(
-            "coverage json export failed: {stderr}{stdout}"
-        )));
-    }
-
-    Ok(json_path)
-}
-
-/// Check whether the cached `.coverage.json` is fresh.
-///
-/// Returns `true` when `<project_dir>/.coverage.json` exists and its
-/// modification time is newer than every `**/*.py` file **and** every
-/// configuration file (`fest.toml`, `pyproject.toml`) under the project
-/// directory. Returns `false` otherwise (missing file, I/O errors, or any
-/// relevant file is newer than the cache).
+/// Returns `true` when `<project_dir>/.coverage` exists and its modification
+/// time is newer than every `**/*.py` file **and** every configuration file
+/// (`fest.toml`, `pyproject.toml`) under the project directory. Returns
+/// `false` otherwise (missing file, I/O errors, or any relevant file is newer
+/// than the cache).
 #[inline]
 #[must_use]
 pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
-    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
-    let Ok(json_mtime) = std::fs::metadata(&json_path).and_then(|m| m.modified()) else {
+    let db_path = project_dir.join(COVERAGE_DB_FILENAME);
+    let Ok(db_mtime) = std::fs::metadata(&db_path).and_then(|m| m.modified()) else {
         return false;
     };
 
@@ -213,7 +171,7 @@ pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
         let config_path = project_dir.join(config_name);
         let is_newer = std::fs::metadata(&config_path)
             .and_then(|m| m.modified())
-            .is_ok_and(|mtime| mtime > json_mtime);
+            .is_ok_and(|mtime| mtime > db_mtime);
         if is_newer {
             return false;
         }
@@ -231,7 +189,7 @@ pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
         let Ok(py_mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
             return false;
         };
-        if py_mtime > json_mtime {
+        if py_mtime > db_mtime {
             return false;
         }
     }
@@ -239,28 +197,26 @@ pub fn is_coverage_cache_fresh(project_dir: &Path) -> bool {
     true
 }
 
-/// Load coverage data from the cached `.coverage.json` in the project
+/// Load coverage data from the cached `.coverage` database in the project
 /// directory, without running any subprocesses.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Coverage`] if the file cannot be read or parsed.
+/// Returns [`Error::Coverage`] if the database cannot be read or parsed.
 #[inline]
 pub fn load_cached_coverage(project_dir: &Path) -> Result<CoverageMap, Error> {
-    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
-    json_parser::parse_coverage_json(&json_path, project_dir)
+    let db_path = project_dir.join(COVERAGE_DB_FILENAME);
+    sqlite_reader::parse_coverage_sqlite(&db_path, project_dir)
 }
 
 /// Load coverage data from a user-provided file.
 ///
-/// If the path has a `.json` extension it is parsed directly. Otherwise it
-/// is treated as a `.coverage` `SQLite` database: `coverage json` is invoked
-/// with `COVERAGE_FILE` pointing at the given path to export JSON, and then
-/// the JSON is parsed.
+/// If the path has a `.json` extension it is parsed as `coverage json` output.
+/// Otherwise it is treated as a `.coverage` `SQLite` database and read directly.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Coverage`] if the export or parse fails.
+/// Returns [`Error::Coverage`] if the file cannot be read or parsed.
 #[inline]
 pub fn load_coverage_from(path: &Path, project_dir: &Path) -> Result<CoverageMap, Error> {
     let is_json = path
@@ -271,40 +227,7 @@ pub fn load_coverage_from(path: &Path, project_dir: &Path) -> Result<CoverageMap
         return json_parser::parse_coverage_json(path, project_dir);
     }
 
-    // Assume SQLite .coverage database — export to JSON first.
-    let json_path = project_dir.join(COVERAGE_JSON_FILENAME);
-    let json_path_str = json_path.display().to_string();
-
-    let output = Command::new("python")
-        .args([
-            "-m",
-            "coverage",
-            "json",
-            "--show-contexts",
-            "--fail-under=0",
-            "-o",
-        ])
-        .arg(&json_path_str)
-        .env("COVERAGE_FILE", path)
-        .current_dir(project_dir)
-        .output()
-        .map_err(|err| {
-            Error::Coverage(format!(
-                "failed to spawn `coverage json` for {}: {err}",
-                path.display()
-            ))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(Error::Coverage(format!(
-            "coverage json export from {} failed: {stderr}{stdout}",
-            path.display()
-        )));
-    }
-
-    json_parser::parse_coverage_json(&json_path, project_dir)
+    sqlite_reader::parse_coverage_sqlite(path, project_dir)
 }
 
 /// Collect per-line test coverage for a Python project.
@@ -312,13 +235,12 @@ pub fn load_coverage_from(path: &Path, project_dir: &Path) -> Result<CoverageMap
 /// This is the main entry point for the coverage module. It:
 /// 1. Checks that `pytest-cov` is installed.
 /// 2. Runs pytest with coverage and test-context tracking.
-/// 3. Exports the resulting `.coverage` database to JSON.
-/// 4. Parses the JSON into a [`CoverageMap`].
+/// 3. Reads the resulting `.coverage` `SQLite` database directly.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Coverage`] if `pytest-cov` is not available, the coverage
-/// export fails, or the JSON cannot be parsed.
+/// Returns [`Error::Coverage`] if `pytest-cov` is not available or the
+/// database cannot be read.
 #[inline]
 pub fn collect_coverage(
     project_dir: &Path,
@@ -331,9 +253,8 @@ pub fn collect_coverage(
     // We intentionally ignore the test pass/fail status — coverage data
     // is produced even when some tests fail.
 
-    let json_path = export_coverage_json(project_dir)?;
-
-    json_parser::parse_coverage_json(&json_path, project_dir)
+    let db_path = project_dir.join(COVERAGE_DB_FILENAME);
+    sqlite_reader::parse_coverage_sqlite(&db_path, project_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,20 +342,10 @@ mod tests {
         assert_eq!(extract_source_dirs(&patterns), vec!["src/app/collectors"],);
     }
 
-    /// `export_coverage_json` fails when there is no `.coverage` file.
+    /// `COVERAGE_DB_FILENAME` has the expected value.
     #[test]
-    fn export_coverage_json_no_coverage_file() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let result = export_coverage_json(dir.path());
-        // Should be an error because there is no .coverage database.
-        // Accept Err or Ok depending on whether `coverage` CLI is installed.
-        let _unused = result;
-    }
-
-    /// `COVERAGE_JSON_FILENAME` has the expected value.
-    #[test]
-    fn coverage_json_filename_constant() {
-        assert_eq!(COVERAGE_JSON_FILENAME, ".coverage.json");
+    fn coverage_db_filename_constant() {
+        assert_eq!(COVERAGE_DB_FILENAME, ".coverage");
     }
 
     /// `CoverageMap` supports expected lookup operations.
@@ -488,9 +399,9 @@ mod tests {
         assert_eq!(map.len(), 0_usize);
     }
 
-    /// `is_coverage_cache_fresh` returns false when `.coverage.json` is missing.
+    /// `is_coverage_cache_fresh` returns false when `.coverage` is missing.
     #[test]
-    fn is_coverage_cache_fresh_no_json() {
+    fn is_coverage_cache_fresh_no_db() {
         let dir = tempfile::tempdir().expect("create temp dir");
         assert!(!is_coverage_cache_fresh(dir.path()));
     }
@@ -500,9 +411,9 @@ mod tests {
     fn is_coverage_cache_fresh_stale() {
         let dir = tempfile::tempdir().expect("create temp dir");
 
-        // Create .coverage.json first.
-        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
-        std::fs::write(&json_path, "{}").expect("write json");
+        // Create .coverage first.
+        let db_path = dir.path().join(COVERAGE_DB_FILENAME);
+        std::fs::write(&db_path, "").expect("write db");
 
         // Sleep briefly so the .py file gets a strictly newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(50_u64));
@@ -513,7 +424,7 @@ mod tests {
         assert!(!is_coverage_cache_fresh(dir.path()));
     }
 
-    /// `is_coverage_cache_fresh` returns true when json is newer than all `.py`.
+    /// `is_coverage_cache_fresh` returns true when db is newer than all `.py`.
     #[test]
     fn is_coverage_cache_fresh_valid() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -522,11 +433,11 @@ mod tests {
         let py_path = dir.path().join("app.py");
         std::fs::write(&py_path, "x = 1").expect("write py");
 
-        // Sleep briefly so the json gets a strictly newer mtime.
+        // Sleep briefly so the db gets a strictly newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(50_u64));
 
-        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
-        std::fs::write(&json_path, "{}").expect("write json");
+        let db_path = dir.path().join(COVERAGE_DB_FILENAME);
+        std::fs::write(&db_path, "").expect("write db");
 
         assert!(is_coverage_cache_fresh(dir.path()));
     }
@@ -540,13 +451,13 @@ mod tests {
         let py_path = dir.path().join("app.py");
         std::fs::write(&py_path, "x = 1").expect("write py");
 
-        // Sleep so .coverage.json is strictly newer than .py.
+        // Sleep so .coverage is strictly newer than .py.
         std::thread::sleep(std::time::Duration::from_millis(50_u64));
 
-        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
-        std::fs::write(&json_path, "{}").expect("write json");
+        let db_path = dir.path().join(COVERAGE_DB_FILENAME);
+        std::fs::write(&db_path, "").expect("write db");
 
-        // Sleep so fest.toml is strictly newer than .coverage.json.
+        // Sleep so fest.toml is strictly newer than .coverage.
         std::thread::sleep(std::time::Duration::from_millis(50_u64));
 
         let config_path = dir.path().join("fest.toml");
@@ -561,8 +472,8 @@ mod tests {
     fn is_coverage_cache_stale_after_pyproject_change() {
         let dir = tempfile::tempdir().expect("create temp dir");
 
-        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
-        std::fs::write(&json_path, "{}").expect("write json");
+        let db_path = dir.path().join(COVERAGE_DB_FILENAME);
+        std::fs::write(&db_path, "").expect("write db");
 
         std::thread::sleep(std::time::Duration::from_millis(50_u64));
 
@@ -572,23 +483,24 @@ mod tests {
         assert!(!is_coverage_cache_fresh(dir.path()));
     }
 
-    /// `load_cached_coverage` parses a valid `.coverage.json` round-trip.
+    /// `load_cached_coverage` parses a valid `.coverage` SQLite database.
     #[test]
-    fn load_cached_coverage_parses_json() {
+    fn load_cached_coverage_parses_db() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let json_path = dir.path().join(COVERAGE_JSON_FILENAME);
+        let db_path = dir.path().join(COVERAGE_DB_FILENAME);
 
-        let json_content = r#"{
-            "files": {
-                "lib.py": {
-                    "executed_lines": [1],
-                    "contexts": {
-                        "1": ["test_lib.py::test_func"]
-                    }
-                }
-            }
-        }"#;
-        std::fs::write(&json_path, json_content).expect("write json");
+        // Create a minimal SQLite coverage database.
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             INSERT INTO file (id, path) VALUES (1, 'lib.py');
+             INSERT INTO context (id, context) VALUES (1, 'test_lib.py::test_func|run');
+             INSERT INTO line_bits (file_id, context_id, numbits) VALUES (1, 1, X'02');",
+        )
+        .expect("create and populate db");
+        drop(conn);
 
         let map = load_cached_coverage(dir.path()).expect("should parse");
         let key = (dir.path().join("lib.py"), 1_u32);
