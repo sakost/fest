@@ -8,6 +8,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Execution backend for running mutants against the test suite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnerBackend {
+    /// Subprocess runner: writes mutated file to tmpdir, spawns pytest.
+    Subprocess,
+    /// Pytest plugin runner: in-process patching via Unix socket protocol.
+    /// Falls back to subprocess automatically on infrastructure errors.
+    #[default]
+    Plugin,
+}
+
 /// Output format for the mutation-testing report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -138,6 +150,9 @@ pub struct FestConfig {
     /// Output format for the mutation report.
     #[serde(default)]
     pub output: OutputFormat,
+    /// Execution backend for running mutants against the test suite.
+    #[serde(default)]
+    pub backend: RunnerBackend,
     /// Mutator configuration.
     #[serde(default)]
     pub mutators: MutatorConfig,
@@ -164,6 +179,7 @@ impl Default for FestConfig {
             timeout: default_timeout(),
             fail_under: None,
             output: OutputFormat::default(),
+            backend: RunnerBackend::default(),
             mutators: MutatorConfig::default(),
             coverage_cache: true,
             coverage_from: None,

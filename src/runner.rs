@@ -17,11 +17,14 @@ pub mod pytest_plugin;
 /// Subprocess-based runner backend.
 pub mod subprocess;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 pub use pytest_plugin::PytestPluginRunner;
 pub use subprocess::SubprocessRunner;
 
 use crate::{
     Error,
+    config::RunnerBackend,
     mutation::{Mutant, MutantResult},
 };
 
@@ -78,5 +81,133 @@ pub(crate) fn build_python_path(dir: &std::path::Path) -> String {
             format!("{dir_str}{PYTHON_PATH_SEPARATOR}{existing}")
         }
         _ => dir_str,
+    }
+}
+
+/// Enum dispatch wrapper for mutant execution backends.
+///
+/// The [`Runner`] trait uses RPITIT (`-> impl Future`), which makes it
+/// not object-safe. This enum provides static dispatch over all
+/// available backends.
+///
+/// The [`Plugin`](Self::Plugin) variant carries a subprocess fallback:
+/// on the first [`Error::Runner`] from the plugin, it switches to
+/// subprocess for all remaining mutants.
+#[derive(Debug)]
+pub enum AnyRunner {
+    /// Subprocess-based runner (no fallback).
+    Subprocess(SubprocessRunner),
+    /// Pytest-plugin-based runner with automatic subprocess fallback.
+    Plugin {
+        /// Primary plugin runner.
+        plugin: PytestPluginRunner,
+        /// Fallback subprocess runner, used when the plugin fails.
+        subprocess: SubprocessRunner,
+        /// Set to `true` after the first plugin infrastructure failure.
+        plugin_failed: AtomicBool,
+    },
+}
+
+impl AnyRunner {
+    /// Run the test suite against a single mutant, dispatching to the
+    /// underlying backend.
+    ///
+    /// When the plugin backend encounters an infrastructure error
+    /// ([`Error::Runner`]), it automatically falls back to subprocess
+    /// for this and all subsequent mutants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] if the backend (or its fallback)
+    /// encounters an unrecoverable error.
+    #[inline]
+    pub async fn run_mutant(
+        &self,
+        mutant: &Mutant,
+        source: &str,
+        tests: &[String],
+    ) -> Result<MutantResult, Error> {
+        #[allow(
+            clippy::pattern_type_mismatch,
+            reason = "matching on &AnyRunner requires pattern_type_mismatch suppression"
+        )]
+        match self {
+            Self::Subprocess(runner) => runner.run_mutant(mutant, source, tests).await,
+            Self::Plugin {
+                plugin,
+                subprocess,
+                plugin_failed,
+            } => {
+                if plugin_failed.load(Ordering::Relaxed) {
+                    return subprocess.run_mutant(mutant, source, tests).await;
+                }
+
+                match plugin.run_mutant(mutant, source, tests).await {
+                    Err(Error::Runner(msg)) => {
+                        let first = !plugin_failed.swap(true, Ordering::Relaxed);
+                        if first {
+                            let mut stderr = std::io::stderr().lock();
+                            let _result = std::io::Write::write_all(
+                                &mut stderr,
+                                format!(
+                                    "fest: plugin runner failed ({msg}), falling back to \
+                                     subprocess\n"
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        subprocess.run_mutant(mutant, source, tests).await
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+}
+
+/// Build the runner backend selected by the configuration.
+///
+/// The [`Plugin`](RunnerBackend::Plugin) variant always includes a
+/// subprocess fallback runner alongside the plugin runner.
+#[inline]
+#[must_use]
+pub const fn build_runner(backend: &RunnerBackend, timeout: u64) -> AnyRunner {
+    match *backend {
+        RunnerBackend::Subprocess => AnyRunner::Subprocess(SubprocessRunner::new(timeout)),
+        RunnerBackend::Plugin => AnyRunner::Plugin {
+            plugin: PytestPluginRunner::new(timeout),
+            subprocess: SubprocessRunner::new(timeout),
+            plugin_failed: AtomicBool::new(false),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build_runner` returns `AnyRunner::Subprocess` for the subprocess backend.
+    #[test]
+    fn build_runner_subprocess() {
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        assert!(matches!(runner, AnyRunner::Subprocess(_)));
+    }
+
+    /// `build_runner` returns `AnyRunner::Plugin` for the plugin backend.
+    #[test]
+    fn build_runner_plugin() {
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        assert!(matches!(runner, AnyRunner::Plugin { .. }));
+    }
+
+    /// Plugin variant includes a fresh `plugin_failed` flag.
+    #[test]
+    fn build_runner_plugin_not_failed() {
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        if let AnyRunner::Plugin { plugin_failed, .. } = &runner {
+            assert!(!plugin_failed.load(Ordering::Relaxed));
+        } else {
+            panic!("expected AnyRunner::Plugin");
+        }
     }
 }

@@ -10,6 +10,7 @@ use std::path::Path;
 
 pub use types::{
     CustomMutator, DylibMutator, FestConfig, MutatorConfig, OutputFormat, PythonMutator,
+    RunnerBackend,
 };
 
 use crate::Error;
@@ -118,6 +119,8 @@ fn load_pyproject_toml(path: &Path) -> Result<FestConfig, Error> {
 mod tests {
     use std::io::Write as _;
 
+    use types::RunnerBackend;
+
     use super::*;
 
     /// Full fest.toml round-trip: serialize defaults, then deserialize.
@@ -133,6 +136,7 @@ workers_cpu_ratio = 0.5
 timeout = 30
 fail_under = 80.0
 output = "json"
+backend = "plugin"
 
 [fest.mutators]
 arithmetic_op = true
@@ -167,6 +171,7 @@ path = "target/release/libmy_mutator.so"
         assert_eq!(cfg.timeout, 30_u64);
         assert!((cfg.fail_under.unwrap_or(0.0) - 80.0).abs() < f64::EPSILON);
         assert_eq!(cfg.output, OutputFormat::Json);
+        assert_eq!(cfg.backend, RunnerBackend::Plugin);
 
         // Mutator flags
         assert!(cfg.mutators.arithmetic_op);
@@ -221,6 +226,9 @@ path = "target/release/libmy_mutator.so"
         assert!(cfg.coverage_cache);
         assert!(cfg.coverage_from.is_none());
         assert!(cfg.fast_coverage);
+
+        // Runner backend
+        assert_eq!(cfg.backend, RunnerBackend::Plugin);
     }
 
     /// Minimal fest.toml — only required top-level table, all fields default.

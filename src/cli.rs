@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::config::{FestConfig, OutputFormat};
+use crate::config::{FestConfig, OutputFormat, RunnerBackend};
 
 // ---------------------------------------------------------------------------
 // Top-level CLI
@@ -111,6 +111,12 @@ pub struct RunArgs {
     /// collection. Use this flag to let coverage.py pick its own backend.
     #[arg(long)]
     pub no_fast_coverage: bool,
+
+    /// Execution backend: "subprocess" (default) or "plugin".
+    ///
+    /// Overrides `backend` in the config file.
+    #[arg(short, long)]
+    pub backend: Option<RunnerBackend>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +152,7 @@ pub fn run_args(args: Args) -> RunArgs {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         },
     }
 }
@@ -188,6 +195,9 @@ pub fn merge_config(args: &RunArgs, mut config: FestConfig) -> FestConfig {
     if args.no_fast_coverage {
         config.fast_coverage = false;
     }
+    if let Some(backend) = args.backend.as_ref() {
+        config.backend = backend.clone();
+    }
     config
 }
 
@@ -216,6 +226,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config.clone());
@@ -239,6 +250,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -262,6 +274,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -285,6 +298,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -308,6 +322,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -331,6 +346,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -354,6 +370,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -377,6 +394,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -400,6 +418,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -411,6 +430,32 @@ mod tests {
         assert_eq!(merged.output, OutputFormat::Html);
         // Unset fields keep their config-file values
         assert!((merged.workers_cpu_ratio - 0.75).abs() < f64::EPSILON);
+    }
+
+    /// CLI `--backend` overrides the config backend.
+    #[test]
+    fn merge_backend_override() {
+        let config = FestConfig::default();
+        assert_eq!(config.backend, RunnerBackend::Plugin);
+
+        let args = RunArgs {
+            verbose: false,
+            source: None,
+            exclude: None,
+            workers: None,
+            workers_cpu_ratio: None,
+            timeout: None,
+            fail_under: None,
+            output: None,
+            config: None,
+            no_coverage_cache: false,
+            coverage_from: None,
+            no_fast_coverage: false,
+            backend: Some(RunnerBackend::Plugin),
+        };
+
+        let merged = merge_config(&args, config);
+        assert_eq!(merged.backend, RunnerBackend::Plugin);
     }
 
     /// CLI overrides take priority over non-default config values.
@@ -434,6 +479,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -461,6 +507,7 @@ mod tests {
             no_coverage_cache: true,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);
@@ -486,6 +533,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: Some(PathBuf::from("my/.coverage.json")),
             no_fast_coverage: false,
+            backend: None,
         };
 
         let merged = merge_config(&args, config);

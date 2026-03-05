@@ -25,7 +25,6 @@ pub mod runner;
 pub mod signal;
 
 pub use error::Error;
-use runner::Runner as _;
 
 /// Shared context passed into the mutant execution loop.
 ///
@@ -52,7 +51,7 @@ struct RunContext<'ctx> {
 /// 3. Discover and count Python source files, then generate mutants.
 /// 4. Collect per-line test coverage from `pytest-cov`.
 /// 5. For each mutant, look up coverage and either mark as `NoCoverage` or run the test suite via
-///    [`runner::SubprocessRunner`].
+///    the configured runner backend.
 /// 6. Build a [`report::MutationReport`] and format it for output.
 /// 7. Optionally check the mutation score against a `fail_under` threshold.
 ///
@@ -101,7 +100,8 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
 
     // 5. Run each mutant against the test suite.
     reporter.phase(&format!(
-        "[6/7] Running {mutants_generated} mutants against the test suite..."
+        "[6/7] Running {mutants_generated} mutants against the test suite (backend: {:?})...",
+        config.backend,
     ));
     let total_u64 = u64::try_from(mutants_generated).unwrap_or(u64::MAX);
     reporter.start_mutants(total_u64);
@@ -206,7 +206,7 @@ fn resolve_coverage(
 /// sized to [`config::FestConfig::resolved_workers`] and maps over the
 /// mutants with `par_iter`. Each task checks for cancellation, looks up
 /// coverage, and either marks the mutant as `NoCoverage` or runs the test
-/// suite via [`runner::SubprocessRunner`].
+/// suite via the configured runner backend.
 ///
 /// **Phase C — Collect.** Filters out `None` results (from cancelled
 /// tasks) and detects whether any cancellation occurred.
@@ -224,8 +224,7 @@ fn run_mutants(
     config: &config::FestConfig,
     ctx: &RunContext<'_>,
 ) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
-    // TODO: add runner selection config to choose between SubprocessRunner and PytestPluginRunner.
-    let runner = runner::SubprocessRunner::new(config.timeout);
+    let runner = runner::build_runner(&config.backend, config.timeout);
     let total = mutants.len();
 
     // Phase A: Pre-read source files that have at least one covered mutant.
@@ -392,6 +391,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -414,6 +414,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
@@ -438,6 +439,7 @@ mod tests {
             no_coverage_cache: false,
             coverage_from: None,
             no_fast_coverage: false,
+            backend: None,
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
