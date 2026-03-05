@@ -96,7 +96,7 @@ impl Runner for SubprocessRunner {
         })?;
 
         // 3. Build PYTHONPATH: prepend the temp dir so imports resolve there first.
-        let python_path = build_python_path(temp_dir.path());
+        let python_path = super::build_python_path(temp_dir.path());
 
         // 4. Spawn pytest.
         let mut cmd = Command::new("python");
@@ -150,18 +150,6 @@ fn relative_or_filename(path: &Path) -> &Path {
     }
     // For absolute paths, use just the file name to keep the temp dir flat.
     path.file_name().map_or(path, Path::new)
-}
-
-/// Build a `PYTHONPATH` string that prepends `dir` to any existing value.
-fn build_python_path(dir: &Path) -> String {
-    let dir_str = dir.display().to_string();
-
-    match std::env::var("PYTHONPATH") {
-        Ok(existing) if !existing.is_empty() => {
-            format!("{dir_str}:{existing}")
-        }
-        _ => dir_str,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +229,7 @@ mod tests {
     #[test]
     fn python_path_construction() {
         let dir = Path::new("/tmp/fest_test");
-        let result = build_python_path(dir);
+        let result = super::super::build_python_path(dir);
         assert!(result.starts_with("/tmp/fest_test"));
     }
 

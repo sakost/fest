@@ -15,7 +15,6 @@ Protocol (JSON-over-newline):
 
 from __future__ import annotations
 
-import importlib
 import json
 import socket
 import sys

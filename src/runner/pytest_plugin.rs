@@ -14,7 +14,6 @@
 //! 6. Sends `SHUTDOWN` and cleans up.
 
 use core::time::Duration;
-use std::path::Path;
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -88,7 +87,7 @@ impl PytestPluginRunner {
         })?;
 
         // 4. Build PYTHONPATH so pytest can import the plugin.
-        let python_path = build_python_path(temp_dir.path());
+        let python_path = super::build_python_path(temp_dir.path());
 
         // 5. Spawn pytest with the plugin.
         let socket_path_str = socket_path.display().to_string();
@@ -334,25 +333,13 @@ fn file_to_module(file_path: &str) -> String {
     name.replace(['/', '\\'], ".")
 }
 
-/// Build a `PYTHONPATH` string that prepends `dir` to any existing value.
-fn build_python_path(dir: &Path) -> String {
-    let dir_str = dir.display().to_string();
-
-    match std::env::var("PYTHONPATH") {
-        Ok(existing) if !existing.is_empty() => {
-            format!("{dir_str}:{existing}")
-        }
-        _ => dir_str,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -569,7 +556,7 @@ mod tests {
     #[test]
     fn python_path_construction() {
         let dir = Path::new("/tmp/fest_plugin");
-        let result = build_python_path(dir);
+        let result = super::super::build_python_path(dir);
         assert!(result.starts_with("/tmp/fest_plugin"));
     }
 
