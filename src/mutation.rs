@@ -186,6 +186,41 @@ fn generate_mutants_for_file(
     Ok(mutants)
 }
 
+/// Generate mutants for a pre-discovered set of files in parallel.
+///
+/// For each file in `files`, reads the source, parses the AST with
+/// `ruff_python_parser`, and runs every mutator in the `registry`.
+/// Each [`Mutation`] is converted into a [`Mutant`] with the file path,
+/// line/column numbers, and byte offset information.
+///
+/// File processing is parallelized across available cores using
+/// [rayon](https://docs.rs/rayon).
+///
+/// # Errors
+///
+/// Returns [`Error::Mutation`] if a file cannot be read or a Python
+/// source file fails to parse.
+#[inline]
+pub fn generate_mutants_for_files(
+    files: &[PathBuf],
+    registry: &MutatorRegistry,
+) -> Result<Vec<Mutant>, Error> {
+    let results: Result<Vec<Vec<Mutant>>, Error> = files
+        .par_iter()
+        .map(|path| generate_mutants_for_file(path, registry))
+        .collect();
+
+    let nested = results?;
+    let mut all_mutants: Vec<Mutant> = nested.into_iter().flatten().collect();
+    all_mutants.sort_by(|lhs, rhs| {
+        lhs.file_path
+            .cmp(&rhs.file_path)
+            .then(lhs.byte_offset.cmp(&rhs.byte_offset))
+    });
+
+    Ok(all_mutants)
+}
+
 /// Discover Python source files and generate all mutants in parallel.
 ///
 /// 1. Resolves `source_patterns` against `base_dir` to find `.py` files, filtering out any that
@@ -210,21 +245,7 @@ pub fn generate_mutants(
     registry: &MutatorRegistry,
 ) -> Result<Vec<Mutant>, Error> {
     let files = discover_files(source_patterns, exclude_patterns, base_dir)?;
-
-    let results: Result<Vec<Vec<Mutant>>, Error> = files
-        .par_iter()
-        .map(|path| generate_mutants_for_file(path, registry))
-        .collect();
-
-    let nested = results?;
-    let mut all_mutants: Vec<Mutant> = nested.into_iter().flatten().collect();
-    all_mutants.sort_by(|lhs, rhs| {
-        lhs.file_path
-            .cmp(&rhs.file_path)
-            .then(lhs.byte_offset.cmp(&rhs.byte_offset))
-    });
-
-    Ok(all_mutants)
+    generate_mutants_for_files(&files, registry)
 }
 
 // ---------------------------------------------------------------------------

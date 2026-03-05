@@ -23,6 +23,10 @@ pub enum Error {
     #[error("runner error: {0}")]
     Runner(String),
 
+    /// The mutation score fell below the required threshold.
+    #[error("threshold error: {0}")]
+    Threshold(String),
+
     /// An error originating from report generation.
     #[error("report error: {0}")]
     Report(String),

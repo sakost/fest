@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod cli;
 pub mod config;
@@ -57,12 +57,7 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     // 3. Discover source files and generate mutants.
     let files = mutation::discover_files(&config.source, &config.exclude, &project_dir)?;
     let files_scanned = files.len();
-    let mutants = mutation::generate_mutants(
-        &config.source,
-        &config.exclude,
-        &project_dir,
-        &registry,
-    )?;
+    let mutants = mutation::generate_mutants_for_files(&files, &registry)?;
     let mutants_generated = mutants.len();
 
     // 4. Collect coverage.
@@ -70,7 +65,7 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
 
     // 5. Run each mutant against the test suite.
     let start = std::time::Instant::now();
-    let results = run_mutants(&mutants, &coverage_map, &config, &project_dir)?;
+    let results = run_mutants(&mutants, &coverage_map, &config)?;
     let duration = start.elapsed();
 
     // 6. Build and format the report.
@@ -83,7 +78,7 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     if let Some(threshold) = config.fail_under
         && !report.passes_threshold(threshold)
     {
-        return Err(Error::Runner(format!(
+        return Err(Error::Threshold(format!(
             "mutation score {:.1}% is below the required threshold of {:.1}%",
             report.mutation_score(),
             threshold,
@@ -105,7 +100,8 @@ fn resolve_project_dir(args: &cli::RunArgs) -> Result<PathBuf, Error> {
     if let Some(config_path) = args.config.as_ref() {
         let parent = config_path
             .parent()
-            .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         return Ok(parent);
     }
 
@@ -130,7 +126,6 @@ fn run_mutants(
     mutants: &[mutation::Mutant],
     coverage_map: &coverage::CoverageMap,
     config: &config::FestConfig,
-    _project_dir: &std::path::Path,
 ) -> Result<Vec<mutation::MutantResult>, Error> {
     let runner = runner::SubprocessRunner::new(config.timeout);
     let runtime = tokio::runtime::Runtime::new()
@@ -176,15 +171,14 @@ fn run_mutants(
 /// Returns [`Error::Mutation`] if the file cannot be read.
 fn read_source_cached<'cache>(
     cache: &'cache mut HashMap<PathBuf, String>,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<&'cache str, Error> {
-    if !cache.contains_key(path) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(path.to_path_buf()) {
         let content = std::fs::read_to_string(path).map_err(|err| {
             Error::Mutation(format!("failed to read source file {}: {err}", path.display()))
         })?;
-        let _prev = cache.insert(path.clone(), content);
+        let _inserted = entry.insert(content);
     }
-    // The key was just inserted or already existed, so this is safe.
     cache
         .get(path)
         .map(String::as_str)
@@ -248,7 +242,7 @@ mod tests {
     }
 
     /// `resolve_project_dir` handles a config path with no parent
-    /// (bare filename).
+    /// (bare filename) by returning `"."`.
     #[test]
     fn resolve_project_dir_bare_filename() {
         let args = cli::RunArgs {
@@ -263,8 +257,8 @@ mod tests {
         };
 
         let dir = resolve_project_dir(&args).expect("should resolve");
-        // Parent of "fest.toml" is "" which maps to "."
-        assert_eq!(dir, PathBuf::from(""));
+        // Parent of "fest.toml" is "" (empty), which is normalized to "."
+        assert_eq!(dir, PathBuf::from("."));
     }
 
     /// `write_output` writes to stdout without errors.
@@ -320,11 +314,9 @@ mod tests {
 
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
-        let project_dir = PathBuf::from(".");
 
         let results =
-            run_mutants(&[mutant], &coverage_map, &config, &project_dir)
-                .expect("should succeed");
+            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -354,11 +346,9 @@ mod tests {
         );
 
         let config = config::FestConfig::default();
-        let project_dir = PathBuf::from(".");
 
         let results =
-            run_mutants(&[mutant], &coverage_map, &config, &project_dir)
-                .expect("should succeed");
+            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -387,11 +377,9 @@ mod tests {
         );
 
         let config = config::FestConfig::default();
-        let project_dir = PathBuf::from(".");
 
         let results =
-            run_mutants(&[mutant], &coverage_map, &config, &project_dir)
-                .expect("should succeed");
+            run_mutants(&[mutant], &coverage_map, &config).expect("should succeed");
 
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
@@ -402,10 +390,9 @@ mod tests {
     fn run_mutants_empty_slice() {
         let coverage_map = coverage::CoverageMap::new();
         let config = config::FestConfig::default();
-        let project_dir = PathBuf::from(".");
 
-        let results = run_mutants(&[], &coverage_map, &config, &project_dir)
-            .expect("should succeed");
+        let results =
+            run_mutants(&[], &coverage_map, &config).expect("should succeed");
 
         assert!(results.is_empty());
     }
