@@ -139,7 +139,7 @@ pub fn collect_coverage(
 
     let json_path = export_coverage_json(project_dir)?;
 
-    json_parser::parse_coverage_json(&json_path)
+    json_parser::parse_coverage_json(&json_path, project_dir)
 }
 
 // ---------------------------------------------------------------------------

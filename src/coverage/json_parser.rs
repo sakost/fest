@@ -35,7 +35,10 @@ struct FileCoverage {
 ///
 /// Returns [`Error::Coverage`] if the file cannot be read or the JSON is
 /// malformed.
-pub(super) fn parse_coverage_json(path: &std::path::Path) -> Result<CoverageMap, Error> {
+pub(super) fn parse_coverage_json(
+    path: &std::path::Path,
+    project_dir: &std::path::Path,
+) -> Result<CoverageMap, Error> {
     let content = std::fs::read_to_string(path).map_err(|err| {
         Error::Coverage(format!(
             "failed to read coverage JSON {}: {err}",
@@ -43,21 +46,30 @@ pub(super) fn parse_coverage_json(path: &std::path::Path) -> Result<CoverageMap,
         ))
     })?;
 
-    parse_coverage_json_str(&content)
+    parse_coverage_json_str(&content, project_dir)
 }
 
 /// Parse coverage JSON from an in-memory string.
 ///
-/// This is the core parser extracted so that tests can exercise it without
-/// touching the filesystem.
-fn parse_coverage_json_str(json_str: &str) -> Result<CoverageMap, Error> {
+/// File paths in the coverage JSON are relative to the project directory.
+/// They are resolved to absolute paths so that they match the absolute paths
+/// produced by [`crate::mutation::discover_files`].
+fn parse_coverage_json_str(
+    json_str: &str,
+    project_dir: &std::path::Path,
+) -> Result<CoverageMap, Error> {
     let data: CoverageJson = serde_json::from_str(json_str)
         .map_err(|err| Error::Coverage(format!("failed to parse coverage JSON: {err}")))?;
 
     let mut map = CoverageMap::new();
 
     for (file_path_str, file_cov) in &data.files {
-        let file_path = PathBuf::from(file_path_str);
+        let raw_path = PathBuf::from(file_path_str);
+        let file_path = if raw_path.is_relative() {
+            project_dir.join(&raw_path)
+        } else {
+            raw_path
+        };
 
         for (line_str, contexts) in &file_cov.contexts {
             let line_number: u32 = line_str.parse::<u32>().map_err(|err| {
@@ -108,11 +120,12 @@ mod tests {
             }
         }"#;
 
-        let map = parse_coverage_json_str(json).expect("should parse valid JSON");
+        let project_dir = std::path::Path::new("/project");
+        let map = parse_coverage_json_str(json, project_dir).expect("should parse valid JSON");
 
-        let key_line1 = (PathBuf::from("src/app.py"), 1_u32);
-        let key_line2 = (PathBuf::from("src/app.py"), 2_u32);
-        let key_line3 = (PathBuf::from("src/app.py"), 3_u32);
+        let key_line1 = (PathBuf::from("/project/src/app.py"), 1_u32);
+        let key_line2 = (PathBuf::from("/project/src/app.py"), 2_u32);
+        let key_line3 = (PathBuf::from("/project/src/app.py"), 3_u32);
 
         assert_eq!(map.get(&key_line1).expect("line 1 present").len(), 1_usize);
         assert_eq!(map.get(&key_line2).expect("line 2 present").len(), 2_usize);
@@ -140,11 +153,12 @@ mod tests {
             }
         }"#;
 
-        let map = parse_coverage_json_str(json).expect("should parse");
+        let project_dir = std::path::Path::new("/proj");
+        let map = parse_coverage_json_str(json, project_dir).expect("should parse");
         assert_eq!(map.len(), 2_usize);
 
-        let key_a = (PathBuf::from("a.py"), 1_u32);
-        let key_b = (PathBuf::from("b.py"), 5_u32);
+        let key_a = (PathBuf::from("/proj/a.py"), 1_u32);
+        let key_b = (PathBuf::from("/proj/b.py"), 5_u32);
         assert!(map.contains_key(&key_a));
         assert!(map.contains_key(&key_b));
     }
@@ -153,14 +167,16 @@ mod tests {
     #[test]
     fn parse_empty_files() {
         let json = r#"{ "files": {} }"#;
-        let map = parse_coverage_json_str(json).expect("should parse");
+        let project_dir = std::path::Path::new("/proj");
+        let map = parse_coverage_json_str(json, project_dir).expect("should parse");
         assert!(map.is_empty());
     }
 
     /// Invalid JSON returns an error.
     #[test]
     fn parse_invalid_json() {
-        let result = parse_coverage_json_str("not valid json {{{");
+        let project_dir = std::path::Path::new("/proj");
+        let result = parse_coverage_json_str("not valid json {{{", project_dir);
         assert!(result.is_err());
     }
 
@@ -178,7 +194,8 @@ mod tests {
             }
         }"#;
 
-        let result = parse_coverage_json_str(json);
+        let project_dir = std::path::Path::new("/proj");
+        let result = parse_coverage_json_str(json, project_dir);
         assert!(result.is_err());
     }
 
@@ -196,8 +213,9 @@ mod tests {
             }
         }"#;
 
-        let map = parse_coverage_json_str(json).expect("should parse");
-        let key = (PathBuf::from("mod.py"), 10_u32);
+        let project_dir = std::path::Path::new("/proj");
+        let map = parse_coverage_json_str(json, project_dir).expect("should parse");
+        let key = (PathBuf::from("/proj/mod.py"), 10_u32);
         let tests = map.get(&key).expect("line 10 present");
         assert_eq!(tests.len(), 1_usize);
         assert_eq!(tests[0_usize], "test_mod.py::test_x");
@@ -206,7 +224,11 @@ mod tests {
     /// Parsing from a non-existent file returns an error.
     #[test]
     fn parse_file_not_found() {
-        let result = parse_coverage_json(std::path::Path::new("/nonexistent/coverage.json"));
+        let project_dir = std::path::Path::new("/proj");
+        let result = parse_coverage_json(
+            std::path::Path::new("/nonexistent/coverage.json"),
+            project_dir,
+        );
         assert!(result.is_err());
     }
 
@@ -234,8 +256,8 @@ mod tests {
             file.write_all(json_content.as_bytes()).expect("write file");
         }
 
-        let map = parse_coverage_json(&json_path).expect("should parse from file");
-        let key = (PathBuf::from("lib.py"), 7_u32);
+        let map = parse_coverage_json(&json_path, dir.path()).expect("should parse from file");
+        let key = (dir.path().join("lib.py"), 7_u32);
         assert!(map.contains_key(&key));
     }
 }
