@@ -247,8 +247,8 @@ fn write_line_header(
 
     writeln!(
         output,
-        "<div class=\"line {css_class}\"><span class=\"line-num\">\
-         {line_num}</span><code>{code_fragment}</code></div>",
+        "<div class=\"line {css_class}\"><span \
+         class=\"line-num\">{line_num}</span><code>{code_fragment}</code></div>",
     )
     .map_err(fmt_err)
 }

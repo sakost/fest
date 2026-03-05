@@ -15,6 +15,7 @@ pub mod config;
 pub mod coverage;
 pub mod error;
 pub mod mutation;
+pub mod plugin;
 pub mod report;
 pub mod runner;
 

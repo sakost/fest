@@ -1,16 +1,23 @@
 //! Test runner -- executing the test suite against each mutant.
 //!
 //! This module defines the [`Runner`] trait for mutant execution backends
-//! and provides a subprocess-based fallback implementation.
+//! and provides both a subprocess-based fallback and a pytest-plugin-based
+//! primary implementation.
 //!
 //! The [`Runner`] trait is async, allowing backends to leverage
 //! non-blocking I/O and timeouts. The [`SubprocessRunner`] spawns a
 //! `pytest` process for each mutant, writing mutated source to a
-//! temporary file and interpreting the exit code.
+//! temporary file and interpreting the exit code. The
+//! [`PytestPluginRunner`] uses an embedded pytest plugin that
+//! communicates over a Unix domain socket for faster in-process
+//! module patching.
 
+/// Pytest-plugin-based runner backend.
+pub mod pytest_plugin;
 /// Subprocess-based runner backend.
 pub mod subprocess;
 
+pub use pytest_plugin::PytestPluginRunner;
 pub use subprocess::SubprocessRunner;
 
 use crate::{
