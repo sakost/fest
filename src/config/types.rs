@@ -155,6 +155,129 @@ impl Default for MutatorConfig {
     }
 }
 
+/// Per-file mutator overrides.
+///
+/// Each field is `Option<bool>` — `Some(value)` overrides the global setting,
+/// `None` keeps the global setting unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors MutatorConfig; each Option<bool> maps to a named mutator toggle"
+)]
+pub struct MutatorOverrides {
+    /// Override the arithmetic-operator mutator.
+    #[serde(default)]
+    pub arithmetic_op: Option<bool>,
+    /// Override the comparison-operator mutator.
+    #[serde(default)]
+    pub comparison_op: Option<bool>,
+    /// Override the boolean-operator mutator.
+    #[serde(default)]
+    pub boolean_op: Option<bool>,
+    /// Override the return-value mutator.
+    #[serde(default)]
+    pub return_value: Option<bool>,
+    /// Override the negate-condition mutator.
+    #[serde(default)]
+    pub negate_condition: Option<bool>,
+    /// Override the remove-decorator mutator.
+    #[serde(default)]
+    pub remove_decorator: Option<bool>,
+    /// Override the constant-replace mutator.
+    #[serde(default)]
+    pub constant_replace: Option<bool>,
+    /// Override the exception-swallow mutator.
+    #[serde(default)]
+    pub exception_swallow: Option<bool>,
+    /// Override the break/continue swap mutator.
+    #[serde(default)]
+    pub break_continue: Option<bool>,
+    /// Override the unary operator mutator.
+    #[serde(default)]
+    pub unary_op: Option<bool>,
+    /// Override the zero-iteration loop mutator.
+    #[serde(default)]
+    pub zero_iteration_loop: Option<bool>,
+    /// Override the augmented-assignment operator mutator.
+    #[serde(default)]
+    pub augmented_assign: Option<bool>,
+    /// Override the statement-deletion mutator.
+    #[serde(default)]
+    pub statement_deletion: Option<bool>,
+    /// Override the bitwise operator mutator.
+    #[serde(default)]
+    pub bitwise_op: Option<bool>,
+    /// Override the super-call removal mutator.
+    #[serde(default)]
+    pub remove_super_call: Option<bool>,
+    /// Override the variable-replace mutator.
+    #[serde(default)]
+    pub variable_replace: Option<bool>,
+    /// Override the variable-insert mutator.
+    #[serde(default)]
+    pub variable_insert: Option<bool>,
+}
+
+impl MutatorConfig {
+    /// Create a new `MutatorConfig` by merging overrides on top of `self`.
+    ///
+    /// Fields in `overrides` that are `Some(value)` replace the corresponding
+    /// field in `self`; `None` fields keep the value from `self`.
+    #[inline]
+    #[must_use]
+    pub fn with_overrides(&self, overrides: &MutatorOverrides) -> Self {
+        Self {
+            arithmetic_op: overrides.arithmetic_op.unwrap_or(self.arithmetic_op),
+            comparison_op: overrides.comparison_op.unwrap_or(self.comparison_op),
+            boolean_op: overrides.boolean_op.unwrap_or(self.boolean_op),
+            return_value: overrides.return_value.unwrap_or(self.return_value),
+            negate_condition: overrides.negate_condition.unwrap_or(self.negate_condition),
+            remove_decorator: overrides.remove_decorator.unwrap_or(self.remove_decorator),
+            constant_replace: overrides.constant_replace.unwrap_or(self.constant_replace),
+            exception_swallow: overrides
+                .exception_swallow
+                .unwrap_or(self.exception_swallow),
+            break_continue: overrides.break_continue.unwrap_or(self.break_continue),
+            unary_op: overrides.unary_op.unwrap_or(self.unary_op),
+            zero_iteration_loop: overrides
+                .zero_iteration_loop
+                .unwrap_or(self.zero_iteration_loop),
+            augmented_assign: overrides.augmented_assign.unwrap_or(self.augmented_assign),
+            statement_deletion: overrides
+                .statement_deletion
+                .unwrap_or(self.statement_deletion),
+            bitwise_op: overrides.bitwise_op.unwrap_or(self.bitwise_op),
+            remove_super_call: overrides
+                .remove_super_call
+                .unwrap_or(self.remove_super_call),
+            variable_replace: overrides.variable_replace.unwrap_or(self.variable_replace),
+            variable_insert: overrides.variable_insert.unwrap_or(self.variable_insert),
+            custom: self.custom.clone(),
+            python: self.python.clone(),
+            dylib: self.dylib.clone(),
+        }
+    }
+}
+
+/// Per-file configuration override.
+///
+/// Matches files by glob pattern and allows overriding mutator settings,
+/// timeout, or skipping mutation entirely for matching files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerFileConfig {
+    /// Glob pattern to match file paths.
+    pub pattern: String,
+    /// Override mutator configuration for matching files (merged with globals).
+    #[serde(default)]
+    pub mutators: Option<MutatorOverrides>,
+    /// Override timeout for matching files.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Skip matching files entirely when `true`.
+    #[serde(default)]
+    pub skip: bool,
+}
+
 /// Top-level fest configuration.
 ///
 /// This struct represents the full configuration for a fest run, loaded from
@@ -204,6 +327,19 @@ pub struct FestConfig {
     /// Seed for deterministic randomised mutation operators.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Operator filter patterns. Prefix `!` excludes, no prefix includes.
+    /// Patterns are matched as substrings against operator names.
+    #[serde(default)]
+    pub filter_operators: Vec<String>,
+    /// Additional glob patterns to restrict which discovered files get mutated.
+    #[serde(default)]
+    pub filter_paths: Vec<String>,
+    /// Path to a session database for stop/resume support.
+    #[serde(default)]
+    pub session: Option<PathBuf>,
+    /// Per-file configuration overrides.
+    #[serde(default, rename = "per-file")]
+    pub per_file: Vec<PerFileConfig>,
 }
 
 impl Default for FestConfig {
@@ -224,6 +360,10 @@ impl Default for FestConfig {
             coverage_from: None,
             fast_coverage: true,
             seed: None,
+            filter_operators: Vec::new(),
+            filter_paths: Vec::new(),
+            session: None,
+            per_file: Vec::new(),
         }
     }
 }

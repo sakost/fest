@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::{Error, config::MutatorConfig};
+use crate::{
+    Error,
+    config::{MutatorConfig, PerFileConfig},
+};
 
 /// Built-in mutation operators shipped with fest.
 pub mod builtin;
@@ -20,6 +23,21 @@ pub(crate) mod seed;
 
 pub use mutant::{Mutant, MutantResult, MutantStatus};
 pub use mutator::{Mutation, MutationContext, Mutator, MutatorRegistry};
+
+/// Options for mutant generation that control filtering and per-file overrides.
+#[derive(Debug)]
+pub struct GenerationOptions<'opts> {
+    /// RNG seed for deterministic mutant generation.
+    pub seed: Option<u64>,
+    /// Operator filter patterns.
+    pub filter_operators: &'opts [String],
+    /// Path filter patterns.
+    pub filter_paths: &'opts [String],
+    /// Per-file configuration overrides.
+    pub per_file: &'opts [PerFileConfig],
+    /// Global mutator config for merging with per-file overrides.
+    pub global_mutators: &'opts MutatorConfig,
+}
 
 /// Build a [`MutatorRegistry`] from a [`MutatorConfig`].
 ///
@@ -141,6 +159,99 @@ pub(crate) fn discover_files(
     Ok(files)
 }
 
+/// Check whether a mutation at `byte_offset` in `source` is suppressed by a
+/// pragma comment on the same line.
+///
+/// Supports two forms:
+/// - `# pragma: no mutate` — suppresses ALL mutations on that line.
+/// - `# pragma: no mutate(operator_name)` — suppresses only the named operator.
+fn is_suppressed_by_pragma(source: &str, byte_offset: usize, mutator_name: &str) -> bool {
+    // Find the line containing byte_offset using rfind/find on str slices.
+    #[allow(
+        clippy::string_slice,
+        reason = "byte_offset is a valid UTF-8 boundary from AST byte offsets"
+    )]
+    let before = &source[..byte_offset];
+    let line_start = before.rfind('\n').map_or(0_usize, |pos| pos + 1_usize);
+    #[allow(
+        clippy::string_slice,
+        reason = "byte_offset is a valid UTF-8 boundary from AST byte offsets"
+    )]
+    let after = &source[byte_offset..];
+    let line_end = after
+        .find('\n')
+        .map_or(source.len(), |pos| byte_offset + pos);
+
+    #[allow(
+        clippy::string_slice,
+        reason = "line_start..line_end are valid UTF-8 boundaries from newline search"
+    )]
+    let line = &source[line_start..line_end];
+
+    let Some(pragma_pos) = line.find("# pragma: no mutate") else {
+        return false;
+    };
+
+    #[allow(
+        clippy::string_slice,
+        reason = "pragma_pos + len is within line bounds since find() returned it"
+    )]
+    let after_pragma = &line[pragma_pos + "# pragma: no mutate".len()..];
+    // Check for `(operator_name)` suffix.
+    if after_pragma.starts_with('(') {
+        if let Some(close) = after_pragma.find(')') {
+            #[allow(
+                clippy::string_slice,
+                reason = "close is a valid index within after_pragma from find()"
+            )]
+            let operator = &after_pragma[1_usize..close];
+            return operator == mutator_name;
+        }
+        // Malformed pragma with `(` but no `)` — treat as no suppression.
+        return false;
+    }
+    // No parenthesized operator — suppresses all mutations.
+    true
+}
+
+/// Check whether a mutator name passes the operator filter.
+///
+/// - If `filters` is empty, returns `true` (no filtering).
+/// - Patterns prefixed with `!` are exclusion filters (substring match).
+/// - Patterns without `!` are inclusion filters (substring match).
+/// - If any exclusion pattern matches, returns `false`.
+/// - If there are inclusion patterns and none match, returns `false`.
+/// - Otherwise returns `true`.
+fn matches_operator_filter(mutator_name: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let mut has_includes = false;
+    let mut any_include_matched = false;
+
+    for filter in filters {
+        if let Some(pattern) = filter.strip_prefix('!') {
+            // Exclusion filter.
+            if mutator_name.contains(pattern) {
+                return false;
+            }
+        } else {
+            // Inclusion filter.
+            has_includes = true;
+            if mutator_name.contains(filter.as_str()) {
+                any_include_matched = true;
+            }
+        }
+    }
+
+    if has_includes {
+        return any_include_matched;
+    }
+
+    true
+}
+
 /// Compute 1-based line and column numbers from a byte offset into `source`.
 ///
 /// Iterates through the source bytes, counting newlines. Returns
@@ -179,11 +290,14 @@ fn line_column_from_offset(source: &str, byte_offset: usize) -> (u32, u32) {
 /// Generate mutants for a single file.
 ///
 /// Reads the source, parses the AST, and runs each mutator to produce
-/// [`Mutant`] descriptors.
+/// [`Mutant`] descriptors. Mutators that do not match `filter_operators`
+/// are skipped, and individual mutations suppressed by pragma comments
+/// are excluded.
 fn generate_mutants_for_file(
     path: &Path,
     registry: &MutatorRegistry,
     seed: Option<u64>,
+    filter_operators: &[String],
 ) -> Result<Vec<Mutant>, Error> {
     let source = std::fs::read_to_string(path)
         .map_err(|err| Error::Mutation(format!("failed to read {}: {err}", path.display())))?;
@@ -200,9 +314,21 @@ fn generate_mutants_for_file(
     let mut mutants = Vec::new();
 
     for mutator in registry.iter() {
+        let name = mutator.name();
+
+        // Skip mutators that do not match the operator filter.
+        if !matches_operator_filter(name, filter_operators) {
+            continue;
+        }
+
         let mutations = mutator.find_mutations(&source, &ast, &ctx);
 
         for mutation in mutations {
+            // Skip mutations suppressed by pragma comments.
+            if is_suppressed_by_pragma(&source, mutation.byte_offset, name) {
+                continue;
+            }
+
             let (line, column) = line_column_from_offset(&source, mutation.byte_offset);
             mutants.push(Mutant {
                 file_path: path.to_path_buf(),
@@ -212,7 +338,7 @@ fn generate_mutants_for_file(
                 byte_length: mutation.byte_length,
                 original_text: mutation.original_text,
                 mutated_text: mutation.replacement_text,
-                mutator_name: mutator.name().to_owned(),
+                mutator_name: name.to_owned(),
             });
         }
     }
@@ -227,22 +353,49 @@ fn generate_mutants_for_file(
 /// Each [`Mutation`] is converted into a [`Mutant`] with the file path,
 /// line/column numbers, and byte offset information.
 ///
+/// When `filter_paths` is non-empty, only files whose path matches at
+/// least one glob pattern are processed. When `filter_operators` is
+/// non-empty, only matching operators are applied.
+///
 /// File processing is parallelized across available cores using
 /// [rayon](https://docs.rs/rayon).
 ///
 /// # Errors
 ///
-/// Returns [`Error::Mutation`] if a file cannot be read or a Python
-/// source file fails to parse.
+/// Returns [`Error::Mutation`] if a file cannot be read, a Python
+/// source file fails to parse, or a `filter_paths` glob is invalid.
 #[inline]
 pub fn generate_mutants_for_files(
     files: &[PathBuf],
     registry: &MutatorRegistry,
-    seed: Option<u64>,
+    opts: &GenerationOptions<'_>,
 ) -> Result<Vec<Mutant>, Error> {
-    let results: Result<Vec<Vec<Mutant>>, Error> = files
+    let filtered_files = filter_files_by_path(files, opts.filter_paths)?;
+
+    // Pre-compile per-file glob patterns.
+    let compiled_per_file = compile_per_file_patterns(opts.per_file)?;
+
+    let results: Result<Vec<Vec<Mutant>>, Error> = filtered_files
         .par_iter()
-        .map(|path| generate_mutants_for_file(path, registry, seed))
+        .map(|path| {
+            // Check for per-file overrides.
+            if let Some(pf) = find_per_file_config(path, &compiled_per_file) {
+                if pf.skip {
+                    return Ok(Vec::new());
+                }
+                if let Some(overrides) = pf.mutators.as_ref() {
+                    let merged = opts.global_mutators.with_overrides(overrides);
+                    let per_file_reg = build_registry(&merged);
+                    return generate_mutants_for_file(
+                        path,
+                        &per_file_reg,
+                        opts.seed,
+                        opts.filter_operators,
+                    );
+                }
+            }
+            generate_mutants_for_file(path, registry, opts.seed, opts.filter_operators)
+        })
         .collect();
 
     let nested = results?;
@@ -254,6 +407,39 @@ pub fn generate_mutants_for_files(
     });
 
     Ok(all_mutants)
+}
+
+/// Filter a file list by glob patterns.
+///
+/// If `filter_paths` is empty, returns all files unchanged. Otherwise,
+/// only files matching at least one pattern are kept.
+///
+/// # Errors
+///
+/// Returns [`Error::Mutation`] if a glob pattern is invalid.
+fn filter_files_by_path<'fl>(
+    files: &'fl [PathBuf],
+    filter_paths: &[String],
+) -> Result<Vec<&'fl PathBuf>, Error> {
+    if filter_paths.is_empty() {
+        return Ok(files.iter().collect());
+    }
+
+    let compiled: Vec<glob::Pattern> = filter_paths
+        .iter()
+        .map(|pat| {
+            glob::Pattern::new(pat).map_err(|err| {
+                Error::Mutation(format!("invalid filter_paths pattern '{pat}': {err}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let matched = files
+        .iter()
+        .filter(|path| compiled.iter().any(|pat| pat.matches_path(path)))
+        .collect();
+
+    Ok(matched)
 }
 
 /// Discover Python source files and generate all mutants in parallel.
@@ -278,10 +464,54 @@ pub fn generate_mutants(
     exclude_patterns: &[String],
     base_dir: &Path,
     registry: &MutatorRegistry,
-    seed: Option<u64>,
+    opts: &GenerationOptions<'_>,
 ) -> Result<Vec<Mutant>, Error> {
     let files = discover_files(source_patterns, exclude_patterns, base_dir)?;
-    generate_mutants_for_files(&files, registry, seed)
+    generate_mutants_for_files(&files, registry, opts)
+}
+
+/// A compiled per-file configuration with pre-compiled glob pattern.
+struct CompiledPerFile<'pf> {
+    /// Compiled glob pattern.
+    pattern: glob::Pattern,
+    /// Reference to the original per-file config.
+    config: &'pf PerFileConfig,
+}
+
+/// Pre-compile all per-file glob patterns.
+///
+/// # Errors
+///
+/// Returns [`Error::Mutation`] if a glob pattern is invalid.
+fn compile_per_file_patterns(
+    per_file: &[PerFileConfig],
+) -> Result<Vec<CompiledPerFile<'_>>, Error> {
+    per_file
+        .iter()
+        .map(|pf| {
+            let pattern = glob::Pattern::new(&pf.pattern).map_err(|err| {
+                Error::Mutation(format!("invalid per-file pattern '{}': {err}", pf.pattern))
+            })?;
+            Ok(CompiledPerFile {
+                pattern,
+                config: pf,
+            })
+        })
+        .collect()
+}
+
+/// Find the last matching per-file config for a path.
+///
+/// Later entries override earlier ones ("last match wins").
+fn find_per_file_config<'pf>(
+    path: &Path,
+    compiled: &'pf [CompiledPerFile<'pf>],
+) -> Option<&'pf PerFileConfig> {
+    compiled
+        .iter()
+        .rev()
+        .find(|cpf| cpf.pattern.matches_path(path))
+        .map(|cpf| cpf.config)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +523,7 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+    use crate::config::MutatorOverrides;
 
     // -- File discovery tests -----------------------------------------------
 
@@ -417,8 +648,8 @@ mod tests {
         let mut registry = MutatorRegistry::new();
         registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
 
-        let mutants =
-            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &[])
+            .expect("should generate mutants");
 
         assert_eq!(mutants.len(), 1_usize);
         assert_eq!(mutants[0_usize].original_text, "+");
@@ -453,8 +684,20 @@ mod tests {
 
         let patterns = vec!["src/**/*.py".to_owned()];
         let excludes: Vec<String> = Vec::new();
-        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry, None)
-            .expect("should generate mutants");
+        let mutants = generate_mutants(
+            &patterns,
+            &excludes,
+            dir.path(),
+            &registry,
+            &GenerationOptions {
+                seed: None,
+                filter_operators: &[],
+                filter_paths: &[],
+                per_file: &[],
+                global_mutators: &MutatorConfig::default(),
+            },
+        )
+        .expect("should generate mutants");
 
         assert_eq!(mutants.len(), 2_usize);
         // Sorted by file path then byte offset
@@ -473,7 +716,7 @@ mod tests {
         }
 
         let registry = MutatorRegistry::new();
-        let result = generate_mutants_for_file(&py_file, &registry, None);
+        let result = generate_mutants_for_file(&py_file, &registry, None, &[]);
 
         assert!(result.is_err());
     }
@@ -489,8 +732,8 @@ mod tests {
         }
 
         let registry = MutatorRegistry::new();
-        let mutants =
-            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &[])
+            .expect("should generate mutants");
 
         assert!(mutants.is_empty());
     }
@@ -511,8 +754,8 @@ mod tests {
         registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
         registry.register(Box::new(builtin::comparison::ComparisonOp));
 
-        let mutants =
-            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &[])
+            .expect("should generate mutants");
 
         // At least 1 arithmetic + 1 comparison mutation
         assert!(mutants.len() >= 2_usize);
@@ -547,8 +790,20 @@ mod tests {
 
         let patterns = vec!["src/**/*.py".to_owned()];
         let excludes = vec!["src/gen/**/*.py".to_owned()];
-        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry, None)
-            .expect("should generate mutants");
+        let mutants = generate_mutants(
+            &patterns,
+            &excludes,
+            dir.path(),
+            &registry,
+            &GenerationOptions {
+                seed: None,
+                filter_operators: &[],
+                filter_paths: &[],
+                per_file: &[],
+                global_mutators: &MutatorConfig::default(),
+            },
+        )
+        .expect("should generate mutants");
 
         assert_eq!(mutants.len(), 1_usize);
         assert_eq!(mutants[0_usize].file_path, keep);
@@ -726,5 +981,321 @@ mod tests {
                 "expected mutator '{expected}' not found in registry",
             );
         }
+    }
+
+    // -- Pragma suppression tests -------------------------------------------
+
+    /// Global pragma suppresses all mutations on the line.
+    #[test]
+    fn pragma_suppresses_all_mutations() {
+        let source = "x = a + b  # pragma: no mutate\n";
+        assert!(is_suppressed_by_pragma(source, 6_usize, "arithmetic_op"));
+        assert!(is_suppressed_by_pragma(source, 6_usize, "comparison_op"));
+    }
+
+    /// Per-operator pragma suppresses only the named operator.
+    #[test]
+    fn pragma_suppresses_specific_operator() {
+        let source = "x = a + b  # pragma: no mutate(arithmetic_op)\n";
+        assert!(is_suppressed_by_pragma(source, 6_usize, "arithmetic_op"));
+        assert!(!is_suppressed_by_pragma(source, 6_usize, "comparison_op"));
+    }
+
+    /// Lines without pragma are not suppressed.
+    #[test]
+    fn pragma_absent_no_suppression() {
+        let source = "x = a + b\n";
+        assert!(!is_suppressed_by_pragma(source, 6_usize, "arithmetic_op"));
+    }
+
+    /// Pragma on a different line does not suppress.
+    #[test]
+    fn pragma_on_different_line_no_suppression() {
+        let source = "x = a + b\ny = 1  # pragma: no mutate\n";
+        assert!(!is_suppressed_by_pragma(source, 6_usize, "arithmetic_op"));
+    }
+
+    /// Pragma integration: mutants on suppressed lines are excluded.
+    #[test]
+    fn pragma_integration_filters_mutants() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("suppressed.py");
+        {
+            let mut file = std::fs::File::create(&py_file).expect("create file");
+            file.write_all(b"x = a + b  # pragma: no mutate\ny = c + d\n")
+                .expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &[])
+            .expect("should generate mutants");
+
+        // Only the second line should produce a mutant.
+        assert_eq!(mutants.len(), 1_usize);
+        assert_eq!(mutants[0_usize].line, 2_u32);
+    }
+
+    // -- Operator filter tests ----------------------------------------------
+
+    /// Empty filters match everything.
+    #[test]
+    fn operator_filter_empty_matches_all() {
+        assert!(matches_operator_filter("arithmetic_op", &[]));
+    }
+
+    /// Include filter matches substring.
+    #[test]
+    fn operator_filter_include_match() {
+        let filters = vec!["arithmetic".to_owned()];
+        assert!(matches_operator_filter("arithmetic_op", &filters));
+        assert!(!matches_operator_filter("comparison_op", &filters));
+    }
+
+    /// Exclude filter rejects substring match.
+    #[test]
+    fn operator_filter_exclude_match() {
+        let filters = vec!["!arithmetic".to_owned()];
+        assert!(!matches_operator_filter("arithmetic_op", &filters));
+        assert!(matches_operator_filter("comparison_op", &filters));
+    }
+
+    /// Mixed include and exclude filters work together.
+    #[test]
+    fn operator_filter_mixed() {
+        let filters = vec!["_op".to_owned(), "!arithmetic".to_owned()];
+        // "arithmetic_op" matches include "_op" but is excluded by "!arithmetic".
+        assert!(!matches_operator_filter("arithmetic_op", &filters));
+        // "comparison_op" matches include "_op" and is not excluded.
+        assert!(matches_operator_filter("comparison_op", &filters));
+        // "return_value" does not match any include pattern.
+        assert!(!matches_operator_filter("return_value", &filters));
+    }
+
+    /// Operator filter integration: filtered operators are skipped.
+    #[test]
+    fn operator_filter_integration() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("filtered.py");
+        {
+            let mut file = std::fs::File::create(&py_file).expect("create file");
+            file.write_all(b"result = (a + b) == c\n")
+                .expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+        registry.register(Box::new(builtin::comparison::ComparisonOp));
+
+        let filters = vec!["arithmetic".to_owned()];
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &filters)
+            .expect("should generate mutants");
+
+        // Only arithmetic mutations should be present.
+        for mutant in &mutants {
+            assert_eq!(mutant.mutator_name, "arithmetic_op");
+        }
+        assert!(!mutants.is_empty());
+    }
+
+    // -- Path filter tests --------------------------------------------------
+
+    /// Empty path filters keep all files.
+    #[test]
+    fn path_filter_empty_keeps_all() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+
+        let py_a = src.join("a.py");
+        let py_b = src.join("b.py");
+        {
+            let mut file = std::fs::File::create(&py_a).expect("create file");
+            file.write_all(b"x = 1 + 2\n").expect("write file");
+        }
+        {
+            let mut file = std::fs::File::create(&py_b).expect("create file");
+            file.write_all(b"y = 3 + 4\n").expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let files = vec![py_a.clone(), py_b.clone()];
+        let opts = GenerationOptions {
+            seed: None,
+            filter_operators: &[],
+            filter_paths: &[],
+            per_file: &[],
+            global_mutators: &MutatorConfig::default(),
+        };
+        let mutants =
+            generate_mutants_for_files(&files, &registry, &opts).expect("should generate mutants");
+
+        assert_eq!(mutants.len(), 2_usize);
+    }
+
+    /// Path filter restricts which files are mutated.
+    #[test]
+    fn path_filter_restricts_files() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src dir");
+
+        let py_a = src.join("a.py");
+        let py_b = src.join("b.py");
+        {
+            let mut file = std::fs::File::create(&py_a).expect("create file");
+            file.write_all(b"x = 1 + 2\n").expect("write file");
+        }
+        {
+            let mut file = std::fs::File::create(&py_b).expect("create file");
+            file.write_all(b"y = 3 + 4\n").expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let files = vec![py_a.clone(), py_b];
+        let filter_paths = vec!["**/a.py".to_owned()];
+        let opts = GenerationOptions {
+            seed: None,
+            filter_operators: &[],
+            filter_paths: &filter_paths,
+            per_file: &[],
+            global_mutators: &MutatorConfig::default(),
+        };
+        let mutants =
+            generate_mutants_for_files(&files, &registry, &opts).expect("should generate mutants");
+
+        assert_eq!(mutants.len(), 1_usize);
+        assert_eq!(mutants[0_usize].file_path, py_a);
+    }
+
+    /// Per-file config with `skip = true` excludes files from mutation.
+    #[test]
+    fn per_file_skip_excludes_file() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_a = dir.path().join("a.py");
+        let py_b = dir.path().join("b.py");
+        {
+            let mut file = std::fs::File::create(&py_a).expect("create file");
+            file.write_all(b"x = 1 + 2\n").expect("write file");
+        }
+        {
+            let mut file = std::fs::File::create(&py_b).expect("create file");
+            file.write_all(b"y = 3 + 4\n").expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let per_file = vec![PerFileConfig {
+            pattern: "**/a.py".to_owned(),
+            mutators: None,
+            timeout: None,
+            skip: true,
+        }];
+        let files = vec![py_a, py_b.clone()];
+        let opts = GenerationOptions {
+            seed: None,
+            filter_operators: &[],
+            filter_paths: &[],
+            per_file: &per_file,
+            global_mutators: &MutatorConfig::default(),
+        };
+        let mutants =
+            generate_mutants_for_files(&files, &registry, &opts).expect("should generate mutants");
+
+        assert_eq!(mutants.len(), 1_usize);
+        assert_eq!(mutants[0_usize].file_path, py_b);
+    }
+
+    /// Per-file config with mutator overrides merges with the global registry.
+    #[test]
+    fn per_file_custom_mutators() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("target.py");
+        {
+            let mut file = std::fs::File::create(&py_file).expect("create file");
+            // Has both arithmetic and comparison operators.
+            file.write_all(b"x = (a + b) == c\n").expect("write file");
+        }
+
+        // Global config enables both arithmetic and comparison.
+        let global_config = MutatorConfig {
+            arithmetic_op: true,
+            comparison_op: true,
+            ..MutatorConfig::default()
+        };
+        let registry = build_registry(&global_config);
+
+        // Per-file override: disable arithmetic only (merge semantics).
+        let per_file_overrides = MutatorOverrides {
+            arithmetic_op: Some(false),
+            ..MutatorOverrides::default()
+        };
+        let per_file = vec![PerFileConfig {
+            pattern: "**/target.py".to_owned(),
+            mutators: Some(per_file_overrides),
+            timeout: None,
+            skip: false,
+        }];
+        let files = vec![py_file];
+        let opts = GenerationOptions {
+            seed: None,
+            filter_operators: &[],
+            filter_paths: &[],
+            per_file: &per_file,
+            global_mutators: &global_config,
+        };
+        let mutants =
+            generate_mutants_for_files(&files, &registry, &opts).expect("should generate mutants");
+
+        // Should only have comparison mutations, no arithmetic (disabled by override).
+        let mutator_names: Vec<&str> = mutants.iter().map(|m| m.mutator_name.as_str()).collect();
+        assert!(!mutator_names.contains(&"arithmetic_op"));
+        assert!(mutator_names.contains(&"comparison_op"));
+    }
+
+    /// Pragma suppression suppresses all mutations on a line.
+    #[test]
+    fn pragma_no_mutate_suppresses_all() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("pragma.py");
+        {
+            let mut file = std::fs::File::create(&py_file).expect("create file");
+            file.write_all(b"x = 1 + 2  # pragma: no mutate\n")
+                .expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let mutants =
+            generate_mutants_for_file(&py_file, &registry, None, &[]).expect("should generate");
+        assert!(mutants.is_empty());
+    }
+
+    /// Pragma suppression with operator name only suppresses that operator.
+    #[test]
+    fn pragma_no_mutate_specific_operator() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("pragma_op.py");
+        {
+            let mut file = std::fs::File::create(&py_file).expect("create file");
+            file.write_all(b"x = 1 + 2  # pragma: no mutate(comparison_op)\n")
+                .expect("write file");
+        }
+
+        let mut registry = MutatorRegistry::new();
+        registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
+
+        let mutants =
+            generate_mutants_for_file(&py_file, &registry, None, &[]).expect("should generate");
+        // arithmetic_op should NOT be suppressed (only comparison_op is).
+        assert_eq!(mutants.len(), 1_usize);
+        assert_eq!(mutants[0_usize].mutator_name, "arithmetic_op");
     }
 }

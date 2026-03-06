@@ -82,8 +82,13 @@ mod tests {
     /// Score is 0.0 when no mutants were tested.
     #[test]
     fn score_zero_when_none_tested() {
-        let report =
-            MutationReport::from_results(Vec::new(), 5_usize, 0_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            5_usize,
+            0_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         assert!((report.mutation_score() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -100,8 +105,13 @@ mod tests {
                 MutantStatus::Killed,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         assert!((report.mutation_score() - 100.0).abs() < f64::EPSILON);
     }
 
@@ -118,8 +128,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         assert!((report.mutation_score() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -136,8 +151,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         assert!((report.mutation_score() - 50.0).abs() < f64::EPSILON);
     }
 
@@ -154,8 +174,13 @@ mod tests {
                 MutantStatus::NoCoverage,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         assert_eq!(report.mutants_tested, 1_usize);
         assert_eq!(report.no_coverage, 1_usize);
         assert!((report.mutation_score() - 100.0).abs() < f64::EPSILON);
@@ -189,8 +214,13 @@ mod tests {
             ),
         ];
 
-        let report =
-            MutationReport::from_results(results, 3_usize, 10_usize, Duration::from_secs(5_u64));
+        let report = MutationReport::from_results(
+            results,
+            3_usize,
+            10_usize,
+            Duration::from_secs(5_u64),
+            None,
+        );
 
         assert_eq!(report.files_scanned, 3_usize);
         assert_eq!(report.mutants_generated, 10_usize);
@@ -207,8 +237,13 @@ mod tests {
     /// `from_results` with an empty vector produces zero counts.
     #[test]
     fn from_results_empty() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         assert_eq!(report.killed, 0_usize);
         assert_eq!(report.survived, 0_usize);
         assert_eq!(report.timeouts, 0_usize);
@@ -222,8 +257,13 @@ mod tests {
     /// A threshold of 0.0 always passes.
     #[test]
     fn threshold_zero_always_passes() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         assert!(report.passes_threshold(0.0));
     }
 
@@ -234,8 +274,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         // score is 100.0
         assert!(report.passes_threshold(100.0));
     }
@@ -253,8 +298,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         // score is 50.0
         assert!(!report.passes_threshold(80.0));
     }
@@ -264,8 +314,13 @@ mod tests {
     /// Text report contains the header.
     #[test]
     fn text_report_contains_header() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = text::format_text(&report, false).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
         assert!(output.contains("----------------------------"));
@@ -290,8 +345,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 12_usize, 347_usize, Duration::from_secs(30_u64));
+        let report = MutationReport::from_results(
+            results,
+            12_usize,
+            347_usize,
+            Duration::from_secs(30_u64),
+            None,
+        );
         let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("Files scanned:"));
@@ -309,8 +369,13 @@ mod tests {
             make_mutant("src/parser.py", 42_u32, "ArithmeticOp", "x + 1", "x - 1"),
             MutantStatus::Survived,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("Survived mutants:"));
@@ -326,8 +391,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = text::format_text(&report, false).expect("should format text");
 
         assert!(!output.contains("Survived mutants:"));
@@ -346,8 +416,13 @@ mod tests {
                 MutantStatus::NoCoverage,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = text::format_text(&report, false).expect("should format text");
 
         assert!(output.contains("no coverage"));
@@ -368,8 +443,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 3_usize, 10_usize, Duration::from_secs(5_u64));
+        let report = MutationReport::from_results(
+            results,
+            3_usize,
+            10_usize,
+            Duration::from_secs(5_u64),
+            None,
+        );
         let json_str = json::format_json(&report).expect("should format JSON");
 
         // Verify it is valid JSON by parsing it
@@ -390,8 +470,13 @@ mod tests {
             make_mutant("module.py", 10_u32, "boolean_op", "and", "or"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let json_str = json::format_json(&report).expect("should format JSON");
         let value: serde_json::Value =
             serde_json::from_str(&json_str).expect("should be valid JSON");
@@ -412,8 +497,13 @@ mod tests {
     /// JSON report for empty results.
     #[test]
     fn json_report_empty_results() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let json_str = json::format_json(&report).expect("should format JSON");
         let value: serde_json::Value =
             serde_json::from_str(&json_str).expect("should be valid JSON");
@@ -431,8 +521,13 @@ mod tests {
     /// `format_report` dispatches to text formatter.
     #[test]
     fn format_report_text() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output =
             format_report(&report, &OutputFormat::Text, false).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
@@ -441,8 +536,13 @@ mod tests {
     /// `format_report` dispatches to JSON formatter.
     #[test]
     fn format_report_json() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output =
             format_report(&report, &OutputFormat::Json, false).expect("should format JSON");
         let _value: serde_json::Value =
@@ -452,8 +552,13 @@ mod tests {
     /// `format_report` dispatches to HTML formatter.
     #[test]
     fn format_report_html() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output =
             format_report(&report, &OutputFormat::Html, false).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
@@ -465,8 +570,13 @@ mod tests {
     /// HTML report contains the DOCTYPE declaration.
     #[test]
     fn html_report_contains_doctype() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
     }
@@ -474,8 +584,13 @@ mod tests {
     /// HTML report contains the page title.
     #[test]
     fn html_report_contains_title() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("<title>fest mutation testing report</title>"));
     }
@@ -483,8 +598,13 @@ mod tests {
     /// HTML report contains inline CSS styles.
     #[test]
     fn html_report_contains_inline_css() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("<style>"));
         assert!(output.contains(".killed"));
@@ -506,8 +626,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 3_usize, 10_usize, Duration::from_secs(5_u64));
+        let report = MutationReport::from_results(
+            results,
+            3_usize,
+            10_usize,
+            Duration::from_secs(5_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
 
         assert!(output.contains("Files scanned"));
@@ -524,8 +649,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("100.0%"));
     }
@@ -537,8 +667,13 @@ mod tests {
             make_mutant("src/parser.py", 10_u32, "ArithmeticOp", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("src/parser.py"));
     }
@@ -550,8 +685,13 @@ mod tests {
             make_mutant("a.py", 5_u32, "op", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("class=\"line killed\""));
     }
@@ -563,8 +703,13 @@ mod tests {
             make_mutant("a.py", 5_u32, "op", "+", "-"),
             MutantStatus::Survived,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("class=\"line survived\""));
     }
@@ -576,8 +721,13 @@ mod tests {
             make_mutant("a.py", 5_u32, "op", "+", "-"),
             MutantStatus::NoCoverage,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("class=\"line no-coverage\""));
     }
@@ -595,8 +745,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("class=\"line survived\""));
     }
@@ -614,8 +769,13 @@ mod tests {
                 MutantStatus::NoCoverage,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         // Not all killed, so should be grey (no-coverage class).
         assert!(output.contains("class=\"line no-coverage\""));
@@ -628,8 +788,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "ArithmeticOp", "+", "-"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("ArithmeticOp"));
         assert!(output.contains("[KILLED]"));
@@ -644,8 +809,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Survived,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("[SURVIVED]"));
     }
@@ -657,8 +827,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Timeout,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("[TIMEOUT]"));
     }
@@ -670,8 +845,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::Error("segfault".to_owned()),
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("[ERROR]"));
     }
@@ -683,8 +863,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "a < b", "a > b"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("a &lt; b"));
         assert!(output.contains("a &gt; b"));
@@ -697,8 +882,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "a & b", "a | b"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("a &amp; b"));
     }
@@ -710,8 +900,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "x == \"hello\"", "x != \"hello\""),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("&quot;hello&quot;"));
     }
@@ -723,8 +918,13 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "x == 'world'", "x != 'world'"),
             MutantStatus::Killed,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("&#39;world&#39;"));
     }
@@ -742,8 +942,13 @@ mod tests {
                 MutantStatus::Survived,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 2_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            2_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("alpha.py"));
         assert!(output.contains("beta.py"));
@@ -752,8 +957,13 @@ mod tests {
     /// HTML report for empty results produces valid HTML structure.
     #[test]
     fn html_report_empty_results() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
         assert!(output.contains("</html>"));
@@ -763,8 +973,13 @@ mod tests {
     /// HTML report is self-contained (no external stylesheets).
     #[test]
     fn html_report_self_contained() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         // Should not contain external stylesheet links.
         assert!(!output.contains("<link rel=\"stylesheet\""));
@@ -775,8 +990,13 @@ mod tests {
     /// HTML report contains closing tags in the right order.
     #[test]
     fn html_report_closing_tags() {
-        let report =
-            MutationReport::from_results(Vec::new(), 0_usize, 0_usize, Duration::from_secs(0_u64));
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("</body>"));
         assert!(output.contains("</html>"));
@@ -799,8 +1019,13 @@ mod tests {
                 MutantStatus::Killed,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 2_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            2_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         // Should show both mutation details.
         assert!(output.contains("<code>-</code>"));
@@ -835,8 +1060,13 @@ mod tests {
                 MutantStatus::Error("oops".to_owned()),
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 1_usize, 5_usize, Duration::from_secs(2_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            5_usize,
+            Duration::from_secs(2_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("Timeout"));
         assert!(output.contains("Errors"));
@@ -850,10 +1080,74 @@ mod tests {
             make_mutant("a.py", 1_u32, "op", "+", "-"),
             MutantStatus::NoCoverage,
         )];
-        let report =
-            MutationReport::from_results(results, 1_usize, 1_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("[NO COVERAGE]"));
+    }
+
+    /// Text report shows seed in header and statistics when set.
+    #[test]
+    fn text_report_shows_seed() {
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            Some(42_u64),
+        );
+        let output = text::format_text(&report, false).expect("should format text");
+        assert!(output.contains("(seed: 42)"));
+        assert!(output.contains("Seed:               42"));
+    }
+
+    /// Text report omits seed line when seed is None.
+    #[test]
+    fn text_report_no_seed_line_when_none() {
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
+        let output = text::format_text(&report, false).expect("should format text");
+        assert!(!output.contains("Seed:"));
+        assert!(!output.contains("seed:"));
+    }
+
+    /// HTML report shows seed in header and summary when set.
+    #[test]
+    fn html_report_shows_seed() {
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            Some(123_u64),
+        );
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("(seed: 123)"));
+        assert!(output.contains("<tr><td>Seed</td><td>123</td></tr>"));
+    }
+
+    /// HTML report omits seed row when seed is None.
+    #[test]
+    fn html_report_no_seed_when_none() {
+        let report = MutationReport::from_results(
+            Vec::new(),
+            0_usize,
+            0_usize,
+            Duration::from_secs(0_u64),
+            None,
+        );
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(!output.contains("Seed"));
     }
 
     /// HTML report has balanced `<div>` and `</div>` tags.
@@ -873,8 +1167,13 @@ mod tests {
                 MutantStatus::NoCoverage,
             ),
         ];
-        let report =
-            MutationReport::from_results(results, 2_usize, 3_usize, Duration::from_secs(1_u64));
+        let report = MutationReport::from_results(
+            results,
+            2_usize,
+            3_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
         let output = html::format_html(&report).expect("should format HTML");
         let open_divs = output.matches("<div").count();
         let close_divs = output.matches("</div>").count();

@@ -9,8 +9,8 @@ mod types;
 use std::path::Path;
 
 pub use types::{
-    CustomMutator, DylibMutator, FestConfig, MutatorConfig, OutputFormat, PythonMutator,
-    RunnerBackend,
+    CustomMutator, DylibMutator, FestConfig, MutatorConfig, MutatorOverrides, OutputFormat,
+    PerFileConfig, PythonMutator, RunnerBackend,
 };
 
 use crate::Error;

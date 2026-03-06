@@ -20,7 +20,7 @@ use crate::mutation::MutantStatus;
 pub fn format_text(report: &MutationReport, colored: bool) -> Result<String, crate::Error> {
     let mut output = String::new();
 
-    write_header(&mut output, colored)?;
+    write_header(&mut output, report, colored)?;
     write_statistics(report, &mut output, colored)?;
     write_survived_mutants(report, &mut output, colored)?;
 
@@ -28,14 +28,21 @@ pub fn format_text(report: &MutationReport, colored: bool) -> Result<String, cra
 }
 
 /// Write the report header.
-fn write_header(output: &mut String, colored: bool) -> Result<(), crate::Error> {
+fn write_header(
+    output: &mut String,
+    report: &MutationReport,
+    colored: bool,
+) -> Result<(), crate::Error> {
+    let seed_suffix = report
+        .seed
+        .map_or_else(String::new, |seed| format!(" (seed: {seed})"));
     if colored {
-        let title = console::style("fest mutation testing report")
+        let title = console::style(format!("fest mutation testing report{seed_suffix}"))
             .bold()
             .force_styling(true);
         writeln!(output, "{title}")
     } else {
-        writeln!(output, "fest mutation testing report")
+        writeln!(output, "fest mutation testing report{seed_suffix}")
     }
     .map_err(|err| crate::Error::Report(format!("failed to format report header: {err}")))?;
     writeln!(output, "----------------------------")
@@ -75,6 +82,11 @@ fn write_statistics(
         .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
     writeln!(output, "Errors:             {}", report.errors)
         .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
+
+    if let Some(seed) = report.seed {
+        writeln!(output, "Seed:               {seed}")
+            .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
+    }
 
     Ok(())
 }

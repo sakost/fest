@@ -54,6 +54,10 @@ pub enum Command {
 
 /// Arguments for the `run` subcommand.
 #[derive(Debug, clap::Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool maps to a named CLI flag"
+)]
 pub struct RunArgs {
     /// Enable verbose per-mutant progress output.
     ///
@@ -154,6 +158,42 @@ pub struct RunArgs {
     /// Overrides `seed` in the config file.
     #[arg(long)]
     pub seed: Option<u64>,
+
+    /// Filter mutators by name pattern. Prefix `!` to exclude.
+    ///
+    /// Can be specified multiple times. Patterns are matched as substrings
+    /// against operator names.
+    #[arg(long)]
+    pub filter_operators: Option<Vec<String>>,
+
+    /// Restrict mutation to files matching these glob patterns.
+    ///
+    /// Can be specified multiple times. When set, only files matching at
+    /// least one pattern are mutated.
+    #[arg(long)]
+    pub filter_paths: Option<Vec<String>>,
+
+    /// Path to a session database for stop/resume support.
+    ///
+    /// When set, mutant results are persisted in a `SQLite` database so
+    /// that interrupted runs can be resumed.
+    #[arg(long)]
+    pub session: Option<PathBuf>,
+
+    /// Reset the session database before running.
+    ///
+    /// Deletes all existing mutant results so the entire run starts fresh.
+    /// Only meaningful when `--session` is also set.
+    #[arg(long)]
+    pub reset: bool,
+
+    /// Incremental mode: only re-test mutants in changed files.
+    ///
+    /// Compares source file modification times against the session database
+    /// and resets mutants for files that have changed since the last run.
+    /// Only meaningful when `--session` is also set.
+    #[arg(long)]
+    pub incremental: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +232,11 @@ pub fn run_args(args: Args) -> RunArgs {
             backend: None,
             progress: ProgressStyle::Auto,
             seed: None,
+            filter_operators: None,
+            filter_paths: None,
+            session: None,
+            reset: false,
+            incremental: false,
         },
     }
 }
@@ -240,6 +285,15 @@ pub fn merge_config(args: &RunArgs, mut config: FestConfig) -> FestConfig {
     if let Some(seed) = args.seed {
         config.seed = Some(seed);
     }
+    if let Some(filter_operators) = args.filter_operators.as_ref() {
+        config.filter_operators.clone_from(filter_operators);
+    }
+    if let Some(filter_paths) = args.filter_paths.as_ref() {
+        config.filter_paths.clone_from(filter_paths);
+    }
+    if let Some(session) = args.session.as_ref() {
+        config.session = Some(session.clone());
+    }
     config
 }
 
@@ -270,6 +324,11 @@ mod tests {
             backend: None,
             progress: ProgressStyle::Auto,
             seed: None,
+            filter_operators: None,
+            filter_paths: None,
+            session: None,
+            reset: false,
+            incremental: false,
         }
     }
 

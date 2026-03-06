@@ -26,7 +26,7 @@ use crate::mutation::{MutantResult, MutantStatus};
 pub fn format_html(report: &MutationReport) -> Result<String, crate::Error> {
     let mut output = String::new();
 
-    write_document_open(&mut output)?;
+    write_document_open(&mut output, report)?;
     write_summary_section(report, &mut output)?;
     write_file_sections(report, &mut output)?;
     write_document_close(&mut output)?;
@@ -40,13 +40,16 @@ pub fn format_html(report: &MutationReport) -> Result<String, crate::Error> {
 
 /// Write the opening HTML structure including `DOCTYPE`, `<head>`, and
 /// inline CSS styles.
-fn write_document_open(output: &mut String) -> Result<(), crate::Error> {
+fn write_document_open(output: &mut String, report: &MutationReport) -> Result<(), crate::Error> {
     writeln!(output, "<!DOCTYPE html>").map_err(fmt_err)?;
     writeln!(output, "<html lang=\"en\">").map_err(fmt_err)?;
     write_head_section(output)?;
     writeln!(output, "<body>").map_err(fmt_err)?;
     writeln!(output, "<div class=\"container\">").map_err(fmt_err)?;
-    writeln!(output, "<h1>fest mutation testing report</h1>").map_err(fmt_err)?;
+    let seed_suffix = report
+        .seed
+        .map_or_else(String::new, |seed| format!(" (seed: {seed})"));
+    writeln!(output, "<h1>fest mutation testing report{seed_suffix}</h1>").map_err(fmt_err)?;
     Ok(())
 }
 
@@ -134,6 +137,9 @@ fn write_summary_rows(report: &MutationReport, output: &mut String) -> Result<()
     write_summary_row(output, "Errors", report.errors)?;
     write_summary_row(output, "No coverage", report.no_coverage)?;
     write_score_row(output, report.mutation_score())?;
+    if let Some(seed) = report.seed {
+        writeln!(output, "<tr><td>Seed</td><td>{seed}</td></tr>").map_err(fmt_err)?;
+    }
     Ok(())
 }
 

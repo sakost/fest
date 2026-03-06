@@ -22,6 +22,7 @@ pub mod plugin;
 pub mod progress;
 pub mod report;
 pub mod runner;
+pub mod session;
 pub mod signal;
 
 pub use error::Error;
@@ -83,8 +84,14 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     let (config, mutants, coverage_map, files_scanned, project_dir) =
         run_preparation_phases(&args, &reporter)?;
 
+    // Open session if configured, applying --reset and --incremental.
+    let session_db = prepare_session(&config, &args, &reporter)?;
+
+    // Determine which mutants to run: all, or only pending from session.
+    let (mutants_to_run, prior_results) = resolve_session_mutants(session_db.as_ref(), &mutants)?;
+
     // Run mutants against the test suite.
-    let total_u64 = u64::try_from(mutants.len()).unwrap_or(u64::MAX);
+    let total_u64 = u64::try_from(mutants_to_run.len()).unwrap_or(u64::MAX);
     reporter.phase_start("Running mutants");
     reporter.start_mutants(total_u64);
 
@@ -95,21 +102,43 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     };
     let mutants_generated = mutants.len();
     let start = std::time::Instant::now();
-    let (results, was_cancelled) =
-        run_mutants(&mutants, &coverage_map, &config, &ctx, &project_dir)?;
+    let (new_results, was_cancelled) =
+        run_mutants(&mutants_to_run, &coverage_map, &config, &ctx, &project_dir)?;
+
+    // Persist results to session if available.
+    if let Some(sess) = session_db.as_ref() {
+        for result in &new_results {
+            sess.update_result(result)?;
+        }
+        // Store the current timestamp for incremental mode.
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _meta = sess.set_metadata("last_run_at", &epoch_secs.to_string());
+    }
     let duration = start.elapsed();
     reporter.finish_mutants(was_cancelled);
 
-    let tested = results.len();
+    let tested = new_results.len() + prior_results.len();
     reporter.phase_complete(
         "Mutants tested",
         Some(&format!("{tested} mutants")),
         start.elapsed(),
     );
 
+    // Combine prior results (from session) with new results.
+    let mut results = prior_results;
+    results.extend(new_results);
+
     // Build the report and emit the summary scoreboard.
-    let report =
-        report::MutationReport::from_results(results, files_scanned, mutants_generated, duration);
+    let report = report::MutationReport::from_results(
+        results,
+        files_scanned,
+        mutants_generated,
+        duration,
+        config.seed,
+    );
     emit_summary(&reporter, &report, duration);
 
     // Shut down the render task before writing the stdout report.
@@ -179,7 +208,14 @@ fn run_preparation_phases(
 
     reporter.phase_start("Generating mutants");
     let t3 = std::time::Instant::now();
-    let mutants = mutation::generate_mutants_for_files(&files, &registry, config.seed)?;
+    let gen_opts = mutation::GenerationOptions {
+        seed: config.seed,
+        filter_operators: &config.filter_operators,
+        filter_paths: &config.filter_paths,
+        per_file: &config.per_file,
+        global_mutators: &config.mutators,
+    };
+    let mutants = mutation::generate_mutants_for_files(&files, &registry, &gen_opts)?;
     let mutants_generated = mutants.len();
     reporter.phase_complete(
         "Mutants generated",
@@ -284,6 +320,126 @@ fn resolve_coverage(
         return coverage::load_cached_coverage(project_dir);
     }
     coverage::collect_coverage(project_dir, &config.source, config.fast_coverage)
+}
+
+/// Open a session database if configured.
+///
+/// When `config.session` is set, opens (or creates) the `SQLite` database
+/// and stores the generated mutants. Returns `None` when no session is
+/// configured.
+///
+/// # Errors
+///
+/// Returns [`Error::Session`] if the database cannot be opened.
+fn open_session(
+    config: &config::FestConfig,
+    reporter: &progress::ProgressReporter,
+) -> Result<Option<session::Session>, Error> {
+    let Some(session_path) = config.session.as_ref() else {
+        return Ok(None);
+    };
+    reporter.phase_start("Opening session");
+    let t0 = std::time::Instant::now();
+    let sess = session::Session::open(session_path)?;
+    reporter.phase_complete(
+        "Session opened",
+        Some(&session_path.display().to_string()),
+        t0.elapsed(),
+    );
+    Ok(Some(sess))
+}
+
+/// Prepare the session database: open, reset/incremental, store metadata.
+///
+/// # Errors
+///
+/// Returns [`Error::Session`] if any session operation fails.
+fn prepare_session(
+    config: &config::FestConfig,
+    args: &cli::RunArgs,
+    reporter: &progress::ProgressReporter,
+) -> Result<Option<session::Session>, Error> {
+    let session_db = open_session(config, reporter)?;
+    let Some(sess) = session_db else {
+        return Ok(None);
+    };
+    if args.reset {
+        sess.delete_all_mutants()?;
+    }
+    if args.incremental {
+        let changed = find_changed_source_files(&sess)?;
+        if !changed.is_empty() {
+            let _count = sess.reset_stale_files(&changed)?;
+        }
+    }
+    sess.store_run_metadata(config.seed, env!("CARGO_PKG_VERSION"))?;
+    Ok(Some(sess))
+}
+
+/// Find source files that have changed since the session was last run.
+///
+/// Reads `last_run_at` from the session metadata and compares it against
+/// file modification times. Returns file paths whose mtime is newer.
+///
+/// # Errors
+///
+/// Returns [`Error::Session`] if the session database query fails.
+fn find_changed_source_files(sess: &session::Session) -> Result<Vec<PathBuf>, Error> {
+    let last_run = sess.get_metadata("last_run_at")?;
+    let Some(timestamp_str) = last_run else {
+        // No previous run — treat all files as changed (no-op: reset won't change pending).
+        return Ok(Vec::new());
+    };
+
+    // Parse the stored timestamp (seconds since epoch).
+    let last_run_secs: u64 = timestamp_str.parse().unwrap_or(0_u64);
+    let last_run_time = std::time::UNIX_EPOCH + core::time::Duration::from_secs(last_run_secs);
+
+    // Get distinct file paths from the session.
+    let pending = sess.load_pending_mutants()?;
+    let completed = sess.load_completed_results()?;
+
+    let mut file_paths: Vec<PathBuf> = pending
+        .iter()
+        .map(|mutant| mutant.file_path.clone())
+        .chain(completed.iter().map(|res| res.mutant.file_path.clone()))
+        .collect();
+    file_paths.sort();
+    file_paths.dedup();
+
+    let changed: Vec<PathBuf> = file_paths
+        .into_iter()
+        .filter(|path| {
+            path.metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|mtime| mtime > last_run_time)
+        })
+        .collect();
+
+    Ok(changed)
+}
+
+/// Determine which mutants to run based on session state.
+///
+/// If a session is active, stores all generated mutants and returns only
+/// the pending ones. Previously completed results are returned separately.
+/// Without a session, returns all mutants with no prior results.
+///
+/// # Errors
+///
+/// Returns [`Error::Session`] if a session database operation fails.
+fn resolve_session_mutants(
+    session_db: Option<&session::Session>,
+    mutants: &[mutation::Mutant],
+) -> Result<(Vec<mutation::Mutant>, Vec<mutation::MutantResult>), Error> {
+    let Some(sess) = session_db else {
+        return Ok((mutants.to_vec(), Vec::new()));
+    };
+
+    sess.store_mutants(mutants)?;
+    let pending = sess.load_pending_mutants()?;
+    let completed = sess.load_completed_results()?;
+    Ok((pending, completed))
 }
 
 /// Run all mutants in parallel and collect their results.
@@ -506,6 +662,11 @@ mod tests {
             backend: None,
             progress: cli::ProgressStyle::Auto,
             seed: None,
+            filter_operators: None,
+            filter_paths: None,
+            session: None,
+            reset: false,
+            incremental: false,
         }
     }
 

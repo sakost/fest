@@ -36,6 +36,8 @@ pub struct MutationReport {
     pub results: Vec<MutantResult>,
     /// Total wall-clock duration of the mutation-testing run.
     pub duration: Duration,
+    /// Optional RNG seed used for deterministic mutant generation.
+    pub seed: Option<u64>,
 }
 
 impl MutationReport {
@@ -50,6 +52,7 @@ impl MutationReport {
         files_scanned: usize,
         mutants_generated: usize,
         duration: Duration,
+        seed: Option<u64>,
     ) -> Self {
         let mut killed: usize = 0;
         let mut survived: usize = 0;
@@ -80,6 +83,7 @@ impl MutationReport {
             errors,
             results,
             duration,
+            seed,
         }
     }
 

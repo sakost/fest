@@ -31,6 +31,10 @@ pub enum Error {
     #[error("report error: {0}")]
     Report(String),
 
+    /// An error originating from session management.
+    #[error("session error: {0}")]
+    Session(String),
+
     /// The run was cancelled by a signal (SIGINT / SIGTERM / SIGQUIT).
     #[error("cancelled: {0}")]
     Cancelled(String),
