@@ -4,6 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "fest-mutate"
+dynamic = ["version"]
 description = "An extremely fast mutation testing tool for Python"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
