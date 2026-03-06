@@ -6,7 +6,7 @@
 use ruff_python_ast::{BoolOp, Expr, Stmt, UnaryOp};
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that swaps boolean operators and removes `not`.
 #[derive(Debug)]
@@ -231,7 +231,12 @@ impl Mutator for BooleanOp {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -248,7 +253,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        BooleanOp.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        BooleanOp.find_mutations(source, &ast, &ctx)
     }
 
     /// `and` is swapped to `or`.
@@ -290,5 +299,43 @@ mod tests {
     fn mixed_and_not() {
         let mutations = find("x = not a and b");
         assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside if blocks.
+    #[test]
+    fn inside_if_block() {
+        let source = "if True:\n    x = a and b";
+        let mutations = find(source);
+        assert!(!mutations.is_empty());
+    }
+
+    /// Mutations are found inside try/except blocks.
+    #[test]
+    fn inside_try_block() {
+        let source = "try:\n    x = a and b\nexcept:\n    y = c or d";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Byte offset of `and` operator is correct.
+    #[test]
+    fn byte_offset_and_length() {
+        let source = "x = a and b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("and").expect("has and");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 3_usize);
+    }
+
+    /// Byte offset of `or` operator is correct.
+    #[test]
+    fn byte_offset_or() {
+        let source = "x = a or b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find(" or ").expect("has or") + 1_usize;
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
     }
 }

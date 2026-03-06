@@ -6,7 +6,7 @@
 use ruff_python_ast::{Expr, Stmt};
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that modifies return values.
 #[derive(Debug)]
@@ -152,7 +152,12 @@ impl Mutator for ReturnValue {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -169,7 +174,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        ReturnValue.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        ReturnValue.find_mutations(source, &ast, &ctx)
     }
 
     /// `return expr` is replaced with `return None`.
@@ -216,5 +225,24 @@ mod tests {
         let source = "def calc():\n    if True:\n        return 1\n    return 2";
         let mutations = find(source);
         assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Return inside try/except is found.
+    #[test]
+    fn return_inside_try_block() {
+        let source = "def func():\n    try:\n        return 1\n    except:\n        return 2";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Byte offset and length of return value mutation are correct.
+    #[test]
+    fn return_byte_offset() {
+        let source = "def calc():\n    return 42";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("42").expect("has 42");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
     }
 }

@@ -148,6 +148,12 @@ pub struct RunArgs {
     /// `quiet` suppresses all progress output.
     #[arg(long, default_value = "auto")]
     pub progress: ProgressStyle,
+
+    /// Seed for deterministic randomised mutation operators.
+    ///
+    /// Overrides `seed` in the config file.
+    #[arg(long)]
+    pub seed: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +191,7 @@ pub fn run_args(args: Args) -> RunArgs {
             no_fast_coverage: false,
             backend: None,
             progress: ProgressStyle::Auto,
+            seed: None,
         },
     }
 }
@@ -230,6 +237,9 @@ pub fn merge_config(args: &RunArgs, mut config: FestConfig) -> FestConfig {
     if let Some(backend) = args.backend.as_ref() {
         config.backend = backend.clone();
     }
+    if let Some(seed) = args.seed {
+        config.seed = Some(seed);
+    }
     config
 }
 
@@ -259,6 +269,7 @@ mod tests {
             no_fast_coverage: false,
             backend: None,
             progress: ProgressStyle::Auto,
+            seed: None,
         }
     }
 

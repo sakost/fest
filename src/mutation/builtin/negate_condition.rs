@@ -5,7 +5,7 @@
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that negates conditions in `if`, `elif`, and `while` statements.
 #[derive(Debug)]
@@ -125,7 +125,12 @@ impl Mutator for NegateCondition {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -142,7 +147,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        NegateCondition.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        NegateCondition.find_mutations(source, &ast, &ctx)
     }
 
     /// An `if` condition is negated.
@@ -190,5 +199,36 @@ mod tests {
         let mutations = find(source);
         assert_eq!(mutations.len(), 1_usize);
         assert_eq!(mutations[0_usize].original_text, "a");
+    }
+
+    /// If inside try/except is found.
+    #[test]
+    fn if_inside_try_block() {
+        let source = "try:\n    if cond:\n        pass\nexcept:\n    pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        assert_eq!(mutations[0_usize].original_text, "cond");
+    }
+
+    /// Byte offset and length of negate mutation are correct.
+    #[test]
+    fn negate_byte_offset() {
+        let source = "if x:\n    pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find('x').expect("has x");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 1_usize);
+    }
+
+    /// Byte offset for multi-char condition.
+    #[test]
+    fn negate_byte_offset_long_cond() {
+        let source = "if running:\n    pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("running").expect("has running");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, "running".len());
     }
 }

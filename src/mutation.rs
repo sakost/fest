@@ -15,9 +15,11 @@ pub mod builtin;
 pub mod mutant;
 /// Mutator trait and registry for mutation operators.
 pub mod mutator;
+/// Deterministic per-mutation value derivation from a seed.
+pub(crate) mod seed;
 
 pub use mutant::{Mutant, MutantResult, MutantStatus};
-pub use mutator::{Mutation, Mutator, MutatorRegistry};
+pub use mutator::{Mutation, MutationContext, Mutator, MutatorRegistry};
 
 /// Build a [`MutatorRegistry`] from a [`MutatorConfig`].
 ///
@@ -61,6 +63,33 @@ pub fn build_registry(config: &MutatorConfig) -> MutatorRegistry {
     }
     if config.exception_swallow {
         registry.register(Box::new(builtin::exception::ExceptionSwallow));
+    }
+    if config.break_continue {
+        registry.register(Box::new(builtin::break_continue::BreakContinue));
+    }
+    if config.unary_op {
+        registry.register(Box::new(builtin::unary::UnaryOp));
+    }
+    if config.zero_iteration_loop {
+        registry.register(Box::new(builtin::zero_iteration::ZeroIterationLoop));
+    }
+    if config.augmented_assign {
+        registry.register(Box::new(builtin::augmented_assign::AugmentedAssign));
+    }
+    if config.statement_deletion {
+        registry.register(Box::new(builtin::statement_deletion::StatementDeletion));
+    }
+    if config.bitwise_op {
+        registry.register(Box::new(builtin::bitwise::BitwiseOp));
+    }
+    if config.remove_super_call {
+        registry.register(Box::new(builtin::remove_super::RemoveSuperCall));
+    }
+    if config.variable_replace {
+        registry.register(Box::new(builtin::variable_replace::VariableReplace));
+    }
+    if config.variable_insert {
+        registry.register(Box::new(builtin::variable_insert::VariableInsert));
     }
 
     registry
@@ -154,6 +183,7 @@ fn line_column_from_offset(source: &str, byte_offset: usize) -> (u32, u32) {
 fn generate_mutants_for_file(
     path: &Path,
     registry: &MutatorRegistry,
+    seed: Option<u64>,
 ) -> Result<Vec<Mutant>, Error> {
     let source = std::fs::read_to_string(path)
         .map_err(|err| Error::Mutation(format!("failed to read {}: {err}", path.display())))?;
@@ -162,10 +192,15 @@ fn generate_mutants_for_file(
         .map_err(|err| Error::Mutation(format!("failed to parse {}: {err}", path.display())))?;
     let ast = parsed.into_syntax();
 
+    let ctx = MutationContext {
+        file_path: path,
+        seed,
+    };
+
     let mut mutants = Vec::new();
 
     for mutator in registry.iter() {
-        let mutations = mutator.find_mutations(&source, &ast);
+        let mutations = mutator.find_mutations(&source, &ast, &ctx);
 
         for mutation in mutations {
             let (line, column) = line_column_from_offset(&source, mutation.byte_offset);
@@ -203,10 +238,11 @@ fn generate_mutants_for_file(
 pub fn generate_mutants_for_files(
     files: &[PathBuf],
     registry: &MutatorRegistry,
+    seed: Option<u64>,
 ) -> Result<Vec<Mutant>, Error> {
     let results: Result<Vec<Vec<Mutant>>, Error> = files
         .par_iter()
-        .map(|path| generate_mutants_for_file(path, registry))
+        .map(|path| generate_mutants_for_file(path, registry, seed))
         .collect();
 
     let nested = results?;
@@ -242,9 +278,10 @@ pub fn generate_mutants(
     exclude_patterns: &[String],
     base_dir: &Path,
     registry: &MutatorRegistry,
+    seed: Option<u64>,
 ) -> Result<Vec<Mutant>, Error> {
     let files = discover_files(source_patterns, exclude_patterns, base_dir)?;
-    generate_mutants_for_files(&files, registry)
+    generate_mutants_for_files(&files, registry, seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +418,7 @@ mod tests {
         registry.register(Box::new(builtin::arithmetic::ArithmeticOp));
 
         let mutants =
-            generate_mutants_for_file(&py_file, &registry).expect("should generate mutants");
+            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
 
         assert_eq!(mutants.len(), 1_usize);
         assert_eq!(mutants[0_usize].original_text, "+");
@@ -416,7 +453,7 @@ mod tests {
 
         let patterns = vec!["src/**/*.py".to_owned()];
         let excludes: Vec<String> = Vec::new();
-        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry)
+        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry, None)
             .expect("should generate mutants");
 
         assert_eq!(mutants.len(), 2_usize);
@@ -436,7 +473,7 @@ mod tests {
         }
 
         let registry = MutatorRegistry::new();
-        let result = generate_mutants_for_file(&py_file, &registry);
+        let result = generate_mutants_for_file(&py_file, &registry, None);
 
         assert!(result.is_err());
     }
@@ -453,7 +490,7 @@ mod tests {
 
         let registry = MutatorRegistry::new();
         let mutants =
-            generate_mutants_for_file(&py_file, &registry).expect("should generate mutants");
+            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
 
         assert!(mutants.is_empty());
     }
@@ -475,7 +512,7 @@ mod tests {
         registry.register(Box::new(builtin::comparison::ComparisonOp));
 
         let mutants =
-            generate_mutants_for_file(&py_file, &registry).expect("should generate mutants");
+            generate_mutants_for_file(&py_file, &registry, None).expect("should generate mutants");
 
         // At least 1 arithmetic + 1 comparison mutation
         assert!(mutants.len() >= 2_usize);
@@ -510,7 +547,7 @@ mod tests {
 
         let patterns = vec!["src/**/*.py".to_owned()];
         let excludes = vec!["src/gen/**/*.py".to_owned()];
-        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry)
+        let mutants = generate_mutants(&patterns, &excludes, dir.path(), &registry, None)
             .expect("should generate mutants");
 
         assert_eq!(mutants.len(), 1_usize);
@@ -524,7 +561,7 @@ mod tests {
     fn build_registry_default_config_registers_all() {
         let config = MutatorConfig::default();
         let registry = build_registry(&config);
-        assert_eq!(registry.len(), 8_usize);
+        assert_eq!(registry.len(), 14_usize);
     }
 
     /// Disabling all flags produces an empty registry.
@@ -539,6 +576,15 @@ mod tests {
             remove_decorator: false,
             constant_replace: false,
             exception_swallow: false,
+            break_continue: false,
+            unary_op: false,
+            zero_iteration_loop: false,
+            augmented_assign: false,
+            statement_deletion: false,
+            bitwise_op: false,
+            remove_super_call: false,
+            variable_replace: false,
+            variable_insert: false,
             custom: Vec::new(),
             python: Vec::new(),
             dylib: Vec::new(),
@@ -560,6 +606,15 @@ mod tests {
             remove_decorator: false,
             constant_replace: false,
             exception_swallow: false,
+            break_continue: false,
+            unary_op: false,
+            zero_iteration_loop: false,
+            augmented_assign: false,
+            statement_deletion: false,
+            bitwise_op: false,
+            remove_super_call: false,
+            variable_replace: false,
+            variable_insert: false,
             custom: Vec::new(),
             python: Vec::new(),
             dylib: Vec::new(),
@@ -582,6 +637,15 @@ mod tests {
             remove_decorator: false,
             constant_replace: false,
             exception_swallow: false,
+            break_continue: false,
+            unary_op: false,
+            zero_iteration_loop: false,
+            augmented_assign: false,
+            statement_deletion: false,
+            bitwise_op: false,
+            remove_super_call: false,
+            variable_replace: false,
+            variable_insert: false,
             custom: Vec::new(),
             python: Vec::new(),
             dylib: Vec::new(),
@@ -604,6 +668,15 @@ mod tests {
             remove_decorator: false,
             constant_replace: false,
             exception_swallow: true,
+            break_continue: false,
+            unary_op: false,
+            zero_iteration_loop: false,
+            augmented_assign: false,
+            statement_deletion: false,
+            bitwise_op: false,
+            remove_super_call: false,
+            variable_replace: false,
+            variable_insert: false,
             custom: Vec::new(),
             python: Vec::new(),
             dylib: Vec::new(),
@@ -626,7 +699,7 @@ mod tests {
     #[test]
     fn build_registry_flag_name_mapping() {
         /// Expected mapping from config field name to mutator name.
-        const EXPECTED_NAMES: [&str; 8] = [
+        const EXPECTED_NAMES: [&str; 14] = [
             "arithmetic_op",
             "comparison_op",
             "boolean_op",
@@ -635,6 +708,12 @@ mod tests {
             "remove_decorator",
             "constant_replace",
             "exception_swallow",
+            "break_continue",
+            "unary_op",
+            "zero_iteration_loop",
+            "augmented_assign",
+            "bitwise_op",
+            "remove_super_call",
         ];
 
         let config = MutatorConfig::default();

@@ -89,6 +89,33 @@ pub struct MutatorConfig {
     /// Enable the exception-swallow mutator.
     #[serde(default = "default_true")]
     pub exception_swallow: bool,
+    /// Enable the break/continue swap mutator.
+    #[serde(default = "default_true")]
+    pub break_continue: bool,
+    /// Enable the unary operator mutator.
+    #[serde(default = "default_true")]
+    pub unary_op: bool,
+    /// Enable the zero-iteration loop mutator.
+    #[serde(default = "default_true")]
+    pub zero_iteration_loop: bool,
+    /// Enable the augmented-assignment operator mutator.
+    #[serde(default = "default_true")]
+    pub augmented_assign: bool,
+    /// Enable the statement-deletion mutator.
+    #[serde(default = "default_false")]
+    pub statement_deletion: bool,
+    /// Enable the bitwise operator mutator.
+    #[serde(default = "default_true")]
+    pub bitwise_op: bool,
+    /// Enable the super-call removal mutator.
+    #[serde(default = "default_true")]
+    pub remove_super_call: bool,
+    /// Enable the variable-replace mutator (requires seed).
+    #[serde(default = "default_false")]
+    pub variable_replace: bool,
+    /// Enable the variable-insert mutator (requires seed).
+    #[serde(default = "default_false")]
+    pub variable_insert: bool,
     /// Custom text-pattern mutators.
     #[serde(default)]
     pub custom: Vec<CustomMutator>,
@@ -112,6 +139,15 @@ impl Default for MutatorConfig {
             remove_decorator: true,
             constant_replace: true,
             exception_swallow: true,
+            break_continue: true,
+            unary_op: true,
+            zero_iteration_loop: true,
+            augmented_assign: true,
+            statement_deletion: false,
+            bitwise_op: true,
+            remove_super_call: true,
+            variable_replace: false,
+            variable_insert: false,
             custom: Vec::new(),
             python: Vec::new(),
             dylib: Vec::new(),
@@ -165,6 +201,9 @@ pub struct FestConfig {
     /// Force the fastest C-based coverage tracer (`COVERAGE_CORE=ctrace`).
     #[serde(default = "default_true")]
     pub fast_coverage: bool,
+    /// Seed for deterministic randomised mutation operators.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for FestConfig {
@@ -184,6 +223,7 @@ impl Default for FestConfig {
             coverage_cache: true,
             coverage_from: None,
             fast_coverage: true,
+            seed: None,
         }
     }
 }
@@ -228,6 +268,11 @@ impl FestConfig {
 /// Returns `true` — used as `#[serde(default)]` helper for boolean mutator flags.
 const fn default_true() -> bool {
     true
+}
+
+/// Returns `false` — used as `#[serde(default)]` helper for opt-in mutator flags.
+const fn default_false() -> bool {
+    false
 }
 
 /// Default source globs.

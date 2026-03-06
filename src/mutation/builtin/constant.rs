@@ -5,7 +5,7 @@
 
 use ruff_python_ast::{Expr, Number, Stmt};
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that replaces constant literals.
 #[derive(Debug)]
@@ -281,7 +281,12 @@ impl Mutator for ConstantReplace {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -298,7 +303,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        ConstantReplace.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        ConstantReplace.find_mutations(source, &ast, &ctx)
     }
 
     /// `True` is swapped to `False`.
@@ -368,5 +377,86 @@ mod tests {
         let mutations = find("x = \"hello\"");
         assert_eq!(mutations.len(), 1_usize);
         assert_eq!(mutations[0_usize].replacement_text, "\"\"");
+    }
+
+    /// Mutations are found inside if blocks.
+    #[test]
+    fn inside_if_block() {
+        let source = "if True:\n    x = 42";
+        let mutations = find(source);
+        assert!(!mutations.is_empty());
+    }
+
+    /// Mutations are found inside try/except blocks.
+    #[test]
+    fn inside_try_block() {
+        let source = "try:\n    x = 42\nexcept:\n    y = 0";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside expressions visited via visit_exprs (e.g. bool_op values).
+    #[test]
+    fn inside_bool_op_values() {
+        let source = "x = 1 or 2";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside dict literals.
+    #[test]
+    fn inside_dict() {
+        let source = "x = {1: 2}";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Byte offset for boolean literal is correct.
+    #[test]
+    fn boolean_byte_offset() {
+        let source = "x = True";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("True").expect("has True");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 4_usize);
+    }
+
+    /// Byte offset for number literal is correct.
+    #[test]
+    fn number_byte_offset() {
+        let source = "x = 42";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("42").expect("has 42");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
+    }
+
+    /// Byte offset for string literal is correct.
+    #[test]
+    fn string_byte_offset() {
+        let source = "x = \"hello\"";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find('"').expect("has quote");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 7_usize);
+    }
+
+    /// Float `1.0` is swapped to `0.0`.
+    #[test]
+    fn swap_float_one() {
+        let mutations = find("x = 1.0");
+        assert_eq!(mutations.len(), 1_usize);
+        assert_eq!(mutations[0_usize].replacement_text, "0.0");
+    }
+
+    /// Non-special float is incremented.
+    #[test]
+    fn increment_float() {
+        let mutations = find("x = 2.5");
+        assert_eq!(mutations.len(), 1_usize);
+        assert_eq!(mutations[0_usize].replacement_text, "3.5");
     }
 }

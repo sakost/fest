@@ -5,8 +5,14 @@
 
 /// Arithmetic operator mutations (`+` <-> `-`, `*` <-> `/`, etc.).
 pub mod arithmetic;
+/// Augmented assignment operator mutations (`+=` <-> `-=`, etc.).
+pub mod augmented_assign;
+/// Bitwise operator mutations (`&` <-> `|`, `<<` <-> `>>`, etc.).
+pub mod bitwise;
 /// Boolean operator mutations (`and` <-> `or`, `not` removal).
 pub mod boolean;
+/// Break/continue swap mutations.
+pub mod break_continue;
 /// Comparison operator mutations (`==` <-> `!=`, `<` <-> `>=`, etc.).
 pub mod comparison;
 /// Constant literal mutations (`True` <-> `False`, `0` <-> `1`, etc.).
@@ -17,8 +23,20 @@ pub mod exception;
 pub mod negate_condition;
 /// Decorator removal from functions and classes.
 pub mod remove_decorator;
+/// Super-call removal mutations.
+pub mod remove_super;
 /// Return value mutations (`return expr` -> `return None`, etc.).
 pub mod return_value;
+/// Statement deletion mutations.
+pub mod statement_deletion;
+/// Unary operator mutations.
+pub mod unary;
+/// Variable insertion mutations (requires seed).
+pub mod variable_insert;
+/// Variable replacement mutations (requires seed).
+pub mod variable_replace;
+/// Zero-iteration loop mutations.
+pub mod zero_iteration;
 
 use crate::mutation::mutator::Mutator;
 

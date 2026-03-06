@@ -6,7 +6,7 @@
 use ruff_python_ast::{Expr, Operator, Stmt};
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that swaps binary arithmetic operators.
 #[derive(Debug)]
@@ -222,7 +222,12 @@ impl Mutator for ArithmeticOp {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -239,7 +244,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        ArithmeticOp.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        ArithmeticOp.find_mutations(source, &ast, &ctx)
     }
 
     /// Addition is swapped to subtraction.
@@ -317,5 +326,52 @@ mod tests {
     fn no_mutation_for_bitwise() {
         let mutations = find("x = a & b");
         assert!(mutations.is_empty());
+    }
+
+    /// Mutations are found inside if blocks.
+    #[test]
+    fn inside_if_block() {
+        let source = "if True:\n    x = a + b";
+        let mutations = find(source);
+        assert!(!mutations.is_empty());
+    }
+
+    /// Mutations are found inside try/except blocks.
+    #[test]
+    fn inside_try_block() {
+        let source = "try:\n    x = a + b\nexcept:\n    y = c - d";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside expressions visited via visit_exprs (e.g. list).
+    #[test]
+    fn inside_bool_op_values() {
+        let source = "x = (a + b) or (c - d)";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutation byte offset matches the operator position in source.
+    #[test]
+    fn mutation_byte_offset_is_correct() {
+        let source = "x = a + b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        // "+" is at byte offset 6 in "x = a + b"
+        let expected_offset = source.find('+').expect("has +");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 1_usize);
+    }
+
+    /// Byte offset is correct for multi-char operators.
+    #[test]
+    fn byte_offset_floordiv() {
+        let source = "x = a // b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("//").expect("has //");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
     }
 }

@@ -4,7 +4,7 @@
 
 use ruff_python_ast::Stmt;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that removes decorators from functions and classes.
 #[derive(Debug)]
@@ -130,7 +130,12 @@ impl Mutator for RemoveDecorator {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -147,7 +152,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        RemoveDecorator.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        RemoveDecorator.find_mutations(source, &ast, &ctx)
     }
 
     /// A single decorator is removed.
@@ -191,5 +200,68 @@ mod tests {
         let source = "class Cls:\n    @staticmethod\n    def method():\n        pass";
         let mutations = find(source);
         assert_eq!(mutations.len(), 1_usize);
+    }
+
+    /// Decorator inside if block is found.
+    #[test]
+    fn decorator_inside_if_block() {
+        let source = "if True:\n    @deco\n    def func():\n        pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+    }
+
+    /// Decorator inside try/except is found.
+    #[test]
+    fn decorator_inside_try_block() {
+        let source = "try:\n    @deco\n    def func():\n        pass\nexcept:\n    pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+    }
+
+    /// Byte offset of decorator mutation is correct, including trailing newline.
+    #[test]
+    fn decorator_byte_offset_and_length() {
+        let source = "@my_decorator\ndef func():\n    pass";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        assert_eq!(mutations[0_usize].byte_offset, 0_usize);
+        // "@my_decorator\n" = 14 bytes
+        assert_eq!(mutations[0_usize].byte_length, "@my_decorator\n".len());
+    }
+
+    /// skip_trailing_newline skips \n correctly.
+    #[test]
+    fn skip_trailing_newline_lf() {
+        assert_eq!(skip_trailing_newline("abc\ndef", 3_usize), 4_usize);
+    }
+
+    /// skip_trailing_newline skips \r\n correctly.
+    #[test]
+    fn skip_trailing_newline_crlf() {
+        assert_eq!(skip_trailing_newline("abc\r\ndef", 3_usize), 5_usize);
+    }
+
+    /// skip_trailing_newline returns offset unchanged when no newline.
+    #[test]
+    fn skip_trailing_newline_none() {
+        assert_eq!(skip_trailing_newline("abcdef", 3_usize), 3_usize);
+    }
+
+    /// skip_trailing_newline at end of string returns offset unchanged.
+    #[test]
+    fn skip_trailing_newline_at_end() {
+        assert_eq!(skip_trailing_newline("abc", 3_usize), 3_usize);
+    }
+
+    /// skip_trailing_newline with \r not followed by \n.
+    #[test]
+    fn skip_trailing_newline_bare_cr() {
+        assert_eq!(skip_trailing_newline("abc\rdef", 3_usize), 3_usize);
+    }
+
+    /// skip_trailing_newline with \r at end of string.
+    #[test]
+    fn skip_trailing_newline_cr_at_end() {
+        assert_eq!(skip_trailing_newline("abc\r", 3_usize), 3_usize);
     }
 }

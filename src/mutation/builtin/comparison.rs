@@ -6,7 +6,7 @@
 use ruff_python_ast::{CmpOp, Expr, Stmt};
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that swaps comparison operators.
 #[derive(Debug)]
@@ -223,7 +223,12 @@ impl Mutator for ComparisonOp {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -240,7 +245,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        ComparisonOp.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        ComparisonOp.find_mutations(source, &ast, &ctx)
     }
 
     /// `==` is swapped to `!=`.
@@ -320,5 +329,51 @@ mod tests {
     fn chained_comparison() {
         let mutations = find("x = a < b < c");
         assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside if blocks.
+    #[test]
+    fn inside_if_block() {
+        let source = "if True:\n    x = a == b";
+        let mutations = find(source);
+        assert!(!mutations.is_empty());
+    }
+
+    /// Mutations are found inside try/except blocks.
+    #[test]
+    fn inside_try_block() {
+        let source = "try:\n    x = a == b\nexcept:\n    y = c != d";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Mutations are found inside expressions visited via visit_exprs (e.g. bool_op values).
+    #[test]
+    fn inside_bool_op_values() {
+        let source = "x = (a == b) or (c != d)";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 2_usize);
+    }
+
+    /// Byte offset of `==` operator is correct.
+    #[test]
+    fn byte_offset_is_correct() {
+        let source = "x = a == b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("==").expect("has ==");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
+    }
+
+    /// find_op_in_source returns correct offset for operator not at start of region.
+    #[test]
+    fn find_op_in_source_offset() {
+        let source = "x = a  !=  b";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("!=").expect("has !=");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, 2_usize);
     }
 }

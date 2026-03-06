@@ -6,7 +6,7 @@
 use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 
-use crate::mutation::mutator::{Mutation, Mutator};
+use crate::mutation::mutator::{Mutation, MutationContext, Mutator};
 
 /// Mutator that replaces exception handler bodies with `pass`.
 #[derive(Debug)]
@@ -126,7 +126,12 @@ impl Mutator for ExceptionSwallow {
     }
 
     #[inline]
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation> {
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        _ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation> {
         let mut out = Vec::new();
         walk_stmts(&ast.body, source, &mut out);
         out
@@ -143,7 +148,11 @@ mod tests {
         let parsed = ruff_python_parser::parse_module(source)
             .expect("valid Python source required for test");
         let ast = parsed.into_syntax();
-        ExceptionSwallow.find_mutations(source, &ast)
+        let ctx = MutationContext {
+            file_path: std::path::Path::new("test.py"),
+            seed: None,
+        };
+        ExceptionSwallow.find_mutations(source, &ast, &ctx)
     }
 
     /// An except handler body is replaced with `pass`.
@@ -180,5 +189,24 @@ mod tests {
         let source = "def func():\n    try:\n        op()\n    except:\n        recover()";
         let mutations = find(source);
         assert_eq!(mutations.len(), 1_usize);
+    }
+
+    /// Try/except inside if block is found.
+    #[test]
+    fn try_inside_if_block() {
+        let source = "if True:\n    try:\n        op()\n    except:\n        recover()";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+    }
+
+    /// Byte offset and length of except body mutation are correct.
+    #[test]
+    fn except_body_byte_offset() {
+        let source = "try:\n    risky()\nexcept Exception:\n    log(error)";
+        let mutations = find(source);
+        assert_eq!(mutations.len(), 1_usize);
+        let expected_offset = source.find("log(error)").expect("has log");
+        assert_eq!(mutations[0_usize].byte_offset, expected_offset);
+        assert_eq!(mutations[0_usize].byte_length, "log(error)".len());
     }
 }

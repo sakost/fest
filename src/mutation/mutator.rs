@@ -22,6 +22,18 @@ pub struct Mutation {
     pub replacement_text: String,
 }
 
+/// Context passed to every mutator during a mutation-generation run.
+///
+/// Carries per-file and per-run information that operators may use to
+/// produce deterministic, seed-dependent mutations.
+#[derive(Debug, Clone)]
+pub struct MutationContext<'ctx> {
+    /// Path of the file being mutated.
+    pub file_path: &'ctx std::path::Path,
+    /// Global seed for deterministic randomised operators.
+    pub seed: Option<u64>,
+}
+
 /// A mutation operator that can inspect Python source code and produce
 /// candidate mutations.
 ///
@@ -34,7 +46,12 @@ pub trait Mutator: Send + Sync {
 
     /// Scan the given Python source and its AST, returning all mutations
     /// this operator can produce.
-    fn find_mutations(&self, source: &str, ast: &ruff_python_ast::ModModule) -> Vec<Mutation>;
+    fn find_mutations(
+        &self,
+        source: &str,
+        ast: &ruff_python_ast::ModModule,
+        ctx: &MutationContext<'_>,
+    ) -> Vec<Mutation>;
 }
 
 /// A collection of active [`Mutator`] implementations.
@@ -116,6 +133,7 @@ mod tests {
             &self,
             _source: &str,
             _ast: &ruff_python_ast::ModModule,
+            _ctx: &MutationContext<'_>,
         ) -> Vec<Mutation> {
             Vec::new()
         }

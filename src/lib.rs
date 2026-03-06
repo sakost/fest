@@ -179,7 +179,7 @@ fn run_preparation_phases(
 
     reporter.phase_start("Generating mutants");
     let t3 = std::time::Instant::now();
-    let mutants = mutation::generate_mutants_for_files(&files, &registry)?;
+    let mutants = mutation::generate_mutants_for_files(&files, &registry, config.seed)?;
     let mutants_generated = mutants.len();
     reporter.phase_complete(
         "Mutants generated",
@@ -505,6 +505,7 @@ mod tests {
             no_fast_coverage: false,
             backend: None,
             progress: cli::ProgressStyle::Auto,
+            seed: None,
         }
     }
 
