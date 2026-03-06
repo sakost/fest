@@ -4,7 +4,8 @@
 //! pool of long-lived pytest worker processes.  Each worker loads the
 //! embedded `_fest_plugin.py` plugin, collects tests once, then enters
 //! an event loop receiving mutant descriptions and returning results
-//! over a Unix domain socket using a JSON-over-newline protocol.
+//! over IPC (Unix domain sockets on Unix, TCP on Windows) using a
+//! JSON-over-newline protocol.
 //!
 //! The lifecycle is:
 //! 1. [`Runner::start`] — spawn N persistent workers (one pytest each).
@@ -16,9 +17,13 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::time::Duration;
 
+#[cfg(windows)]
+use tokio::net::{TcpListener as IpcListener, TcpStream as IpcStream};
+// Platform-specific IPC types: Unix domain sockets on Unix, TCP on Windows.
+#[cfg(unix)]
+use tokio::net::{UnixListener as IpcListener, UnixStream as IpcStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
-    net::{UnixListener, UnixStream},
     process::Command,
 };
 
@@ -59,20 +64,22 @@ struct TempWorkerEnv {
     /// Temporary directory owning the plugin file and socket.
     temp_dir: tempfile::TempDir,
 
-    /// Bound Unix listener waiting for the plugin to connect.
-    listener: UnixListener,
+    /// Bound IPC listener waiting for the plugin to connect.
+    listener: IpcListener,
 
     /// `PYTHONPATH` value that prepends the temp directory.
     python_path: String,
 
-    /// Stringified socket path for the `--fest-socket` CLI argument.
-    socket_path_str: String,
+    /// Connection address string for the `--fest-socket` CLI argument.
+    /// On Unix this is a socket path; on Windows it is `host:port`.
+    socket_addr_str: String,
 }
 
 /// Prepare the temporary environment for a persistent worker.
 ///
-/// Creates the temp directory, writes the plugin file, binds the Unix
-/// socket, and builds the `PYTHONPATH` value.
+/// Creates the temp directory, writes the plugin file, binds the IPC
+/// listener (Unix socket on Unix, TCP localhost on Windows), and builds
+/// the `PYTHONPATH` value.
 ///
 /// # Errors
 ///
@@ -89,22 +96,39 @@ fn prepare_worker_env() -> Result<TempWorkerEnv, Error> {
         ))
     })?;
 
-    let socket_path = temp_dir.path().join("fest.sock");
-    let listener = UnixListener::bind(&socket_path).map_err(|err| {
-        Error::Runner(format!(
-            "failed to bind Unix socket at {}: {err}",
-            socket_path.display()
-        ))
-    })?;
+    #[cfg(unix)]
+    let (listener, socket_addr_str) = {
+        let socket_path = temp_dir.path().join("fest.sock");
+        let listener = IpcListener::bind(&socket_path).map_err(|err| {
+            Error::Runner(format!(
+                "failed to bind Unix socket at {}: {err}",
+                socket_path.display()
+            ))
+        })?;
+        (listener, socket_path.display().to_string())
+    };
+
+    #[cfg(windows)]
+    let (listener, socket_addr_str) = {
+        let listener = IpcListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
+            .map_err(|err| {
+                Error::Runner(format!("failed to bind TCP listener on localhost: {err}"))
+            })?;
+        let addr = listener.local_addr().map_err(|err| {
+            Error::Runner(format!(
+                "failed to get local address of TCP listener: {err}"
+            ))
+        })?;
+        (listener, addr.to_string())
+    };
 
     let python_path = super::build_python_path(temp_dir.path());
-    let socket_path_str = socket_path.display().to_string();
 
     Ok(TempWorkerEnv {
         temp_dir,
         listener,
         python_path,
-        socket_path_str,
+        socket_addr_str,
     })
 }
 
@@ -122,10 +146,10 @@ struct PersistentWorker {
     child: tokio::process::Child,
 
     /// Buffered reader for the Unix socket connection.
-    reader: BufReader<ReadHalf<UnixStream>>,
+    reader: BufReader<ReadHalf<IpcStream>>,
 
     /// Writer half of the Unix socket connection.
-    writer: WriteHalf<UnixStream>,
+    writer: WriteHalf<IpcStream>,
 }
 
 impl PersistentWorker {
@@ -153,7 +177,7 @@ impl PersistentWorker {
                 "-p",
                 "_fest_plugin",
                 "--fest-socket",
-                &env.socket_path_str,
+                &env.socket_addr_str,
                 "-p",
                 "no:xdist",
                 "-o",
@@ -628,9 +652,9 @@ fn compute_startup_timeout(per_mutant_timeout: Duration) -> Duration {
 /// accept fails.
 async fn accept_or_child_exit(
     child: &mut tokio::process::Child,
-    listener: UnixListener,
+    listener: IpcListener,
     timeout: Duration,
-) -> Result<UnixStream, Error> {
+) -> Result<IpcStream, Error> {
     tokio::select! {
         // Branch 1: plugin connects successfully.
         accept_result = listener.accept() => {
@@ -648,8 +672,8 @@ async fn accept_or_child_exit(
             }
         }
         // Branch 2: child process exits before connecting.
-        wait_result = child.wait() => {
-            let code = wait_result
+        child_exit = child.wait() => {
+            let code = child_exit
                 .as_ref()
                 .ok()
                 .and_then(std::process::ExitStatus::code);
@@ -1247,24 +1271,45 @@ mod tests {
     /// End-to-end socket protocol test: simulates the plugin side.
     #[tokio::test]
     async fn socket_protocol_end_to_end() {
-        let temp_dir = tempfile::tempdir().unwrap_or_else(|err| {
-            #[allow(clippy::panic, reason = "test assertion")]
-            {
-                panic!("create temp dir: {err}");
-            }
-        });
-        let socket_path = temp_dir.path().join("test.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap_or_else(|err| {
-            #[allow(clippy::panic, reason = "test assertion")]
-            {
-                panic!("bind socket: {err}");
-            }
-        });
+        #[cfg(unix)]
+        let (listener, connect_addr) = {
+            let temp_dir_leaked = Box::leak(Box::new(tempfile::tempdir().unwrap_or_else(|err| {
+                #[allow(clippy::panic, reason = "test assertion")]
+                {
+                    panic!("create temp dir: {err}");
+                }
+            })));
+            let socket_path = temp_dir_leaked.path().join("test.sock");
+            let listener = IpcListener::bind(&socket_path).unwrap_or_else(|err| {
+                #[allow(clippy::panic, reason = "test assertion")]
+                {
+                    panic!("bind socket: {err}");
+                }
+            });
+            (listener, socket_path)
+        };
+
+        #[cfg(windows)]
+        let (listener, connect_addr) = {
+            let listener = IpcListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
+                .unwrap_or_else(|err| {
+                    #[allow(clippy::panic, reason = "test assertion")]
+                    {
+                        panic!("bind TCP: {err}");
+                    }
+                });
+            let addr = listener.local_addr().unwrap_or_else(|err| {
+                #[allow(clippy::panic, reason = "test assertion")]
+                {
+                    panic!("local addr: {err}");
+                }
+            });
+            (listener, addr)
+        };
 
         // Spawn a mock plugin that sends READY, reads MUTANT, sends RESULT.
-        let socket_path_clone = socket_path.clone();
         let mock_handle = tokio::spawn(async move {
-            let stream = UnixStream::connect(&socket_path_clone)
+            let stream = IpcStream::connect(&connect_addr)
                 .await
                 .unwrap_or_else(|err| {
                     #[allow(clippy::panic, reason = "test assertion")]

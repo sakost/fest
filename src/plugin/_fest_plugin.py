@@ -1,9 +1,9 @@
-"""fest pytest plugin -- communicates with the fest Rust process over a Unix socket.
+"""fest pytest plugin -- communicates with the fest Rust process over IPC.
 
 This plugin is embedded inside the fest binary and written to a temporary
 directory at runtime.  It is registered with pytest via ``-p _fest_plugin``
-and expects a ``--fest-socket`` CLI option pointing to the Unix domain
-socket that the fest process is listening on.
+and expects a ``--fest-socket`` CLI option pointing to the IPC endpoint:
+a Unix domain socket path on Unix, or a ``host:port`` address on Windows.
 
 Protocol (JSON-over-newline):
     plugin ->  fest:   {"type": "ready", "tests": ["nodeid", ...]}
@@ -35,7 +35,7 @@ def pytest_addoption(parser: Any) -> None:
         "--fest-socket",
         dest="fest_socket",
         default=None,
-        help="Path to the Unix domain socket for fest communication.",
+        help="IPC endpoint: Unix socket path or host:port for fest communication.",
     )
 
 
@@ -58,12 +58,8 @@ def pytest_runtestloop(session: Any) -> bool:
     # Build abs_path -> module_name cache from currently loaded modules.
     file_to_mod = _build_file_module_index()
 
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        conn.connect(socket_path)
-    except OSError as exc:
-        print(f"_fest_plugin: connect failed: {exc}", file=sys.stderr)
-        conn.close()
+    conn = _connect(socket_path)
+    if conn is None:
         return True
 
     # Use a generous timeout; the Rust side enforces per-mutant timeouts.
@@ -246,6 +242,40 @@ def _file_to_module(file_path: str) -> str:
             name = name[: -len(suffix)]
             break
     return name.replace("/", ".").replace("\\", ".")
+
+
+def _connect(addr: str) -> socket.socket | None:
+    """Connect to the fest IPC endpoint.
+
+    On Unix, ``addr`` is a filesystem path to a Unix domain socket.
+    On Windows (or when ``addr`` looks like ``host:port``), it connects
+    via TCP.
+    """
+    if ":" in addr and not os.path.exists(addr):
+        # TCP mode (Windows): addr is "host:port".
+        host, port_str = addr.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            print(f"_fest_plugin: invalid TCP address: {addr}", file=sys.stderr)
+            return None
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            conn.connect((host, port))
+        except OSError as exc:
+            print(f"_fest_plugin: TCP connect failed: {exc}", file=sys.stderr)
+            conn.close()
+            return None
+    else:
+        # Unix socket mode.
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.connect(addr)
+        except OSError as exc:
+            print(f"_fest_plugin: connect failed: {exc}", file=sys.stderr)
+            conn.close()
+            return None
+    return conn
 
 
 def _send(conn: socket.socket, msg: dict[str, Any]) -> None:

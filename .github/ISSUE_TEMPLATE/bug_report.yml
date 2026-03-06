@@ -1,0 +1,76 @@
+name: Bug Report
+description: Report a bug in fest
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the details below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the behavior.
+      placeholder: |
+        1. Run `fest ...`
+        2. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened. Include error messages or output if applicable.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: fest version
+      description: Output of `fest --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04 / macOS 15 / Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Any other context, logs, or screenshots.
+    validations:
+      required: false

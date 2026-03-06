@@ -3,9 +3,8 @@
 **An extremely fast mutation testing tool for Python.**
 
 <p align="center">
-  <img src="https://img.shields.io/crates/v/fest?style=flat-square&color=blue" alt="crates.io">
   <img src="https://img.shields.io/pypi/v/fest-mutate?style=flat-square&color=blue" alt="PyPI">
-  <img src="https://img.shields.io/crates/l/fest?style=flat-square" alt="License">
+  <img src="https://img.shields.io/github/license/sakost/fest?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/rust-1.93+-orange?style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square" alt="Python">
 </p>

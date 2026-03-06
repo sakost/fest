@@ -51,7 +51,10 @@ impl Default for CancellationState {
     }
 }
 
-/// Install signal handlers for SIGINT, SIGTERM, and SIGQUIT.
+/// Install signal handlers for graceful cancellation.
+///
+/// On Unix: listens for SIGINT, SIGTERM, and SIGQUIT.
+/// On Windows: listens for Ctrl+C.
 ///
 /// - First signal: sets `state.cancelled` → the pipeline finishes the current mutant, builds a
 ///   partial report, then returns `Error::Cancelled`.
@@ -61,65 +64,74 @@ impl Default for CancellationState {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Runner`] if any Unix signal listener cannot be
-/// created.
+/// Returns [`crate::Error::Runner`] if signal listeners cannot be created.
 #[inline]
 pub fn install_signal_handlers(
     runtime: &tokio::runtime::Runtime,
     state: &CancellationState,
 ) -> Result<(), crate::Error> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    // Enter the runtime context so `signal()` can register with the reactor.
     let _guard = runtime.enter();
-
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(|err| crate::Error::Runner(format!("failed to install SIGINT handler: {err}")))?;
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|err| crate::Error::Runner(format!("failed to install SIGTERM handler: {err}")))?;
-    let mut sigquit = signal(SignalKind::quit())
-        .map_err(|err| crate::Error::Runner(format!("failed to install SIGQUIT handler: {err}")))?;
-
     let cancelled = Arc::clone(&state.cancelled);
 
-    let _handle = runtime.spawn(async move {
-        // Wait for the first signal from any of the three sources.
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-            _ = sigquit.recv() => {}
-        }
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
 
-        // Mark graceful cancellation.
-        cancelled.store(true, Ordering::Relaxed);
+        let mut sigint = signal(SignalKind::interrupt()).map_err(|err| {
+            crate::Error::Runner(format!("failed to install SIGINT handler: {err}"))
+        })?;
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|err| {
+            crate::Error::Runner(format!("failed to install SIGTERM handler: {err}"))
+        })?;
+        let mut sigquit = signal(SignalKind::quit()).map_err(|err| {
+            crate::Error::Runner(format!("failed to install SIGQUIT handler: {err}"))
+        })?;
 
-        {
-            let mut stderr = std::io::stderr().lock();
-            // Best-effort — ignore write failures on stderr.
-            let _result = std::io::Write::write_all(
-                &mut stderr,
-                b"\nReceived signal, finishing current mutant...\n",
-            );
-        }
+        let _handle = runtime.spawn(async move {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+                _ = sigquit.recv() => {}
+            }
+            on_first_signal(&cancelled);
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+                _ = sigquit.recv() => {}
+            }
+            on_second_signal();
+        });
+    }
 
-        // Wait for a second signal → hard exit.
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-            _ = sigquit.recv() => {}
-        }
-
-        {
-            // Second signal — abort immediately.
-            let mut stderr = std::io::stderr().lock();
-            let _result =
-                std::io::Write::write_all(&mut stderr, b"\nReceived second signal, aborting.\n");
-        }
-        #[allow(clippy::exit, reason = "intentional hard exit on second signal")]
-        std::process::exit(130_i32);
-    });
+    #[cfg(windows)]
+    {
+        let _handle = runtime.spawn(async move {
+            let _result = tokio::signal::ctrl_c().await;
+            on_first_signal(&cancelled);
+            let _result = tokio::signal::ctrl_c().await;
+            on_second_signal();
+        });
+    }
 
     Ok(())
+}
+
+/// Handle the first cancellation signal.
+fn on_first_signal(cancelled: &AtomicBool) {
+    cancelled.store(true, Ordering::Relaxed);
+    let mut stderr = std::io::stderr().lock();
+    let _result = std::io::Write::write_all(
+        &mut stderr,
+        b"\nReceived signal, finishing current mutant...\n",
+    );
+}
+
+/// Handle the second cancellation signal — hard exit.
+fn on_second_signal() -> ! {
+    let mut stderr = std::io::stderr().lock();
+    let _result = std::io::Write::write_all(&mut stderr, b"\nReceived second signal, aborting.\n");
+    #[allow(clippy::exit, reason = "intentional hard exit on second signal")]
+    std::process::exit(130_i32);
 }
 
 // ---------------------------------------------------------------------------
