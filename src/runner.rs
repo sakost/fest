@@ -292,7 +292,11 @@ mod tests {
     /// `build_runner` returns `AnyRunner::Subprocess` for the subprocess backend.
     #[test]
     fn build_runner_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Subprocess,
+            10_u64,
+            PathBuf::from("/project"),
+        );
         assert!(matches!(runner, AnyRunner::Subprocess(_)));
     }
 
@@ -317,7 +321,11 @@ mod tests {
     /// `AnyRunner::start` on subprocess variant is a no-op that succeeds.
     #[tokio::test]
     async fn any_runner_start_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Subprocess,
+            10_u64,
+            PathBuf::from("/project"),
+        );
         let result = runner.start(4_usize, Path::new(".")).await;
         assert!(result.is_ok());
     }
@@ -325,7 +333,11 @@ mod tests {
     /// `AnyRunner::stop` on subprocess variant is a no-op that succeeds.
     #[tokio::test]
     async fn any_runner_stop_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Subprocess,
+            10_u64,
+            PathBuf::from("/project"),
+        );
         let result = runner.stop().await;
         assert!(result.is_ok());
     }

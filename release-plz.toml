@@ -8,8 +8,6 @@ semver_check = true
 changelog_update = true
 # Git tag format
 git_tag_name = "v{{ version }}"
-# Use conventional commits for changelog generation
-changelog_config = "keep-a-changelog"
 
 [[package]]
 name = "fest"

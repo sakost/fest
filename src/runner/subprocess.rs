@@ -5,13 +5,17 @@
 //! `pytest` as a subprocess, then restores the original source.
 //! Mutants for the same file are serialised to avoid races.
 
-use core::time::Duration;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+extern crate alloc;
 
-use tokio::process::Command;
-use tokio::sync::Mutex as AsyncMutex;
+use alloc::sync::Arc;
+use core::time::Duration;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+
+use tokio::{process::Command, sync::Mutex as AsyncMutex};
 
 use crate::{
     Error,
@@ -38,7 +42,7 @@ pub struct SubprocessRunner {
     /// Per-file locks ensuring only one mutant modifies a given file at
     /// a time.  Other mutants for different files can still run in
     /// parallel.
-    file_locks: Mutex<HashMap<PathBuf, std::sync::Arc<AsyncMutex<()>>>>,
+    file_locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
 }
 
 impl SubprocessRunner {
@@ -54,16 +58,21 @@ impl SubprocessRunner {
     }
 
     /// Get (or create) a per-file async lock.
-    fn file_lock(&self, path: &Path) -> std::sync::Arc<AsyncMutex<()>> {
-        let mut locks = self.file_locks.lock().expect("file_locks poisoned");
-        locks
-            .entry(path.to_path_buf())
-            .or_insert_with(|| std::sync::Arc::new(AsyncMutex::new(())))
-            .clone()
+    fn file_lock(&self, path: &Path) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .file_locks
+            .lock()
+            .unwrap_or_else(|poisoned: std::sync::PoisonError<_>| poisoned.into_inner());
+        Arc::clone(
+            locks
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 }
 
 impl Default for SubprocessRunner {
+    #[inline]
     fn default() -> Self {
         Self::new(
             DEFAULT_TIMEOUT_SECS,
@@ -94,7 +103,7 @@ impl Runner for SubprocessRunner {
 
         // 2. Acquire per-file lock to prevent concurrent modifications.
         let lock = self.file_lock(&mutant.file_path);
-        let _guard = lock.lock().await;
+        let guard = lock.lock().await;
 
         // 3. Overwrite the original file in-place.
         let file_path = &mutant.file_path;
@@ -119,8 +128,8 @@ impl Runner for SubprocessRunner {
         // 5. Restore the original source immediately (before releasing lock).
         let _restore = std::fs::write(file_path, source);
 
-        // Lock released here when _guard drops.
-        drop(_guard);
+        // Lock released here when guard drops.
+        drop(guard);
 
         let elapsed = start.elapsed();
         let tests_run: Vec<String> = tests.iter().map(ToString::to_string).collect();
