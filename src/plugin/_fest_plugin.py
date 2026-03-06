@@ -19,10 +19,14 @@ Requires pytest >= 7.0.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import types
 from typing import Any
+
+import pytest
+from _pytest.runner import runtestprotocol
 
 
 def pytest_addoption(parser: Any) -> None:
@@ -51,11 +55,14 @@ def pytest_runtestloop(session: Any) -> bool:
     for item in session.items:
         item_index[item.nodeid] = item
 
+    # Build abs_path -> module_name cache from currently loaded modules.
+    file_to_mod = _build_file_module_index()
+
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         conn.connect(socket_path)
     except OSError as exc:
-        print(f"fest: connect failed: {exc}", file=sys.stderr)
+        print(f"_fest_plugin: connect failed: {exc}", file=sys.stderr)
         conn.close()
         return True
 
@@ -92,7 +99,7 @@ def pytest_runtestloop(session: Any) -> bool:
                 conn.close()
                 return True
             if msg_type == "mutant":
-                result = _handle_mutant(session, msg, item_index)
+                result = _handle_mutant(session, msg, item_index, file_to_mod)
                 _send(conn, result)
             else:
                 _send(
@@ -115,8 +122,6 @@ def _check_pytest_version() -> None:
     which causes the connection to fail and triggers the Rust-side subprocess
     fallback.
     """
-    import pytest  # noqa: PLC0415
-
     version = tuple(int(x) for x in pytest.__version__.split(".")[:2])
     if version < (7, 0):
         raise RuntimeError(
@@ -126,7 +131,10 @@ def _check_pytest_version() -> None:
 
 
 def _handle_mutant(
-    session: Any, msg: dict[str, Any], item_index: dict[str, Any]
+    session: Any,
+    msg: dict[str, Any],
+    item_index: dict[str, Any],
+    file_to_mod: dict[str, str],
 ) -> dict[str, Any]:
     """Apply a mutation, run the relevant tests, restore, and return a result."""
     file_path: str = msg.get("file", "")
@@ -134,9 +142,13 @@ def _handle_mutant(
     mutated_source: str = msg.get("mutated_source", "")
     test_ids: list[str] = msg.get("tests", [])
 
-    if not module_name:
+    # Prefer cached __file__-based lookup: handles src-layout and editable
+    # installs where a naive path-to-module conversion gives the wrong name.
+    found = file_to_mod.get(os.path.abspath(file_path))
+    if found:
+        module_name = found
+    elif not module_name:
         module_name = _file_to_module(file_path)
-
     original_module = sys.modules.get(module_name)
     saved_dict: dict[str, Any] | None = None
 
@@ -191,8 +203,6 @@ def _run_tests(
     session: Any, test_ids: list[str], item_index: dict[str, Any]
 ) -> str:
     """Run the given tests via ``runtestprotocol`` and return ``'killed'`` or ``'survived'``."""
-    from _pytest.runner import runtestprotocol  # noqa: PLC0415
-
     items = []
     for nodeid in test_ids:
         item = item_index.get(nodeid)
@@ -210,6 +220,22 @@ def _run_tests(
                 return "killed"
 
     return "survived"
+
+
+def _build_file_module_index() -> dict[str, str]:
+    """Build an ``{abs_path: module_name}`` dict from ``sys.modules``.
+
+    Called once after pytest collection so that per-mutant lookups are O(1)
+    instead of scanning all loaded modules.  This handles src-layout projects
+    (e.g. ``src/flask/helpers.py`` → ``flask.helpers``) where a naive
+    path-to-module conversion would produce an incorrect dotted name.
+    """
+    index: dict[str, str] = {}
+    for name, mod in sys.modules.items():
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file is not None:
+            index[os.path.abspath(mod_file)] = name
+    return index
 
 
 def _file_to_module(file_path: str) -> str:

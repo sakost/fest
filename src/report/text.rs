@@ -13,16 +13,26 @@ use crate::mutation::MutantStatus;
 /// When `colored` is true, ANSI escape codes are used to highlight the
 /// header, score, and survived-mutant listing.
 ///
+/// When `list_survived` is true, the listing of individual survived
+/// mutants is appended after the statistics. Pass `false` for compact
+/// output (e.g. in fancy progress mode).
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Report`] if string formatting fails.
 #[inline]
-pub fn format_text(report: &MutationReport, colored: bool) -> Result<String, crate::Error> {
+pub fn format_text(
+    report: &MutationReport,
+    colored: bool,
+    list_survived: bool,
+) -> Result<String, crate::Error> {
     let mut output = String::new();
 
     write_header(&mut output, report, colored)?;
     write_statistics(report, &mut output, colored)?;
-    write_survived_mutants(report, &mut output, colored)?;
+    if list_survived {
+        write_survived_mutants(report, &mut output, colored)?;
+    }
 
     Ok(output)
 }

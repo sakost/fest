@@ -168,19 +168,8 @@ impl AnyRunner {
                 plugin_failed,
                 ..
             } => {
-                if let Err(err) = plugin.start(num_workers, project_dir).await {
-                    let first = !plugin_failed.swap(true, Ordering::Relaxed);
-                    if first {
-                        let mut stderr = std::io::stderr().lock();
-                        let _result = std::io::Write::write_all(
-                            &mut stderr,
-                            format!(
-                                "fest: plugin runner failed to start ({err}), falling back to \
-                                 subprocess\n"
-                            )
-                            .as_bytes(),
-                        );
-                    }
+                if let Err(_err) = plugin.start(num_workers, project_dir).await {
+                    plugin_failed.store(true, Ordering::Relaxed);
                 }
                 Ok(())
             }
@@ -240,24 +229,30 @@ impl AnyRunner {
                 }
 
                 match plugin.run_mutant(mutant, source, tests).await {
-                    Err(Error::Runner(msg)) => {
-                        let first = !plugin_failed.swap(true, Ordering::Relaxed);
-                        if first {
-                            let mut stderr = std::io::stderr().lock();
-                            let _result = std::io::Write::write_all(
-                                &mut stderr,
-                                format!(
-                                    "fest: plugin runner failed ({msg}), falling back to \
-                                     subprocess\n"
-                                )
-                                .as_bytes(),
-                            );
-                        }
+                    Err(Error::Runner(_msg)) => {
+                        plugin_failed.store(true, Ordering::Relaxed);
                         subprocess.run_mutant(mutant, source, tests).await
                     }
                     other => other,
                 }
             }
+        }
+    }
+
+    /// Check whether the plugin backend has failed and fallen back to
+    /// subprocess.
+    ///
+    /// Returns `false` for the subprocess variant.
+    #[inline]
+    #[must_use]
+    pub fn did_plugin_fail(&self) -> bool {
+        #[allow(
+            clippy::pattern_type_mismatch,
+            reason = "matching on &AnyRunner requires pattern_type_mismatch suppression"
+        )]
+        match self {
+            Self::Subprocess(_) => false,
+            Self::Plugin { plugin_failed, .. } => plugin_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -268,39 +263,50 @@ impl AnyRunner {
 /// subprocess fallback runner alongside the plugin runner.
 #[inline]
 #[must_use]
-pub const fn build_runner(backend: &RunnerBackend, timeout: u64) -> AnyRunner {
+pub fn build_runner(
+    backend: &RunnerBackend,
+    timeout: u64,
+    project_dir: std::path::PathBuf,
+) -> AnyRunner {
     match *backend {
-        RunnerBackend::Subprocess => AnyRunner::Subprocess(SubprocessRunner::new(timeout)),
-        RunnerBackend::Plugin => AnyRunner::Plugin {
-            plugin: PytestPluginRunner::new(timeout),
-            subprocess: SubprocessRunner::new(timeout),
-            plugin_failed: AtomicBool::new(false),
-        },
+        RunnerBackend::Subprocess => {
+            AnyRunner::Subprocess(SubprocessRunner::new(timeout, project_dir))
+        }
+        RunnerBackend::Plugin => {
+            let subprocess = SubprocessRunner::new(timeout, project_dir);
+            AnyRunner::Plugin {
+                plugin: PytestPluginRunner::new(timeout),
+                subprocess,
+                plugin_failed: AtomicBool::new(false),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// `build_runner` returns `AnyRunner::Subprocess` for the subprocess backend.
     #[test]
     fn build_runner_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
         assert!(matches!(runner, AnyRunner::Subprocess(_)));
     }
 
     /// `build_runner` returns `AnyRunner::Plugin` for the plugin backend.
     #[test]
     fn build_runner_plugin() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
         assert!(matches!(runner, AnyRunner::Plugin { .. }));
     }
 
     /// Plugin variant includes a fresh `plugin_failed` flag.
     #[test]
     fn build_runner_plugin_not_failed() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
         if let AnyRunner::Plugin { plugin_failed, .. } = &runner {
             assert!(!plugin_failed.load(Ordering::Relaxed));
         } else {
@@ -311,7 +317,7 @@ mod tests {
     /// `AnyRunner::start` on subprocess variant is a no-op that succeeds.
     #[tokio::test]
     async fn any_runner_start_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
         let result = runner.start(4_usize, Path::new(".")).await;
         assert!(result.is_ok());
     }
@@ -319,7 +325,7 @@ mod tests {
     /// `AnyRunner::stop` on subprocess variant is a no-op that succeeds.
     #[tokio::test]
     async fn any_runner_stop_subprocess() {
-        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64);
+        let runner = build_runner(&RunnerBackend::Subprocess, 10_u64, PathBuf::from("/project"));
         let result = runner.stop().await;
         assert!(result.is_ok());
     }
@@ -329,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn any_runner_start_plugin_absorbs_error() {
         // Using timeout=0 so the worker spawn will likely fail/timeout.
-        let runner = build_runner(&RunnerBackend::Plugin, 0_u64);
+        let runner = build_runner(&RunnerBackend::Plugin, 0_u64, PathBuf::from("/project"));
         // start should not return Err -- it absorbs plugin errors.
         let result = runner.start(1_usize, Path::new(".")).await;
         assert!(result.is_ok());
@@ -338,7 +344,7 @@ mod tests {
     /// `AnyRunner::stop` on plugin variant succeeds even without start.
     #[tokio::test]
     async fn any_runner_stop_plugin_without_start() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64);
+        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
         let result = runner.stop().await;
         assert!(result.is_ok());
     }

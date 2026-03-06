@@ -21,6 +21,9 @@ use crate::{Error, config::OutputFormat};
 /// When `colored` is true **and** the format supports it (currently only
 /// [`OutputFormat::Text`]), ANSI colors are used to highlight the output.
 ///
+/// When `list_survived` is true and the format is [`OutputFormat::Text`],
+/// individual survived mutants are listed after the statistics summary.
+///
 /// Returns the formatted report as a [`String`]. The caller decides where
 /// to write the output (stdout, file, etc.).
 ///
@@ -33,9 +36,10 @@ pub fn format_report(
     report: &MutationReport,
     format: &OutputFormat,
     colored: bool,
+    list_survived: bool,
 ) -> Result<String, Error> {
     match *format {
-        OutputFormat::Text => text::format_text(report, colored),
+        OutputFormat::Text => text::format_text(report, colored, list_survived),
         OutputFormat::Json => json::format_json(report),
         OutputFormat::Html => html::format_html(report),
     }
@@ -321,7 +325,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
         assert!(output.contains("----------------------------"));
     }
@@ -352,7 +356,7 @@ mod tests {
             Duration::from_secs(30_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
 
         assert!(output.contains("Files scanned:"));
         assert!(output.contains("12"));
@@ -376,12 +380,35 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
 
         assert!(output.contains("Survived mutants:"));
         assert!(output.contains("src/parser.py:42"));
         assert!(output.contains("ArithmeticOp"));
         assert!(output.contains("`x + 1` -> `x - 1`"));
+    }
+
+    /// `list_survived = false` suppresses the survived mutants listing.
+    #[test]
+    fn text_report_suppresses_survived_list() {
+        let results = vec![make_result(
+            make_mutant("src/parser.py", 42_u32, "ArithmeticOp", "x + 1", "x - 1"),
+            MutantStatus::Survived,
+        )];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output = text::format_text(&report, false, false).expect("should format text");
+
+        // Statistics should still be present.
+        assert!(output.contains("Survived:"));
+        // But the individual mutant listing should be absent.
+        assert!(!output.contains("Survived mutants:"));
+        assert!(!output.contains("src/parser.py:42"));
     }
 
     /// Text report does not list survived section when there are none.
@@ -398,7 +425,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
 
         assert!(!output.contains("Survived mutants:"));
     }
@@ -423,7 +450,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
 
         assert!(output.contains("no coverage"));
     }
@@ -529,7 +556,7 @@ mod tests {
             None,
         );
         let output =
-            format_report(&report, &OutputFormat::Text, false).expect("should format text");
+            format_report(&report, &OutputFormat::Text, false, true).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
     }
 
@@ -544,7 +571,7 @@ mod tests {
             None,
         );
         let output =
-            format_report(&report, &OutputFormat::Json, false).expect("should format JSON");
+            format_report(&report, &OutputFormat::Json, false, true).expect("should format JSON");
         let _value: serde_json::Value =
             serde_json::from_str(&output).expect("should be valid JSON");
     }
@@ -560,7 +587,7 @@ mod tests {
             None,
         );
         let output =
-            format_report(&report, &OutputFormat::Html, false).expect("should format HTML");
+            format_report(&report, &OutputFormat::Html, false, true).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
         assert!(output.contains("fest mutation testing report"));
     }
@@ -1101,7 +1128,7 @@ mod tests {
             Duration::from_secs(0_u64),
             Some(42_u64),
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
         assert!(output.contains("(seed: 42)"));
         assert!(output.contains("Seed:               42"));
     }
@@ -1116,7 +1143,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, true).expect("should format text");
         assert!(!output.contains("Seed:"));
         assert!(!output.contains("seed:"));
     }

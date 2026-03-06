@@ -1,8 +1,11 @@
 //! Direct reader for coverage.py `.coverage` `SQLite` databases.
 //!
-//! The `.coverage` file produced by `pytest --cov` is a `SQLite` database with
-//! tables `file`, `context`, and `line_bits`. Reading it directly avoids the
-//! overhead of shelling out to `coverage json --show-contexts`.
+//! The `.coverage` file produced by `pytest --cov` is a `SQLite` database.
+//! Older versions (< 7) store line data in the `line_bits` table as packed
+//! bitsets. Newer versions (7+) store branch arc data in the `arc` table
+//! with `(file_id, context_id, fromno, tono)` rows. This reader supports
+//! both formats, preferring `line_bits` when available and falling back to
+//! `arc` otherwise.
 
 use std::{
     collections::HashMap,
@@ -92,9 +95,36 @@ fn load_context_table(conn: &Connection) -> Result<HashMap<i64, String>, Error> 
     Ok(map)
 }
 
-/// Build a [`CoverageMap`] by iterating `line_bits` rows and decoding the
-/// packed `numbits` bitsets into individual line numbers.
+/// Build a [`CoverageMap`] from the database.
+///
+/// Tries `line_bits` first (coverage.py < 7 format). If that table is empty
+/// or missing, falls back to the `arc` table (coverage.py 7+ format) where
+/// each row stores a `(fromno, tono)` line transition per file and context.
 fn build_coverage_map(
+    conn: &Connection,
+    files: &HashMap<i64, PathBuf>,
+    contexts: &HashMap<i64, String>,
+) -> Result<CoverageMap, Error> {
+    let map = build_coverage_map_from_line_bits(conn, files, contexts)?;
+    if !map.is_empty() {
+        return Ok(map);
+    }
+
+    // Fallback: coverage.py 7+ stores data in the `arc` table.
+    if has_arc_table(conn) {
+        return build_coverage_map_from_arcs(conn, files, contexts);
+    }
+
+    Ok(map)
+}
+
+/// Check whether the `arc` table exists in the database.
+fn has_arc_table(conn: &Connection) -> bool {
+    conn.prepare("SELECT 1 FROM arc LIMIT 1").is_ok()
+}
+
+/// Build a [`CoverageMap`] from the `line_bits` table (coverage.py < 7).
+fn build_coverage_map_from_line_bits(
     conn: &Connection,
     files: &HashMap<i64, PathBuf>,
     contexts: &HashMap<i64, String>,
@@ -118,7 +148,6 @@ fn build_coverage_map(
         let (file_id, context_id, numbits) =
             row.map_err(|err| Error::Coverage(format!("failed to read line_bits row: {err}")))?;
 
-        // Skip rows referencing unknown files/contexts or empty contexts.
         let Some(file_path) = files.get(&file_id) else {
             continue;
         };
@@ -135,6 +164,74 @@ fn build_coverage_map(
                 .or_default()
                 .push(context_name.clone());
         }
+    }
+
+    Ok(map)
+}
+
+/// Build a [`CoverageMap`] from the `arc` table (coverage.py 7+).
+///
+/// Each arc row stores `(file_id, context_id, fromno, tono)` representing a
+/// branch from line `fromno` to line `tono`. Both positive line numbers are
+/// treated as covered lines. Negative values represent entry/exit markers
+/// and are skipped.
+fn build_coverage_map_from_arcs(
+    conn: &Connection,
+    files: &HashMap<i64, PathBuf>,
+    contexts: &HashMap<i64, String>,
+) -> Result<CoverageMap, Error> {
+    let mut stmt = conn
+        .prepare("SELECT file_id, context_id, fromno, tono FROM arc")
+        .map_err(|err| Error::Coverage(format!("failed to query arc table: {err}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let file_id: i64 = row.get(0)?;
+            let context_id: i64 = row.get(1)?;
+            let fromno: i64 = row.get(2)?;
+            let tono: i64 = row.get(3)?;
+            Ok((file_id, context_id, fromno, tono))
+        })
+        .map_err(|err| Error::Coverage(format!("failed to read arc table: {err}")))?;
+
+    let mut map: CoverageMap = CoverageMap::new();
+
+    for row in rows {
+        let (file_id, context_id, fromno, tono) =
+            row.map_err(|err| Error::Coverage(format!("failed to read arc row: {err}")))?;
+
+        let Some(file_path) = files.get(&file_id) else {
+            continue;
+        };
+        let Some(context_name) = contexts.get(&context_id) else {
+            continue;
+        };
+        if context_name.is_empty() {
+            continue;
+        }
+
+        // Positive line numbers are real source lines. Negative values are
+        // coverage.py internal markers (e.g. -1 for exit).
+        for line_no in [fromno, tono] {
+            if line_no > 0 {
+                #[allow(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "line_no is verified positive and Python files have < 2^32 lines"
+                )]
+                let line = line_no as u32;
+                map.entry((file_path.clone(), line))
+                    .or_default()
+                    .push(context_name.clone());
+            }
+        }
+    }
+
+    // Deduplicate test names per line — arcs can produce multiple entries
+    // for the same (file, line, context) triple.
+    for tests in map.values_mut() {
+        tests.sort();
+        tests.dedup();
     }
 
     Ok(map)
@@ -464,5 +561,175 @@ mod tests {
 
         let result = parse_coverage_sqlite(&nested, dir.path());
         assert!(result.is_err());
+    }
+
+    // -- arc table (coverage.py 7+) -------------------------------------------
+
+    /// Helper: create a `.coverage` database with an `arc` table (coverage.py 7+).
+    fn create_arc_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join(".coverage");
+        let conn = Connection::open(&db_path).expect("open db");
+
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             CREATE TABLE arc (file_id INTEGER, context_id INTEGER, fromno INTEGER, tono INTEGER);
+             INSERT INTO file (id, path) VALUES (1, 'src/app.py');
+             INSERT INTO context (id, context) VALUES (1, 'test_app.py::test_hello|run');
+             INSERT INTO context (id, context) VALUES (2, '');
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 1, 2);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 2, 3);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 2, 5, 6);",
+        )
+        .expect("create and populate db");
+        // context 1: lines 1, 2, 3 (from arcs 1->2, 2->3)
+        // context 2: empty context, should be skipped
+
+        db_path
+    }
+
+    #[test]
+    fn parse_coverage_sqlite_arc_table_basic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = create_arc_db(dir.path());
+
+        let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse arc db");
+
+        // Lines 1, 2, 3 should be covered by test_hello
+        for line in [1_u32, 2_u32, 3_u32] {
+            let key = (dir.path().join("src/app.py"), line);
+            let tests = map.get(&key).unwrap_or_else(|| {
+                panic!("line {line} should be in coverage map");
+            });
+            assert!(
+                tests.contains(&"test_app.py::test_hello".to_owned()),
+                "line {line} should be covered by test_hello"
+            );
+        }
+
+        // Empty context lines should NOT be present
+        let key_5 = (dir.path().join("src/app.py"), 5_u32);
+        assert!(
+            !map.contains_key(&key_5),
+            "empty context lines should be excluded"
+        );
+    }
+
+    #[test]
+    fn parse_coverage_sqlite_arc_negative_lines_skipped() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join(".coverage");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             CREATE TABLE arc (file_id INTEGER, context_id INTEGER, fromno INTEGER, tono INTEGER);
+             INSERT INTO file (id, path) VALUES (1, 'mod.py');
+             INSERT INTO context (id, context) VALUES (1, 'test.py::test_x|run');
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, -1, 5);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 5, -1);",
+        )
+        .expect("create db");
+        drop(conn);
+
+        let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse");
+
+        // Line 5 should be covered (from both arcs: tono=5, fromno=5)
+        let key = (dir.path().join("mod.py"), 5_u32);
+        assert!(map.contains_key(&key));
+
+        // Negative line numbers should NOT appear
+        assert_eq!(
+            map.len(),
+            1_usize,
+            "only line 5 should be in map, no negative lines"
+        );
+    }
+
+    #[test]
+    fn parse_coverage_sqlite_arc_deduplicates_tests() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join(".coverage");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             CREATE TABLE arc (file_id INTEGER, context_id INTEGER, fromno INTEGER, tono INTEGER);
+             INSERT INTO file (id, path) VALUES (1, 'mod.py');
+             INSERT INTO context (id, context) VALUES (1, 'test.py::test_a|run');
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 1, 2);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 2, 3);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 3, 2);",
+        )
+        .expect("create db");
+        drop(conn);
+
+        let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse");
+
+        // Line 2 appears in multiple arcs (as fromno and tono) but test_a
+        // should be listed only once.
+        let key = (dir.path().join("mod.py"), 2_u32);
+        let tests = map.get(&key).expect("line 2 present");
+        assert_eq!(tests.len(), 1_usize, "test_a should appear only once");
+    }
+
+    #[test]
+    fn parse_coverage_sqlite_arc_multiple_contexts() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join(".coverage");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             CREATE TABLE arc (file_id INTEGER, context_id INTEGER, fromno INTEGER, tono INTEGER);
+             INSERT INTO file (id, path) VALUES (1, 'mod.py');
+             INSERT INTO context (id, context) VALUES (1, 'test.py::test_a|run');
+             INSERT INTO context (id, context) VALUES (2, 'test.py::test_b|run');
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 5, 5);
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 2, 5, 5);",
+        )
+        .expect("create db");
+        drop(conn);
+
+        let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse");
+        let key = (dir.path().join("mod.py"), 5_u32);
+        let tests = map.get(&key).expect("line 5 present");
+        assert_eq!(
+            tests.len(),
+            2_usize,
+            "both test_a and test_b should cover line 5"
+        );
+    }
+
+    #[test]
+    fn parse_coverage_sqlite_prefers_line_bits_over_arc() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join(".coverage");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
+             CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
+             CREATE TABLE arc (file_id INTEGER, context_id INTEGER, fromno INTEGER, tono INTEGER);
+             INSERT INTO file (id, path) VALUES (1, 'mod.py');
+             INSERT INTO context (id, context) VALUES (1, 'test.py::test_a|run');
+             INSERT INTO line_bits (file_id, context_id, numbits) VALUES (1, 1, X'02');
+             INSERT INTO arc (file_id, context_id, fromno, tono) VALUES (1, 1, 99, 100);",
+        )
+        .expect("create db");
+        drop(conn);
+
+        let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse");
+
+        // line_bits has line 1, arc has lines 99/100
+        // Since line_bits is non-empty, arc should be ignored
+        let key_1 = (dir.path().join("mod.py"), 1_u32);
+        assert!(map.contains_key(&key_1), "line 1 from line_bits");
+        let key_99 = (dir.path().join("mod.py"), 99_u32);
+        assert!(!map.contains_key(&key_99), "arc data should be ignored");
     }
 }

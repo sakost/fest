@@ -164,6 +164,14 @@ impl ProgressReporter {
         drop(self.sender.send(RenderEvent::MutantsFinish { cancelled }));
     }
 
+    /// Emit a warning message (displayed inline in the progress output).
+    #[inline]
+    pub fn warning(&self, message: &str) {
+        drop(self.sender.send(RenderEvent::Warning {
+            message: message.to_owned(),
+        }));
+    }
+
     /// Emit the final summary scoreboard.
     #[inline]
     pub fn summary(&self, info: SummaryInfo) {

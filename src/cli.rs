@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::config::{FestConfig, OutputFormat, RunnerBackend};
+use crate::{
+    config::{FestConfig, OutputFormat, RunnerBackend},
+    init::InitArgs,
+};
 
 // ---------------------------------------------------------------------------
 // Progress style
@@ -47,9 +50,15 @@ pub struct Args {
 
 /// Available subcommands.
 #[derive(Debug, clap::Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "RunArgs is large but Command is only constructed once at startup"
+)]
 pub enum Command {
     /// Run mutation testing (default when no subcommand is given).
     Run(RunArgs),
+    /// Generate a starter fest configuration for the current project.
+    Init(InitArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -216,6 +225,9 @@ pub fn parse() -> Args {
 pub fn run_args(args: Args) -> RunArgs {
     match args.command {
         Some(Command::Run(run_args)) => run_args,
+        Some(Command::Init(_)) => {
+            unreachable!("Init command should be handled before calling run_args")
+        }
         None => RunArgs {
             verbose: false,
             source: None,

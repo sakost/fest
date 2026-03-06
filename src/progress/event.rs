@@ -97,6 +97,11 @@ pub enum RenderEvent {
         /// Whether the run was cancelled by a signal.
         cancelled: bool,
     },
+    /// A warning message to display (e.g. fallback to subprocess).
+    Warning {
+        /// Warning message text.
+        message: String,
+    },
     /// Final summary of the mutation-testing run.
     FinalSummary(SummaryInfo),
     /// Shut down the render task gracefully.

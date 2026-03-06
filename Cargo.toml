@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "A fast mutation-testing tool for Python"
 keywords = ["mutation-testing", "python", "testing"]
 categories = ["development-tools::testing"]
+repository = "https://github.com/sakost/fest"
+homepage = "https://github.com/sakost/fest"
 rust-version = "1.93"
 
 [lib]
@@ -152,3 +154,12 @@ toml = "1.0.3"
 ahash = "0.8"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "mutation"
+harness = false
+
+[[bench]]
+name = "coverage"
+harness = false

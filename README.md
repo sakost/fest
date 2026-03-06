@@ -1,31 +1,49 @@
 # fest
 
-A fast mutation-testing tool for Python, written in Rust.
+**An extremely fast mutation testing tool for Python.**
 
-fest generates small changes (mutants) to your Python source code and checks whether your test suite detects them. Surviving mutants indicate gaps in test coverage that line-coverage tools miss.
+<p align="center">
+  <img src="https://img.shields.io/crates/v/fest?style=flat-square&color=blue" alt="crates.io">
+  <img src="https://img.shields.io/pypi/v/fest-mutate?style=flat-square&color=blue" alt="PyPI">
+  <img src="https://img.shields.io/crates/l/fest?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/rust-1.93+-orange?style=flat-square" alt="Rust">
+  <img src="https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square" alt="Python">
+</p>
 
-## Features
+---
 
-- **Fast** -- Rust-powered mutant generation using [ruff](https://github.com/astral-sh/ruff)'s Python parser, parallel execution with configurable workers, and a persistent pytest plugin runner that avoids per-mutant process overhead.
-- **Coverage-guided** -- Only runs the tests that actually exercise each mutated line, using per-test context data from pytest-cov.
-- **8 built-in mutators** -- Arithmetic, comparison, boolean, return value, negate condition, remove decorator, constant replacement, and exception swallowing operators.
-- **Multiple output formats** -- Text (default), JSON, and self-contained HTML reports.
-- **Configurable** -- fest.toml or `[tool.fest]` in pyproject.toml. Every option can be overridden from the CLI.
+fest generates small changes (_mutants_) to your Python source code and checks whether your test
+suite catches them. Surviving mutants reveal gaps that line coverage alone cannot find.
 
-## Requirements
+Built in Rust with [ruff](https://github.com/astral-sh/ruff)'s Python parser. **~25× faster** than
+[cosmic-ray](https://github.com/sixty-north/cosmic-ray) on real-world projects
+([benchmark](docs/benchmark-2026-03-06.md)).
 
-- **Rust 1.93+** (only for building from source)
-- **Python 3** with:
-  - [pytest](https://docs.pytest.org/) >= 7.0
-  - [pytest-cov](https://pytest-cov.readthedocs.io/)
+## Highlights
+
+- 🔥 **Parallel execution** — runs mutants across all CPU cores simultaneously
+- 🎯 **Coverage-guided** — only runs tests that cover the mutated line, via per-test `pytest-cov` context
+- ⚡ **In-process plugin** — a persistent pytest worker pool avoids per-mutant startup overhead
+- 🧬 **17 mutation operators** — arithmetic, comparison, boolean, return value, constants, decorators, loops, and more
+- 📊 **Multiple output formats** — text, JSON, and self-contained HTML reports
+- 🔄 **Session support** — stop and resume long runs with SQLite-backed sessions
 
 ## Installation
 
+### From PyPI (recommended)
+
 ```bash
-cargo install --path .
+pip install fest-mutate
 ```
 
-Ensure `pytest` and `pytest-cov` are installed in the Python environment fest will test:
+### From source
+
+```bash
+cargo install fest
+```
+
+Both methods give you the `fest` binary. Make sure `pytest` and `pytest-cov` are installed in
+the Python environment you want to test:
 
 ```bash
 pip install pytest pytest-cov
@@ -33,21 +51,53 @@ pip install pytest pytest-cov
 
 ## Quick start
 
-Run fest in your project root:
-
 ```bash
+cd your-python-project
 fest run
 ```
 
 fest will:
 
-1. Discover Python source files matching `src/**/*.py` (default).
-2. Run pytest with coverage to build a per-test line map.
-3. Generate mutants from the discovered source.
-4. Test each mutant against only the relevant tests.
-5. Print a summary report.
+1. Discover Python source files matching `src/**/*.py` (configurable)
+2. Run pytest with coverage to build a per-test line map
+3. Generate mutants from the discovered source
+4. Test each mutant against only the relevant tests
+5. Print a summary report
 
-## CLI reference
+```
+fest v0.1.0 — mutation testing for Python
+
+  Configuration loaded (fest.toml)  0ms
+  Mutator registry built (14 mutators)  0ms
+  Source files discovered (14 files)  0ms
+  Mutants generated (4290 mutants)  23ms
+  Coverage collected  40ms
+  Session opened (.fest-session.db)  0ms
+  Test workers ready (24 workers)  994ms
+  Mutants tested (4186 mutants)  4m 6s
+
+  Mutation Score: 85.7%  |  Killed: 2401  Survived: 314  Timeout: 80  Errors: 8
+```
+
+## Configuration
+
+Create `fest.toml` in your project root (or add `[tool.fest]` to `pyproject.toml`):
+
+```toml
+[fest]
+source = ["src/**/*.py"]
+exclude = ["**/test_*.py", "**/conftest.py"]
+timeout = 30
+workers = 8                    # default: 75% of CPU cores
+fail_under = 80.0              # exit 1 if score is below this
+output = "text"                # "text", "json", or "html"
+backend = "plugin"             # "plugin" or "subprocess"
+session = ".fest-session.db"   # enable stop/resume
+```
+
+All fields are optional — fest picks sensible defaults.
+
+## CLI
 
 ```
 fest run [OPTIONS]
@@ -55,88 +105,66 @@ fest run [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `-s, --source <PATTERNS>` | Glob patterns for source files |
-| `-e, --exclude <PATTERNS>` | Glob patterns to exclude |
-| `-w, --workers <N>` | Number of parallel test workers |
-| `--workers-cpu-ratio <RATIO>` | Fraction of CPUs (default: 0.75) |
-| `-t, --timeout <SECONDS>` | Per-test timeout (default: 10) |
-| `--fail-under <SCORE>` | Minimum mutation score (0--100) |
-| `-o, --output <FORMAT>` | `text`, `json`, or `html` |
-| `-b, --backend <BACKEND>` | `plugin` (default) or `subprocess` |
-| `-c, --config <PATH>` | Path to config file |
-| `--coverage-from <PATH>` | Use pre-existing `.coverage` or `.coverage.json` |
-| `--no-coverage-cache` | Disable mtime-based coverage caching |
-| `--no-fast-coverage` | Don't force C-based coverage tracer |
-| `--progress <STYLE>` | `auto`, `fancy`, `plain`, `verbose`, `quiet` |
-| `-v, --verbose` | Verbose per-mutant progress |
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Mutation score below `--fail-under` threshold |
-| 130 | Cancelled by signal |
-
-## Configuration
-
-Create `fest.toml` in your project root, or add a `[tool.fest]` section to `pyproject.toml`:
-
-```toml
-[fest]
-source = ["src/**/*.py"]
-exclude = ["src/generated/**"]
-test_runner = "pytest"
-workers = 4
-timeout = 10
-fail_under = 80.0
-output = "text"
-backend = "plugin"
-coverage_cache = true
-fast_coverage = true
-
-[fest.mutators]
-arithmetic_op = true
-comparison_op = true
-boolean_op = true
-return_value = true
-negate_condition = true
-remove_decorator = true
-constant_replace = true
-exception_swallow = true
-```
-
-All fields are optional and fall back to defaults.
+| `-s, --source <GLOB>` | Source file patterns |
+| `-e, --exclude <GLOB>` | Exclude patterns |
+| `-w, --workers <N>` | Parallel test workers |
+| `-t, --timeout <SEC>` | Per-test timeout (default: 10) |
+| `--fail-under <SCORE>` | Minimum mutation score (0–100) |
+| `-o, --output <FMT>` | `text` · `json` · `html` |
+| `-b, --backend <BE>` | `plugin` (default) · `subprocess` |
+| `--coverage-from <PATH>` | Use existing `.coverage` file |
+| `--session <PATH>` | SQLite session for stop/resume |
+| `--reset` | Reset session before running |
+| `--incremental` | Only re-test changed files |
+| `--seed <N>` | Deterministic mutation seed |
+| `--filter-operators <PAT>` | Include/exclude operators by name |
+| `--filter-paths <GLOB>` | Restrict mutation to matching files |
+| `--progress <STYLE>` | `auto` · `fancy` · `plain` · `verbose` · `quiet` |
+| `-v, --verbose` | Per-mutant progress output |
 
 ## Mutation operators
 
-| Mutator | Example |
-|---------|---------|
-| Arithmetic | `x + y` &rarr; `x - y` |
-| Comparison | `a == b` &rarr; `a != b` |
-| Boolean | `a and b` &rarr; `a or b`, `not x` &rarr; `x` |
-| Return value | `return expr` &rarr; `return None` |
-| Negate condition | `if cond:` &rarr; `if not (cond):` |
-| Remove decorator | `@cache` &rarr; *(removed)* |
-| Constant replace | `True` &rarr; `False`, `0` &rarr; `1`, `""` &rarr; `"mutant"` |
-| Exception swallow | `except: handle()` &rarr; `except: pass` |
+| Operator | Example |
+|----------|---------|
+| `arithmetic_op` | `x + y` → `x - y` |
+| `augmented_assign` | `x += 1` → `x -= 1` |
+| `bitwise_op` | `a & b` → `a \| b` |
+| `boolean_op` | `a and b` → `a or b` |
+| `break_continue` | `break` → `continue` |
+| `comparison_op` | `a == b` → `a != b` |
+| `constant_replace` | `True` → `False`, `0` → `1` |
+| `exception_swallow` | `raise Error()` → `pass` |
+| `negate_condition` | `if x:` → `if not x:` |
+| `remove_decorator` | `@cache` → _(removed)_ |
+| `remove_super` | `super().__init__()` → _(removed)_ |
+| `return_value` | `return val` → `return None` |
+| `statement_deletion` | `do_something()` → `pass` |
+| `unary_op` | `-x` → `x`, `~x` → `x` |
+| `variable_replace` | `a = x` → `a = y` (same-scope same-type) |
+| `variable_insert` | `a = f(x)` → `a = f(y)` |
+| `zero_iteration` | `for x in items:` → `for x in []:` |
 
-## Runner backends
+## Backends
 
-fest ships two backends:
+| Backend | How it works | Speed | Compatibility |
+|---------|-------------|-------|---------------|
+| **plugin** (default) | Patches modules in a long-lived pytest process | ⚡ Fast | Most projects |
+| **subprocess** | Overwrites source file on disk, runs `pytest` | Slower | Universal |
 
-- **Plugin** (default) -- Embeds a pytest plugin that patches modules in-process. Faster because one pytest worker handles many mutants without restarting.
-- **Subprocess** -- Spawns a fresh `python -m pytest` for each mutant. Slower but universally compatible. Used as automatic fallback if the plugin backend fails.
+The plugin backend falls back to subprocess automatically on infrastructure errors.
 
-## Understanding results
+## Performance
 
-fest reports a **mutation score**: the percentage of tested mutants that were killed (detected) by the test suite. Mutants with no test coverage are excluded from the denominator.
+On [python-ecdsa](https://github.com/tlsfuzzer/python-ecdsa) (17k lines, 1,477 tests):
 
-```
-Mutation score: 85.0% (170/200 killed, 50 no coverage)
-```
+| | fest | cosmic-ray |
+|---|---|---|
+| **Throughput** | 17.4 mut/s | 0.7 mut/s |
+| **Time to complete** | 4 min | ~6 hours (estimated) |
+| **Speedup** | **~25×** | baseline |
 
-A surviving mutant means a code change was not caught -- a potential blind spot in your tests.
+See the full [benchmark report](docs/benchmark-2026-03-06.md) for methodology and reproduction
+steps.
 
 ## License
 

@@ -5,3 +5,20 @@
 .vscode/
 *.orig
 .DS_Store
+
+# Mutation testing output (cargo-mutants)
+mutants.out/
+mutants.out.old/
+
+# Serena IDE
+.serena/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+dist/
+
+# Coverage
+.coverage
+htmlcov/

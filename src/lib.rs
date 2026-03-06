@@ -17,6 +17,7 @@ pub mod cli;
 pub mod config;
 pub mod coverage;
 pub mod error;
+pub mod init;
 pub mod mutation;
 pub mod plugin;
 pub mod progress;
@@ -148,7 +149,8 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
         mode,
         progress::RenderMode::Fancy | progress::RenderMode::Verbose
     ) && std::io::stdout().is_terminal();
-    let formatted = report::format_report(&report, &config.output, colored)?;
+    let list_survived = !matches!(mode, progress::RenderMode::Fancy);
+    let formatted = report::format_report(&report, &config.output, colored, list_survived)?;
     write_output(&formatted)?;
 
     check_final_status(was_cancelled, &report, &config)
@@ -467,6 +469,10 @@ fn resolve_session_mutants(
 ///
 /// Returns [`Error`] if a source file cannot be read or the thread pool
 /// fails to build.
+#[allow(
+    clippy::too_many_lines,
+    reason = "main pipeline orchestration function"
+)]
 fn run_mutants(
     mutants: &[mutation::Mutant],
     coverage_map: &coverage::CoverageMap,
@@ -474,7 +480,7 @@ fn run_mutants(
     ctx: &RunContext<'_>,
     project_dir: &Path,
 ) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
-    let runner = runner::build_runner(&config.backend, config.timeout);
+    let runner = runner::build_runner(&config.backend, config.timeout, project_dir.to_path_buf());
     let total = mutants.len();
 
     // Phase A: Pre-read source files that have at least one covered mutant.
@@ -484,8 +490,19 @@ fn run_mutants(
     let num_workers = config.resolved_workers();
 
     // Start the runner (spawns persistent workers for the plugin backend).
+    ctx.progress.phase_start("Starting test workers");
+    let start_workers = std::time::Instant::now();
     ctx.runtime
         .block_on(runner.start(num_workers, project_dir))?;
+    if runner.did_plugin_fail() {
+        ctx.progress
+            .warning("plugin runner failed to start, falling back to subprocess");
+    }
+    ctx.progress.phase_complete(
+        "Test workers ready",
+        Some(&format!("{num_workers} workers")),
+        start_workers.elapsed(),
+    );
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_workers)
@@ -537,6 +554,12 @@ fn run_mutants(
             })
             .collect()
     });
+
+    // Warn if the plugin failed mid-run and fell back to subprocess.
+    if runner.did_plugin_fail() {
+        ctx.progress
+            .warning("plugin runner failed mid-run, fell back to subprocess");
+    }
 
     // Stop the runner (shuts down persistent workers).
     let _stop = ctx.runtime.block_on(runner.stop());

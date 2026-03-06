@@ -373,20 +373,6 @@ impl Runner for PytestPluginRunner {
         // of seconds. When timeout is zero (tests), skip the floor.
         let startup_timeout = compute_startup_timeout(self.timeout);
 
-        {
-            let mut stderr = std::io::stderr().lock();
-            let _result = std::io::Write::write_all(
-                &mut stderr,
-                format!(
-                    "fest: spawning {num_workers} persistent pytest workers (startup timeout: \
-                     {}s, per-mutant timeout: {}s)\n",
-                    startup_timeout.as_secs(),
-                    self.timeout.as_secs()
-                )
-                .as_bytes(),
-            );
-        }
-
         let mut handles = Vec::with_capacity(num_workers);
         let dir = project_dir.to_path_buf();
 
@@ -406,14 +392,6 @@ impl Runner for PytestPluginRunner {
                 .await
                 .map_err(|err| Error::Runner(format!("worker spawn task panicked: {err}")))??;
             workers.push(worker);
-        }
-
-        {
-            let mut stderr = std::io::stderr().lock();
-            let _result = std::io::Write::write_all(
-                &mut stderr,
-                format!("fest: all {num_workers} workers connected\n").as_bytes(),
-            );
         }
 
         let worker_pool = Arc::new(WorkerPool::new(workers));

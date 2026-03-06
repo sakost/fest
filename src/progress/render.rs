@@ -74,6 +74,7 @@ impl RenderState {
                 summary,
             } => self.on_mutant_completed(index, total, &summary),
             RenderEvent::MutantsFinish { cancelled } => self.on_mutants_finish(cancelled),
+            RenderEvent::Warning { message } => self.on_warning(&message),
             RenderEvent::FinalSummary(info) => self.on_summary(&info),
             RenderEvent::Shutdown => {} // handled in the loop
         }
@@ -167,6 +168,20 @@ impl RenderState {
                 pb.finish_and_clear();
             }
         }
+    }
+
+    /// Handle a warning event.
+    fn on_warning(&self, message: &str) {
+        if self.mode == RenderMode::Quiet {
+            return;
+        }
+        let line = if self.colored {
+            let icon = console::style("⚠").yellow().bold().force_styling(true);
+            format!("  {icon} {message}")
+        } else {
+            format!("  warning: {message}")
+        };
+        drop(self.term.write_line(&line));
     }
 
     /// Handle the final summary event.
