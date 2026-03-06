@@ -38,10 +38,12 @@ pip install fest-mutate
 ### From source
 
 ```bash
-cargo install fest
+git clone https://github.com/sakost/fest.git
+cd fest
+cargo build --release
 ```
 
-Both methods give you the `fest` binary. Make sure `pytest` and `pytest-cov` are installed in
+The binary will be at `target/release/fest`. Make sure `pytest` and `pytest-cov` are installed in
 the Python environment you want to test:
 
 ```bash
