@@ -21,6 +21,7 @@ pub mod init;
 pub mod mutation;
 pub mod plugin;
 pub mod progress;
+pub mod python;
 pub mod report;
 pub mod runner;
 pub mod session;

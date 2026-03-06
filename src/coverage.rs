@@ -37,7 +37,7 @@ pub type CoverageMap = HashMap<(PathBuf, u32), Vec<String>>;
 /// Returns [`Error::Coverage`] if the import check fails or the subprocess
 /// cannot be spawned.
 fn check_pytest_cov_available(project_dir: &Path) -> Result<(), Error> {
-    let output = Command::new("python")
+    let output = Command::new(crate::python::resolve_python(project_dir))
         .args(["-c", "import pytest_cov"])
         .current_dir(project_dir)
         .output()
@@ -58,7 +58,7 @@ fn check_pytest_cov_available(project_dir: &Path) -> Result<(), Error> {
 /// Check whether `pytest-xdist` is importable in the project's Python
 /// environment. Returns `true` when the import succeeds.
 fn is_xdist_available(project_dir: &Path) -> bool {
-    Command::new("python")
+    Command::new(crate::python::resolve_python(project_dir))
         .args(["-c", "import xdist"])
         .current_dir(project_dir)
         .output()
@@ -137,7 +137,7 @@ fn run_pytest_cov(
         args.extend(["-n".to_owned(), "0".to_owned()]);
     }
 
-    let mut cmd = Command::new("python");
+    let mut cmd = Command::new(crate::python::resolve_python(project_dir));
     let _args_ref = cmd.args(&args).current_dir(project_dir);
     if fast_coverage {
         let _env_ref = cmd.env("COVERAGE_CORE", "ctrace");

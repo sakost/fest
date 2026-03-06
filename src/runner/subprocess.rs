@@ -115,7 +115,7 @@ impl Runner for SubprocessRunner {
         })?;
 
         // 4. Spawn pytest with timeout.
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(crate::python::resolve_python(&self.project_dir));
         let _cmd_ref = cmd
             .args(["-m", "pytest", "-x", "--no-header", "-q"])
             .args(tests)

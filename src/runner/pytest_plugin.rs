@@ -177,7 +177,7 @@ impl PersistentWorker {
     ) -> Result<Self, Error> {
         let env = prepare_worker_env()?;
 
-        let mut child = Command::new("python")
+        let mut child = Command::new(crate::python::resolve_python(project_dir))
             .args([
                 "-m",
                 "pytest",
