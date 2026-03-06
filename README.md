@@ -66,7 +66,7 @@ fest will:
 5. Print a summary report
 
 ```
-fest v0.1.0 — mutation testing for Python
+fest — mutation testing for Python
 
   Configuration loaded (fest.toml)  0ms
   Mutator registry built (14 mutators)  0ms
