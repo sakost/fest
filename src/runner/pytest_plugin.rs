@@ -110,14 +110,21 @@ fn prepare_worker_env() -> Result<TempWorkerEnv, Error> {
 
     #[cfg(windows)]
     let (listener, socket_addr_str) = {
-        let listener = IpcListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
-            .map_err(|err| {
-                Error::Runner(format!("failed to bind TCP listener on localhost: {err}"))
-            })?;
-        let addr = listener.local_addr().map_err(|err| {
+        let std_listener =
+            std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
+                .map_err(|err| {
+                    Error::Runner(format!("failed to bind TCP listener on localhost: {err}"))
+                })?;
+        std_listener.set_nonblocking(true).map_err(|err| {
+            Error::Runner(format!("failed to set TCP listener non-blocking: {err}"))
+        })?;
+        let addr = std_listener.local_addr().map_err(|err| {
             Error::Runner(format!(
                 "failed to get local address of TCP listener: {err}"
             ))
+        })?;
+        let listener = IpcListener::from_std(std_listener).map_err(|err| {
+            Error::Runner(format!("failed to convert TCP listener to tokio: {err}"))
         })?;
         (listener, addr.to_string())
     };
@@ -1291,17 +1298,30 @@ mod tests {
 
         #[cfg(windows)]
         let (listener, connect_addr) = {
-            let listener = IpcListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
-                .unwrap_or_else(|err| {
-                    #[allow(clippy::panic, reason = "test assertion")]
-                    {
-                        panic!("bind TCP: {err}");
-                    }
-                });
-            let addr = listener.local_addr().unwrap_or_else(|err| {
+            let std_listener =
+                std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0_u16)))
+                    .unwrap_or_else(|err| {
+                        #[allow(clippy::panic, reason = "test assertion")]
+                        {
+                            panic!("bind TCP: {err}");
+                        }
+                    });
+            std_listener.set_nonblocking(true).unwrap_or_else(|err| {
+                #[allow(clippy::panic, reason = "test assertion")]
+                {
+                    panic!("set non-blocking: {err}");
+                }
+            });
+            let addr = std_listener.local_addr().unwrap_or_else(|err| {
                 #[allow(clippy::panic, reason = "test assertion")]
                 {
                     panic!("local addr: {err}");
+                }
+            });
+            let listener = IpcListener::from_std(std_listener).unwrap_or_else(|err| {
+                #[allow(clippy::panic, reason = "test assertion")]
+                {
+                    panic!("convert to tokio: {err}");
                 }
             });
             (listener, addr)
