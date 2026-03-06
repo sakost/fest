@@ -469,21 +469,29 @@ mod tests {
     fn parse_coverage_sqlite_absolute_path() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let db_path = dir.path().join(".coverage");
+
+        // Use a platform-appropriate absolute path.
+        let abs_path = if cfg!(windows) {
+            r"C:\absolute\src\app.py"
+        } else {
+            "/absolute/src/app.py"
+        };
+
         let conn = Connection::open(&db_path).expect("open db");
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE file (id INTEGER PRIMARY KEY, path TEXT);
              CREATE TABLE context (id INTEGER PRIMARY KEY, context TEXT);
              CREATE TABLE line_bits (file_id INTEGER, context_id INTEGER, numbits BLOB);
-             INSERT INTO file (id, path) VALUES (1, '/absolute/src/app.py');
+             INSERT INTO file (id, path) VALUES (1, '{abs_path}');
              INSERT INTO context (id, context) VALUES (1, 'test.py::test_x|run');
              INSERT INTO line_bits (file_id, context_id, numbits) VALUES (1, 1, X'04');",
-        )
+        ))
         .expect("create and populate db");
         // line 2 -> byte 0, bit 2 = 0x04
         drop(conn);
 
         let map = parse_coverage_sqlite(&db_path, dir.path()).expect("should parse");
-        let key = (PathBuf::from("/absolute/src/app.py"), 2_u32);
+        let key = (PathBuf::from(abs_path), 2_u32);
         assert!(map.contains_key(&key));
     }
 
