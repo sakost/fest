@@ -7,7 +7,7 @@
 use core::time::Duration;
 
 use console::Term;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::{
@@ -26,6 +26,8 @@ struct RenderState {
     colored: bool,
     /// Whether the terminal supports line overwriting.
     can_overwrite: bool,
+    /// Coordinated multi-progress for spinners and bars (Fancy mode only).
+    multi: MultiProgress,
     /// Optional phase spinner (Fancy mode only).
     spinner: Option<ProgressBar>,
     /// Optional progress bar (Fancy mode only).
@@ -43,6 +45,7 @@ impl RenderState {
             mode,
             colored,
             can_overwrite,
+            multi: MultiProgress::new(),
             spinner: None,
             bar: None,
         }
@@ -86,7 +89,7 @@ impl RenderState {
             return;
         }
         if self.can_overwrite {
-            let pb = ProgressBar::new_spinner();
+            let pb = self.multi.add(ProgressBar::new_spinner());
             let template = ProgressStyle::with_template("  {spinner:.green} {msg}...");
             if let Ok(styled) = template {
                 pb.set_style(styled.tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✔"));
@@ -104,6 +107,7 @@ impl RenderState {
         }
         if let Some(pb) = self.spinner.take() {
             pb.finish_and_clear();
+            self.multi.remove(&pb);
         }
 
         let timing = style::format_duration(elapsed);
@@ -127,7 +131,7 @@ impl RenderState {
         if let Some(pb) = self.spinner.take() {
             pb.finish_and_clear();
         }
-        let pb = ProgressBar::new(total);
+        let pb = self.multi.add(ProgressBar::new(total));
         let template = ProgressStyle::with_template(
             "  {spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} mutants ({eta} remaining)",
         );
@@ -167,6 +171,7 @@ impl RenderState {
             } else {
                 pb.finish_and_clear();
             }
+            self.multi.remove(&pb);
         }
     }
 
