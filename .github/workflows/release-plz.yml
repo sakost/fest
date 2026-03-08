@@ -39,15 +39,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install release-plz
-        run: |
-          curl -sSfL https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.157/release-plz-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz -C /usr/local/bin
-      - name: Run release-plz release-pr
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+          manifest_path: Cargo.toml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          release-plz release-pr \
-            --git-token "$GITHUB_TOKEN" \
-            --repo-url "https://github.com/$GITHUB_REPOSITORY" \
-            --verbose
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

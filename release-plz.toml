@@ -14,7 +14,6 @@ git_tag_name = "v{{ version }}"
 
 [[package]]
 name = "fest"
-# Enable changelog for the package
+release = true
 changelog_update = true
-# Include conventional commits in changelog
 changelog_include = ["feat", "fix", "docs", "perf", "refactor", "build", "ci"]
