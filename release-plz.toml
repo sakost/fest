@@ -16,4 +16,3 @@ git_tag_name = "v{{ version }}"
 name = "fest"
 release = true
 changelog_update = true
-changelog_include = ["feat", "fix", "docs", "perf", "refactor", "build", "ci"]
