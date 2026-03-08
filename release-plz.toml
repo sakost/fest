@@ -8,6 +8,8 @@ publish = false
 semver_check = false
 # Generate changelogs from conventional commits
 changelog_update = true
+git_release_enable = true
+release_pr = true
 # Git tag format
 git_tag_name = "v{{ version }}"
 
