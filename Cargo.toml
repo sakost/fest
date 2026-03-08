@@ -9,7 +9,7 @@ categories = ["development-tools::testing"]
 repository = "https://github.com/sakost/fest"
 homepage = "https://github.com/sakost/fest"
 rust-version = "1.93"
-publish = false
+publish = []
 
 [lib]
 name = "fest"
