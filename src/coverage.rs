@@ -249,9 +249,13 @@ pub fn collect_coverage(
 ) -> Result<CoverageMap, Error> {
     check_pytest_cov_available(project_dir)?;
 
-    let _tests_passed = run_pytest_cov(project_dir, source_patterns, fast_coverage)?;
-    // We intentionally ignore the test pass/fail status — coverage data
-    // is produced even when some tests fail.
+    let tests_passed = run_pytest_cov(project_dir, source_patterns, fast_coverage)?;
+    if !tests_passed {
+        return Err(Error::Coverage(
+            "baseline test suite failed — fix failing tests before running mutation testing"
+                .to_owned(),
+        ));
+    }
 
     let db_path = project_dir.join(COVERAGE_DB_FILENAME);
     sqlite_reader::parse_coverage_sqlite(&db_path, project_dir)
