@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/sakost/fest/compare/v0.1.0...v0.1.1) (2026-03-09)
+
+
+### Features
+
+* abort if baseline test suite fails before mutation testing ([7bccf88](https://github.com/sakost/fest/commit/7bccf8834bec385a45e47d2296cd24280ad3f18d))
+* auto-detect Python from VIRTUAL_ENV and local .venv ([5686841](https://github.com/sakost/fest/commit/56868419666e5f7f48f961bc53c6f73a0fa64ee3))
+
+
+### Bug Fixes
+
+* use MultiProgress to prevent flickering between spinner and progress bar ([057b469](https://github.com/sakost/fest/commit/057b4698efc9b7842bba8a02d4f565bea53c2e33))
+
 ## [Unreleased]
 
 ## [0.1.0](https://github.com/sakost/fest/releases/tag/v0.1.0) - 2026-03-06
