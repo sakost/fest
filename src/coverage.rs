@@ -129,6 +129,7 @@ fn run_pytest_cov(
 
     args.extend([
         "--cov-context=test".to_owned(),
+        "--cov-fail-under=0".to_owned(),
         "--no-header".to_owned(),
         "-q".to_owned(),
     ]);
