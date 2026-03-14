@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3](https://github.com/sakost/fest/compare/v0.1.2...v0.1.3) (2026-03-14)
+
+
+### Bug Fixes
+
+* prevent .pyc cache staleness in subprocess backend ([f19f4c0](https://github.com/sakost/fest/commit/f19f4c0ea5cab0d2c24d5eeb56649a331c6bf4ca))
+
 ## [0.1.2](https://github.com/sakost/fest/compare/v0.1.1...v0.1.2) (2026-03-09)
 
 
