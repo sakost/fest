@@ -18,8 +18,9 @@ test:
     cargo test --all-features
 
 # Run Python plugin unit tests
+# Uses uvx so contributors don't need pytest installed system-wide.
 test-plugin:
-    pytest tests/plugin -v
+    uvx pytest tests/plugin -v
 
 # Run clippy lints
 lint:
