@@ -1618,4 +1618,54 @@ mod tests {
         // Either Ok or Err is fine — we just verify it doesn't hang.
         let _status = result;
     }
+
+    /// Integration test: run a real mutant through the plugin pipeline
+    /// against the `from_imports` fixture and verify the consumer
+    /// (which uses `from src.calc import add`) sees the mutation —
+    /// i.e. Plan G's reverse-import rebinding actually works end-to-end.
+    ///
+    /// Ignored by default — requires a working python with pytest on PATH.
+    #[tokio::test]
+    #[ignore = "requires python+pytest on PATH; run with --include-ignored"]
+    async fn plugin_run_mutant_propagates_to_consumer_via_index() {
+        use crate::mutation::{Mutant, MutantStatus};
+
+        let fixture = Path::new("tests/fixtures/from_imports");
+        if !fixture.exists() {
+            return;
+        }
+        let runner = PytestPluginRunner::new(60_u64);
+        runner.start(1, fixture).await.expect("start");
+
+        // Mutate `def add(a, b): return a + b` to `return a - b`.
+        let calc_path = fixture.join("src/calc.py");
+        let source = std::fs::read_to_string(&calc_path).expect("read calc.py");
+        let plus_byte = source.find("a + b").expect("find expr") + 2;
+        let mutant = Mutant {
+            file_path: calc_path.clone(),
+            line: 1,
+            column: 1,
+            byte_offset: plus_byte,
+            byte_length: 1,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic".to_owned(),
+        };
+        let tests: Vec<String> = vec![
+            "tests/test_calc.py::test_add".to_owned(),
+            "tests/test_calc.py::test_double_add".to_owned(),
+        ];
+        let result = runner.run_mutant(&mutant, &source, &tests).await
+            .expect("run_mutant");
+
+        // The consumer test (`test_double_add` uses `from src.calc import add`)
+        // must observe the mutation — status should be Killed, not Survived.
+        assert_eq!(
+            result.status, MutantStatus::Killed,
+            "consumer didn't see the mutation; reverse-import index broken? \
+             actual status: {:?}", result.status,
+        );
+
+        runner.stop().await.expect("stop");
+    }
 }
