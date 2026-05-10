@@ -89,6 +89,60 @@ pub fn derive_diff(
     Vec::new()
 }
 
+/// Recursively descend into a function definition to find the innermost function
+/// whose body contains the mutant's byte offset, returning a [`MutationDiff::FunctionBody`]
+/// with a dotted `qualname` (e.g. `outer.inner`).
+///
+/// `qualname_prefix` is the dotted name accumulated so far from outer scopes.
+/// Pass `""` at the top level — the prefix is prepended automatically.
+#[allow(
+    clippy::string_slice,
+    reason = "byte offsets originate from the AST and are always valid UTF-8 boundaries"
+)]
+fn descend_function(
+    func: &ruff_python_ast::StmtFunctionDef,
+    mutated_source: &str,
+    mutant: &Mutant,
+    qualname_prefix: &str,
+) -> Option<MutationDiff> {
+    let outer_qualname = if qualname_prefix.is_empty() {
+        func.name.id.to_string()
+    } else {
+        format!("{}.{}", qualname_prefix, func.name.id)
+    };
+    for inner_stmt in &func.body {
+        let range = inner_stmt.range();
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        if !(start <= mutant.byte_offset && mutant.byte_offset < end) {
+            continue;
+        }
+        if let Stmt::FunctionDef(nested) = inner_stmt {
+            if let Some(d) = descend_function(nested, mutated_source, mutant, &outer_qualname) {
+                return Some(d);
+            }
+            let stmt_end = mutated_stmt_end(end, mutant);
+            let new_source = strip_decorators(
+                mutated_source.get(start..stmt_end).unwrap_or(""),
+            );
+            return Some(MutationDiff::FunctionBody {
+                qualname: format!("{}.{}", outer_qualname, nested.name.id),
+                new_source,
+            });
+        }
+    }
+    let range = func.range();
+    let stmt_start = range.start().to_usize();
+    let stmt_end = mutated_stmt_end(range.end().to_usize(), mutant);
+    let new_source = strip_decorators(
+        mutated_source.get(stmt_start..stmt_end).unwrap_or(""),
+    );
+    Some(MutationDiff::FunctionBody {
+        qualname: outer_qualname,
+        new_source,
+    })
+}
+
 /// Attempt to derive a [`MutationDiff`] for a single top-level statement.
 ///
 /// Returns `None` when the statement kind is not yet supported.
@@ -102,20 +156,7 @@ fn derive_for_top_level(
     mutant: &Mutant,
 ) -> Option<MutationDiff> {
     match stmt {
-        Stmt::FunctionDef(func) => {
-            let stmt_start = stmt.range().start().to_usize();
-            let stmt_end_in_mutated =
-                mutated_stmt_end(stmt.range().end().to_usize(), mutant);
-            let new_source = strip_decorators(
-                mutated_source
-                    .get(stmt_start..stmt_end_in_mutated)
-                    .unwrap_or(""),
-            );
-            Some(MutationDiff::FunctionBody {
-                qualname: func.name.id.to_string(),
-                new_source,
-            })
-        }
+        Stmt::FunctionDef(func) => descend_function(func, mutated_source, mutant, ""),
         Stmt::Assign(assign) => {
             let target = assign.targets.first()?;
             let name = match target {
@@ -381,6 +422,28 @@ mod tests {
                 assert_eq!(new_expr.trim(), "11");
             }
             other => panic!("expected ClassAttr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_function_yields_dotted_qualname() {
+        let original_src = "def outer():\n    def inner():\n        return 1\n    return inner\n";
+        let mutated_src  = "def outer():\n    def inner():\n        return 2\n    return inner\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let offset = original_src.find("1\n").unwrap();
+        let mutant = make_mutant("nested.py", "1", "2", offset);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::FunctionBody { qualname, new_source } => {
+                assert_eq!(qualname, "outer.inner");
+                assert!(new_source.contains("return 2"));
+                assert!(new_source.starts_with("def inner"));
+            }
+            other => panic!("expected FunctionBody for outer.inner, got {other:?}"),
         }
     }
 
