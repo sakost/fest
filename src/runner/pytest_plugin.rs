@@ -428,9 +428,29 @@ impl Runner for PytestPluginRunner {
         }
 
         // Scan the project to build the plugin index sent to each worker.
+        // On failure, fall back to an empty index — the plugin's runtime
+        // layer (sys.modules walk) still provides partial coverage, but
+        // raw module-level constants imported via `from X import C` will
+        // not be rebound in consumers. Surface the error to stderr so
+        // operators can diagnose misconfigured project_dir or permission
+        // issues; do not abort because partial accuracy is better than
+        // a hard failure here.
         let scanned = match crate::plugin_index::scan_project(project_dir) {
             Ok(idx) => idx,
-            Err(_err) => crate::plugin_index::PluginIndex::default(),
+            #[expect(
+                clippy::print_stderr,
+                reason = "operator-facing diagnostic for a degraded-mode \
+                          fallback; the project has no logging dep and \
+                          the error must not abort the run"
+            )]
+            Err(err) => {
+                eprintln!(
+                    "fest: scan_project failed at {}: {err}; \
+                     reverse-import index falling back to runtime layer only",
+                    project_dir.display(),
+                );
+                crate::plugin_index::PluginIndex::default()
+            }
         };
         let index_arc = Arc::new(scanned);
         if let Ok(mut guard) = self.project_index.lock() {

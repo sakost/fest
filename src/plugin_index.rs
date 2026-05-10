@@ -230,6 +230,10 @@ fn path_to_module(root: &std::path::Path, file: &std::path::Path) -> String {
     parts.join(".")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn scan_source_resolves_bare_relative_one_dot() {
         let src = "from . import sibling\n";
@@ -248,10 +252,6 @@ fn path_to_module(root: &std::path::Path, file: &std::path::Path) -> String {
         assert_eq!(index.import_bindings[0].target_module, "myproj.sibling_pkg");
         assert_eq!(index.import_bindings[0].target_name, "thing");
     }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn scan_source_extracts_simple_from_import() {
