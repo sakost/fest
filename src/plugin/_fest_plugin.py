@@ -418,32 +418,28 @@ def pytest_addoption(parser: Any) -> None:
 
 
 def pytest_runtestloop(session: Any) -> bool:
-    """Run the fest event loop after collection, replacing the default test loop.
-
-    Returns ``True`` to tell pytest we handled test execution ourselves.
-    """
+    """Run the fest event loop after collection."""
     socket_path: str | None = session.config.getoption("fest_socket")
     if socket_path is None:
         return False
 
     _check_pytest_version()
 
-    # Build nodeid -> Item index from collected items.
     item_index: dict[str, Any] = {}
     for item in session.items:
         item_index[item.nodeid] = item
 
-    # Build abs_path -> module_name cache from currently loaded modules.
     file_to_mod = _build_file_module_index()
 
     conn = _connect(socket_path)
     if conn is None:
         return True
-
-    # Use a generous timeout; the Rust side enforces per-mutant timeouts.
     conn.settimeout(None)
+
     test_ids = [item.nodeid for item in session.items]
     _send(conn, {"type": "ready", "tests": test_ids})
+
+    rev_index = ReverseImportIndex.build_runtime_layer()
 
     buf = b""
     while True:
@@ -472,8 +468,12 @@ def pytest_runtestloop(session: Any) -> bool:
             if msg_type == "shutdown":
                 conn.close()
                 return True
+            if msg_type == "ready_ack":
+                rev_index.ingest_ast_layer(msg.get("import_bindings", []))
+                _emit_reload_warnings(msg.get("reload_warnings", []))
+                continue
             if msg_type == "mutant":
-                result = _handle_mutant(session, msg, item_index, file_to_mod)
+                result = _handle_mutant(session, msg, item_index, file_to_mod, rev_index)
                 _send(conn, result)
             else:
                 _send(
@@ -487,6 +487,24 @@ def pytest_runtestloop(session: Any) -> bool:
 
     conn.close()
     return True
+
+
+def _emit_reload_warnings(warnings: list[dict[str, Any]]) -> None:
+    """Print up to 5 reload-warning lines to stderr at startup."""
+    capped = warnings[:5]
+    for w in capped:
+        print(
+            f"fest: detected {w.get('kind')} at {w.get('file')}:{w.get('line')} "
+            "- plugin backend cannot guarantee accuracy. "
+            "Consider --backend=subprocess for affected tests.",
+            file=sys.stderr,
+        )
+    if len(warnings) > len(capped):
+        print(
+            f"fest: ... {len(warnings) - len(capped)} more reload/dynamic-import "
+            "warnings suppressed.",
+            file=sys.stderr,
+        )
 
 
 def _check_pytest_version() -> None:
@@ -509,42 +527,31 @@ def _handle_mutant(
     msg: dict[str, Any],
     item_index: dict[str, Any],
     file_to_mod: dict[str, str],
+    rev_index: "ReverseImportIndex",
 ) -> dict[str, Any]:
-    """Apply a mutation, run the relevant tests, restore, and return a result."""
+    """Apply a mutation, run tests, restore, return a result."""
     file_path: str = msg.get("file", "")
     module_name: str = msg.get("module", "")
-    mutated_source: str = msg.get("mutated_source", "")
+    diff: list[dict[str, Any]] = msg.get("diff", [])
     test_ids: list[str] = msg.get("tests", [])
 
-    # Prefer cached __file__-based lookup: handles src-layout and editable
-    # installs where a naive path-to-module conversion gives the wrong name.
     found = file_to_mod.get(os.path.abspath(file_path))
     if found:
         module_name = found
     elif not module_name:
         module_name = _file_to_module(file_path)
-    original_module = sys.modules.get(module_name)
-    saved_dict: dict[str, Any] | None = None
 
+    target_module = sys.modules.get(module_name)
+    if target_module is None:
+        target_module = types.ModuleType(module_name)
+        target_module.__file__ = file_path
+        sys.modules[module_name] = target_module
+
+    journal = PatchJournal()
+    applier = MutationApplier(target_module, rev_index)
     try:
-        code = compile(mutated_source, file_path, "exec")
-    except SyntaxError as exc:
-        return {
-            "type": "result",
-            "status": "error",
-            "error_message": f"compile error: {exc}",
-        }
-
-    try:
-        if original_module is not None:
-            saved_dict = dict(vars(original_module))
-            _exec_code(code, vars(original_module))
-        else:
-            mod = types.ModuleType(module_name)
-            mod.__file__ = file_path
-            sys.modules[module_name] = mod
-            _exec_code(code, vars(mod))
-
+        for change in diff:
+            applier.apply(change, journal)
         status = _run_tests(session, test_ids, item_index)
         return {"type": "result", "status": status}
     except Exception as exc:  # noqa: BLE001
@@ -554,23 +561,9 @@ def _handle_mutant(
             "error_message": f"runtime error: {exc}",
         }
     finally:
-        if original_module is not None and saved_dict is not None:
-            vars(original_module).clear()
-            vars(original_module).update(saved_dict)
-        elif original_module is None and module_name in sys.modules:
-            del sys.modules[module_name]
-
-
-def _exec_code(code: types.CodeType, namespace: dict[str, Any]) -> None:
-    """Execute compiled code in the given namespace.
-
-    Separated into its own function to keep the security-sensitive call
-    isolated and auditable.
-    """
-    # This is intentional: fest needs to load mutated Python source code
-    # into the target module's namespace for mutation testing.
-    glob = namespace  # noqa: A001
-    exec(code, glob)  # noqa: S102  -- required for mutation testing
+        errors = journal.rollback()
+        for err in errors:
+            print(f"fest: rollback step failed: {err}", file=sys.stderr)
 
 
 def _run_tests(
