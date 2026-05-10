@@ -123,6 +123,141 @@ class ReverseImportIndex:
             self.add(target_mod, target_name, consumer_mod.__dict__, consumer_key)
 
 
+_MISSING = object()
+
+
+def _drill_to_function(value: Any) -> Any:
+    """Follow ``__wrapped__`` chains until a plain function is reached."""
+    seen: set[int] = set()
+    cur = value
+    while not isinstance(cur, types.FunctionType):
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        nxt = getattr(cur, "__wrapped__", None)
+        if nxt is None or nxt is cur:
+            break
+        cur = nxt
+    return cur
+
+
+def _restore_function(
+    func: Any,
+    code: Any,
+    defaults: Any,
+    kwdefaults: Any,
+    annotations: dict[str, Any],
+    func_dict: dict[str, Any],
+) -> None:
+    """Restore a function to its pre-mutation state."""
+    func.__code__ = code
+    func.__defaults__ = defaults
+    func.__kwdefaults__ = kwdefaults
+    func.__annotations__ = dict(annotations)
+    func.__dict__.clear()
+    func.__dict__.update(func_dict)
+
+
+def _restore_code(func: Any, code: Any) -> None:
+    """Restore just a function's `__code__` attribute."""
+    func.__code__ = code
+
+
+def _restore_dict_slot(target_dict: dict[str, Any], key: str, old_value: Any) -> None:
+    """Restore a dict slot, deleting if the original value was missing."""
+    if old_value is _MISSING:
+        target_dict.pop(key, None)
+    else:
+        target_dict[key] = old_value
+
+
+def _restore_class_attr(cls: type, name: str, old_value: Any) -> None:
+    """Restore a class attribute, deleting if the original value was missing."""
+    if old_value is _MISSING:
+        try:
+            delattr(cls, name)
+        except AttributeError:
+            pass
+    else:
+        setattr(cls, name, old_value)
+
+
+def _unwrap_descriptor(descriptor: Any, suffix: str) -> Any:
+    """Unwrap a class-body descriptor to the underlying function."""
+    if isinstance(descriptor, (staticmethod, classmethod)):
+        return descriptor.__func__
+    if isinstance(descriptor, property):
+        if suffix == "fget":
+            return descriptor.fget
+        if suffix == "fset":
+            return descriptor.fset
+        if suffix == "fdel":
+            return descriptor.fdel
+        return descriptor.fget
+    if isinstance(descriptor, types.FunctionType):
+        return descriptor
+    return None
+
+
+class MutationApplier:
+    """Dispatches MutationDiff entries to per-kind appliers."""
+
+    def __init__(
+        self,
+        target_module: types.ModuleType,
+        index: ReverseImportIndex,
+    ) -> None:
+        self.target_module = target_module
+        self.index = index
+
+    def apply(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        """Apply a single MutationDiff entry, recording undo to journal."""
+        kind = change.get("kind", "")
+        handler = {
+            "function_body": self._apply_function_body,
+            "constant_bind": self._apply_constant_rebind,
+            "class_method": self._apply_class_method,
+            "class_attr": self._apply_class_attr,
+            "module_attr": self._apply_module_attr,
+        }.get(kind)
+        if handler is None:
+            raise ValueError(f"unknown mutation kind: {kind!r}")
+        handler(change, journal)
+
+    def _apply_function_body(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        raise NotImplementedError
+
+    def _apply_constant_rebind(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        raise NotImplementedError
+
+    def _apply_class_method(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        raise NotImplementedError
+
+    def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        raise NotImplementedError
+
+    def _apply_module_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        raise NotImplementedError
+
+    def _resolve_qualname(self, qualname: str) -> Any:
+        """Resolve a dotted qualname against the target module."""
+        cur: Any = self.target_module
+        for part in qualname.split("."):
+            cur = getattr(cur, part) if not isinstance(cur, dict) else cur[part]
+        return cur
+
+    def _compile_function(self, new_source: str, like: Any) -> Any:
+        """Compile a `def` source block into a function in `like`'s globals."""
+        ns: dict[str, Any] = dict(like.__globals__)
+        compiled = compile(new_source, "<fest mutation>", "exec")
+        local_ns: dict[str, Any] = {}
+        _PY_EXEC(compiled, ns, local_ns)
+        for value in local_ns.values():
+            if isinstance(value, types.FunctionType):
+                return value
+        raise RuntimeError(f"compiled source produced no function: {new_source!r}")
+
+
 def pytest_addoption(parser: Any) -> None:
     """Register the ``--fest-socket`` CLI option."""
     parser.addoption(
