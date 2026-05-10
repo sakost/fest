@@ -351,10 +351,35 @@ class MutationApplier:
         )
 
     def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        raise NotImplementedError
+        cls = self._resolve_qualname(change["class_qualname"])
+        name = change["name"]
+        compiled = compile(change["new_expr"], "<fest class attr>", "eval")
+        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
+        old_value = cls.__dict__.get(name, _MISSING)
+        setattr(cls, name, new_value)
+        journal.append(_restore_class_attr, cls, name, old_value)
 
     def _apply_module_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        raise NotImplementedError
+        name = change["name"]
+        compiled = compile(change["new_source"], "<fest module attr>", "exec")
+        ns: dict[str, Any] = dict(self.target_module.__dict__)
+        local_ns: dict[str, Any] = {}
+        _PY_EXEC(compiled, ns, local_ns)
+        if name not in local_ns:
+            raise RuntimeError(
+                f"module attr {name!r}: compiled source did not bind {name!r}",
+            )
+        new_value = local_ns[name]
+        target_dict = self.target_module.__dict__
+        old_value = target_dict.get(name, _MISSING)
+        target_dict[name] = new_value
+        journal.append(_restore_dict_slot, target_dict, name, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, name,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_value
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
     def _resolve_qualname(self, qualname: str) -> Any:
         """Resolve a dotted qualname against the target module."""

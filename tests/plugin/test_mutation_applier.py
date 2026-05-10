@@ -196,3 +196,46 @@ def test_property_fget_mutation(target_module):
     assert C().x == 2
     journal.rollback()
     assert C().x == 1
+
+
+def test_class_attr_rebind(target_module):
+    src = "class C:\n    LIMIT = 10\n"
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    C = target_module.C
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    applier.apply(
+        {"kind": "class_attr", "class_qualname": "C", "name": "LIMIT", "new_expr": "11"},
+        journal,
+    )
+
+    assert C.LIMIT == 11
+    journal.rollback()
+    assert C.LIMIT == 10
+
+
+def test_module_attr_rebind_runs_def_block(target_module):
+    target_module.foo = lambda: 1
+    target_module.foo.__module__ = target_module.__name__
+    consumer = {"foo": target_module.foo}
+    idx = ReverseImportIndex()
+    idx.add(target_module.__name__, "foo", consumer, "foo")
+    applier = MutationApplier(target_module, idx)
+    journal = PatchJournal()
+
+    applier.apply(
+        {
+            "kind": "module_attr",
+            "name": "foo",
+            "new_source": "def foo():\n    return 2\n",
+        },
+        journal,
+    )
+
+    assert target_module.foo() == 2
+    assert consumer["foo"]() == 2
+
+    journal.rollback()
+    assert target_module.foo() == 1
+    assert consumer["foo"]() == 1
