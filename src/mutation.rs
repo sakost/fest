@@ -14,6 +14,10 @@ use crate::{
 
 /// Built-in mutation operators shipped with fest.
 pub mod builtin;
+
+/// Structured diff IR for mutations dispatched to the plugin backend.
+pub mod diff;
+
 /// Data types for representing mutants and their execution results.
 pub mod mutant;
 /// Mutator trait and registry for mutation operators.
@@ -21,6 +25,7 @@ pub mod mutator;
 /// Deterministic per-mutation value derivation from a seed.
 pub(crate) mod seed;
 
+pub use diff::MutationDiff;
 pub use mutant::{Mutant, MutantResult, MutantStatus};
 pub use mutator::{Mutation, MutationContext, Mutator, MutatorRegistry};
 
