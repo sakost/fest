@@ -303,7 +303,19 @@ class MutationApplier:
             journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
     def _apply_constant_rebind(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        raise NotImplementedError
+        name = change["name"]
+        compiled = compile(change["new_expr"], "<fest constant>", "eval")
+        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
+        target_dict = self.target_module.__dict__
+        old_value = target_dict.get(name, _MISSING)
+        target_dict[name] = new_value
+        journal.append(_restore_dict_slot, target_dict, name, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, name,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_value
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
     def _apply_class_method(self, change: dict[str, Any], journal: PatchJournal) -> None:
         raise NotImplementedError

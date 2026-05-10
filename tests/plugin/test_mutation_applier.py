@@ -82,3 +82,24 @@ def test_nested_function_body_via_co_consts(target_module):
 
     journal.rollback()
     assert target_module.outer()() == 1
+
+
+def test_constant_rebind_updates_target_and_consumer(target_module):
+    target_module.MAX = 100
+    consumer = {"MAX": 100}
+    idx = ReverseImportIndex()
+    idx.add(target_module.__name__, "MAX", consumer, "MAX")
+    applier = MutationApplier(target_module, idx)
+    journal = PatchJournal()
+
+    applier.apply(
+        {"kind": "constant_bind", "name": "MAX", "new_expr": "101"},
+        journal,
+    )
+
+    assert target_module.MAX == 101
+    assert consumer["MAX"] == 101
+
+    journal.rollback()
+    assert target_module.MAX == 100
+    assert consumer["MAX"] == 100
