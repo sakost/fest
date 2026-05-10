@@ -230,6 +230,25 @@ fn path_to_module(root: &std::path::Path, file: &std::path::Path) -> String {
     parts.join(".")
 }
 
+    #[test]
+    fn scan_source_resolves_bare_relative_one_dot() {
+        let src = "from . import sibling\n";
+        let index = scan_source(src, "myproj.subpkg.consumer", &PathBuf::from("c.py"));
+        assert_eq!(index.import_bindings.len(), 1);
+        assert_eq!(index.import_bindings[0].target_module, "myproj.subpkg");
+        assert_eq!(index.import_bindings[0].target_name, "sibling");
+        assert_eq!(index.import_bindings[0].consumer_key, "sibling");
+    }
+
+    #[test]
+    fn scan_source_resolves_relative_two_dots() {
+        let src = "from ..sibling_pkg import thing\n";
+        let index = scan_source(src, "myproj.subpkg.consumer", &PathBuf::from("c.py"));
+        assert_eq!(index.import_bindings.len(), 1);
+        assert_eq!(index.import_bindings[0].target_module, "myproj.sibling_pkg");
+        assert_eq!(index.import_bindings[0].target_name, "thing");
+    }
+
 #[cfg(test)]
 mod tests {
     use super::*;
