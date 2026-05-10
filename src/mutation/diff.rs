@@ -540,4 +540,16 @@ mod tests {
         // Must not panic.
         drop(derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src));
     }
+
+    #[test]
+    fn mutation_diff_serde_roundtrip() {
+        let original = MutationDiff::FunctionBody {
+            qualname: "mod.outer.inner".into(),
+            new_source: "def inner():\n    return 2\n".into(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: MutationDiff = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+        assert!(json.contains("\"kind\":\"function_body\""));
+    }
 }
