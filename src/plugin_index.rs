@@ -100,17 +100,17 @@ fn walk_stmt_for_calls(
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 
     /// Visitor that records every interesting call it sees.
-    struct CallVisitor<'a> {
+    struct CallVisitor<'src> {
         /// Source for line-number computation.
-        source: &'a str,
+        source: &'src str,
         /// File path stored in [`ReloadWarning::file`].
-        file: &'a std::path::Path,
+        file: &'src std::path::Path,
         /// Output list to which warnings are appended.
-        out: &'a mut PluginIndex,
+        out: &'src mut PluginIndex,
     }
 
-    impl<'a> Visitor<'a> for CallVisitor<'a> {
-        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+    impl<'src> Visitor<'src> for CallVisitor<'src> {
+        fn visit_expr(&mut self, expr: &'src ruff_python_ast::Expr) {
             if let ruff_python_ast::Expr::Call(call) = expr {
                 if let Some(kind) = classify_call(&call.func) {
                     let line = line_at(self.source, call.range().start().to_usize());
