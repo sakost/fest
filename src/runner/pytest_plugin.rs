@@ -811,6 +811,17 @@ fn build_mutant_message(
     msg.to_string()
 }
 
+/// Build the JSON `ready_ack` message sent to the plugin in response
+/// to its `ready` message.
+fn build_ready_ack_message(index: &crate::plugin_index::PluginIndex) -> String {
+    let msg = serde_json::json!({
+        "type": "ready_ack",
+        "import_bindings": index.import_bindings,
+        "reload_warnings": index.reload_warnings,
+    });
+    msg.to_string()
+}
+
 /// Parse the `"status"` field from a result JSON message into a
 /// [`MutantStatus`].
 ///
@@ -1496,6 +1507,24 @@ mod tests {
                 panic!("mock should finish: {err}");
             }
         });
+    }
+
+    /// `build_ready_ack_message` serializes the index correctly.
+    #[test]
+    fn build_ready_ack_message_serializes_index() {
+        let index = crate::plugin_index::PluginIndex {
+            import_bindings: vec![crate::plugin_index::ImportBinding {
+                consumer_module: "consumer".into(),
+                consumer_key: "x".into(),
+                target_module: "target".into(),
+                target_name: "x".into(),
+            }],
+            reload_warnings: vec![],
+        };
+        let msg = build_ready_ack_message(&index);
+        let val: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(val["type"], "ready_ack");
+        assert_eq!(val["import_bindings"][0]["target_module"], "target");
     }
 
     /// `build_mutant_message` includes the diff array.
