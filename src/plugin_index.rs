@@ -56,12 +56,13 @@ pub fn scan_source(source: &str, consumer_module: &str, file_path: &std::path::P
     out
 }
 
-/// Collect `from`-import bindings from a single top-level statement.
+/// Collect `from`-import bindings AND reload/dynamic-import warnings
+/// from a single top-level statement.
 fn collect_from_stmt(
     stmt: &Stmt,
-    _source: &str,
+    source: &str,
     consumer_module: &str,
-    _file_path: &std::path::Path,
+    file_path: &std::path::Path,
     out: &mut PluginIndex,
 ) {
     if let Stmt::ImportFrom(import) = stmt {
@@ -81,6 +82,76 @@ fn collect_from_stmt(
             });
         }
     }
+    walk_stmt_for_calls(stmt, source, file_path, out);
+}
+
+/// Recursively walk a statement looking for reload / dynamic-import
+/// calls anywhere inside its expression tree.
+fn walk_stmt_for_calls(
+    stmt: &Stmt,
+    source: &str,
+    file_path: &std::path::Path,
+    out: &mut PluginIndex,
+) {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+
+    /// Visitor that records every interesting call it sees.
+    struct CallVisitor<'a> {
+        /// Source for line-number computation.
+        source: &'a str,
+        /// File path stored in [`ReloadWarning::file`].
+        file: &'a std::path::Path,
+        /// Output list to which warnings are appended.
+        out: &'a mut PluginIndex,
+    }
+
+    impl<'a> Visitor<'a> for CallVisitor<'a> {
+        fn visit_expr(&mut self, expr: &'a ruff_python_ast::Expr) {
+            if let ruff_python_ast::Expr::Call(call) = expr {
+                if let Some(kind) = classify_call(&call.func) {
+                    let line = line_at(self.source, call.range().start().to_usize());
+                    self.out.reload_warnings.push(ReloadWarning {
+                        file: self.file.to_path_buf(),
+                        line,
+                        kind: kind.to_owned(),
+                    });
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = CallVisitor { source, file: file_path, out };
+    walk_stmt(&mut visitor, stmt);
+}
+
+/// Classify a call expression as `reload` / `import_module` / `__import__`,
+/// or `None` for unrelated calls.
+fn classify_call(callee: &ruff_python_ast::Expr) -> Option<&'static str> {
+    match callee {
+        ruff_python_ast::Expr::Attribute(attr) => {
+            let leaf = attr.attr.id.as_str();
+            let base = match attr.value.as_ref() {
+                ruff_python_ast::Expr::Name(n) => n.id.as_str(),
+                _ => return None,
+            };
+            if base == "importlib" && leaf == "reload" {
+                Some("reload")
+            } else if base == "importlib" && leaf == "import_module" {
+                Some("import_module")
+            } else {
+                None
+            }
+        }
+        ruff_python_ast::Expr::Name(n) if n.id.as_str() == "__import__" => Some("__import__"),
+        _ => None,
+    }
+}
+
+/// Compute 1-based line number of the given byte offset in `source`.
+fn line_at(source: &str, byte_offset: usize) -> u32 {
+    let upto = source.get(..byte_offset).unwrap_or("");
+    u32::try_from(upto.matches('\n').count() + 1).unwrap_or(1)
 }
 
 /// Resolve a `from`-import's target module against the consumer's
@@ -141,5 +212,28 @@ mod tests {
         let src = "from .sib import x\n";
         let index = scan_source(src, "myproj.subpkg.consumer", &PathBuf::from("c.py"));
         assert_eq!(index.import_bindings[0].target_module, "myproj.subpkg.sib");
+    }
+
+    #[test]
+    fn scan_source_detects_importlib_reload() {
+        let src = "import importlib\nimportlib.reload(foo)\n";
+        let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
+        assert_eq!(index.reload_warnings.len(), 1);
+        assert_eq!(index.reload_warnings[0].kind, "reload");
+        assert_eq!(index.reload_warnings[0].line, 2);
+    }
+
+    #[test]
+    fn scan_source_detects_dynamic_import_module() {
+        let src = "import importlib\nimportlib.import_module('foo')\n";
+        let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
+        assert!(index.reload_warnings.iter().any(|w| w.kind == "import_module"));
+    }
+
+    #[test]
+    fn scan_source_detects_dunder_import() {
+        let src = "__import__('foo')\n";
+        let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
+        assert!(index.reload_warnings.iter().any(|w| w.kind == "__import__"));
     }
 }
