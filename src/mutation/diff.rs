@@ -104,10 +104,8 @@ fn derive_for_top_level(
     match stmt {
         Stmt::FunctionDef(func) => {
             let stmt_start = stmt.range().start().to_usize();
-            let stmt_end_in_mutated = stmt_start
-                + stmt.range().len().to_usize()
-                + mutant.mutated_text.len()
-                - mutant.byte_length;
+            let stmt_end_in_mutated =
+                mutated_stmt_end(stmt.range().end().to_usize(), mutant);
             let new_source = strip_decorators(
                 mutated_source
                     .get(stmt_start..stmt_end_in_mutated)
@@ -120,6 +118,15 @@ fn derive_for_top_level(
         }
         _ => None,
     }
+}
+
+/// Compute the new end byte offset of a statement after a mutation is applied.
+///
+/// Uses signed arithmetic to avoid usize underflow when the mutated text is shorter
+/// than the original (e.g. decorator removal replaces `@cache\n` with `""`).
+fn mutated_stmt_end(original_end: usize, mutant: &Mutant) -> usize {
+    let delta = mutant.mutated_text.len() as isize - mutant.byte_length as isize;
+    original_end.checked_add_signed(delta).unwrap_or(original_end)
 }
 
 /// Strip leading decorator lines (`@…`) from a function/class source block.
@@ -186,5 +193,26 @@ mod tests {
             }
             other => panic!("expected FunctionBody, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shrinking_mutation_does_not_panic_or_underflow() {
+        // Decorator removal: replaces "@cache\n" with "" — mutated_text shorter than byte_length.
+        let original_src = "@cache\ndef foo():\n    return 1\n";
+        let mutated_src = "def foo():\n    return 1\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let mutant = Mutant {
+            file_path: "f.py".into(),
+            line: 1,
+            column: 1,
+            byte_offset: 0,
+            byte_length: "@cache\n".len(),
+            original_text: "@cache\n".into(),
+            mutated_text: String::new(),
+            mutator_name: "remove_decorator".to_owned(),
+        };
+        // Must not panic.
+        drop(derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src));
     }
 }
