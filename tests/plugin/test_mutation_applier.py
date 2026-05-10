@@ -215,20 +215,51 @@ def test_class_attr_rebind(target_module):
     assert C.LIMIT == 10
 
 
-def test_function_body_falls_back_when_closure_mismatch(target_module):
-    # Closure-cell mismatch is observable only when the new code object has a
-    # different co_freevars count than the original function — a condition that
-    # requires constructing a genuine closure at the bytecode level.
-    # _compile_function returns the *first* FunctionType in local_ns, which is
-    # always a top-level (non-closure) function, so it's impossible to hand the
-    # applier a code object with free variables via the public `function_body`
-    # change dict.  The fallback path is therefore only reachable via direct
-    # internal manipulation, which belongs in integration tests rather than unit
-    # tests.  Deferred to integration testing.
-    pytest.skip(
-        "closure-mismatch fallback requires bytecode-level setup not reachable "
-        "through the public function_body change dict; deferred to integration tests"
-    )
+def test_fallback_function_rebind_replaces_target_and_consumers(target_module):
+    """Direct test of _fallback_function_rebind (the closure-mismatch fallback path).
+
+    `__code__`-swap raises `ValueError` when the new code object has a
+    different `co_freevars` count from the original. In that branch
+    `_apply_function_body` calls `_fallback_function_rebind` to replace
+    the function object outright via the reverse-import index. We test
+    the fallback method directly because constructing the exact bytecode
+    pattern that triggers it through the public `function_body` change
+    dict would require hand-crafting code objects.
+    """
+    src = "def foo(x):\n    return x + 1\n"
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    target_module.foo.__module__ = target_module.__name__
+    consumer_a = {"foo": target_module.foo}
+    consumer_b = {"renamed_foo": target_module.foo}
+
+    idx = ReverseImportIndex()
+    idx.add(target_module.__name__, "foo", consumer_a, "foo")
+    idx.add(target_module.__name__, "foo", consumer_b, "renamed_foo")
+
+    applier = MutationApplier(target_module, idx)
+    journal = PatchJournal()
+
+    # New function object — different identity, different behavior.
+    def new_foo(x):
+        return x - 1
+
+    new_foo.__module__ = target_module.__name__
+    new_foo.__qualname__ = "foo"
+
+    applier._fallback_function_rebind("foo", new_foo, journal)
+
+    # Target module's slot now points to new_foo.
+    assert target_module.foo(5) == 4
+    # Both consumer slots also point to new_foo (identity-breaking rebind).
+    assert consumer_a["foo"](5) == 4
+    assert consumer_b["renamed_foo"](5) == 4
+
+    journal.rollback()
+
+    # All slots restored.
+    assert target_module.foo(5) == 6
+    assert consumer_a["foo"](5) == 6
+    assert consumer_b["renamed_foo"](5) == 6
 
 
 def test_module_attr_rebind_runs_def_block(target_module):

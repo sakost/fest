@@ -199,6 +199,9 @@ pub fn scan_project(root: &std::path::Path) -> std::io::Result<PluginIndex> {
 }
 
 /// Recursive worker for [`scan_project`].
+///
+/// Skips `__pycache__` directories (no `.py` files) and symlinked
+/// directories (avoids cycles in monorepo layouts).
 fn walk_dir(
     root: &std::path::Path,
     cur: &std::path::Path,
@@ -207,7 +210,14 @@ fn walk_dir(
     for entry in std::fs::read_dir(cur)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                continue;
+            }
             walk_dir(root, &path, out)?;
             continue;
         }
@@ -343,5 +353,44 @@ mod tests {
         assert_eq!(index.import_bindings.len(), 1);
         assert_eq!(index.import_bindings[0].target_module, "pkg.b");
         assert_eq!(index.import_bindings[0].consumer_module, "pkg.a");
+    }
+
+    #[test]
+    fn scan_project_skips_pycache_directories() {
+        use tempfile::tempdir;
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("pkg/__pycache__")).unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "from foo import bar\n").unwrap();
+        std::fs::write(
+            root.join("pkg/__pycache__/cached.py"),
+            "from polluted import zzz\n",
+        )
+        .unwrap();
+
+        let index = scan_project(root).expect("scan ok");
+
+        // Only the real source is scanned; the __pycache__ entry is skipped.
+        assert_eq!(index.import_bindings.len(), 1);
+        assert_eq!(index.import_bindings[0].target_module, "foo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_project_does_not_follow_symlinked_directories() {
+        use tempfile::tempdir;
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/a.py"), "from foo import bar\n").unwrap();
+
+        // Create a symlink to a directory.  If the walker followed it,
+        // it would scan a.py twice.
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        let index = scan_project(root).expect("scan ok");
+
+        // Exactly one binding — the symlinked directory was not followed.
+        assert_eq!(index.import_bindings.len(), 1);
     }
 }

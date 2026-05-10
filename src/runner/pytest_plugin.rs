@@ -1638,6 +1638,21 @@ mod tests {
         if !fixture.exists() {
             return;
         }
+        // Skip cleanly if pytest is not available on the project's python.
+        let python = crate::python::resolve_python(fixture);
+        let py_check = std::process::Command::new(&python)
+            .args(["-c", "import pytest"])
+            .output();
+        if !py_check.is_ok_and(|out| out.status.success()) {
+            #[expect(clippy::print_stderr, reason = "test skip diagnostic")]
+            {
+                eprintln!(
+                    "plugin_run_mutant test: skipped — pytest not available on {}",
+                    python.display()
+                );
+            }
+            return;
+        }
         let runner = PytestPluginRunner::new(60_u64);
         runner.start(1, fixture).await.expect("start");
 
