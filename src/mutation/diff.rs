@@ -132,6 +132,61 @@ fn derive_for_top_level(
                 .to_owned();
             Some(MutationDiff::ConstantBind { name, new_expr })
         }
+        Stmt::ClassDef(class) => {
+            let class_qualname = class.name.id.to_string();
+            for body_stmt in &class.body {
+                let range = body_stmt.range();
+                let start = range.start().to_usize();
+                let end = range.end().to_usize();
+                if !(start <= mutant.byte_offset && mutant.byte_offset < end) {
+                    continue;
+                }
+                match body_stmt {
+                    Stmt::FunctionDef(method) => {
+                        let suffix = property_suffix(method);
+                        let method_name = if suffix.is_empty() {
+                            method.name.id.to_string()
+                        } else {
+                            format!("{}.{}", method.name.id, suffix)
+                        };
+                        let stmt_end = mutated_stmt_end(end, mutant);
+                        let new_source = strip_decorators(
+                            mutated_source.get(start..stmt_end).unwrap_or(""),
+                        );
+                        return Some(MutationDiff::ClassMethod {
+                            class_qualname,
+                            method_name,
+                            new_source,
+                        });
+                    }
+                    Stmt::Assign(assign) => {
+                        let target = assign.targets.first()?;
+                        let attr_name = match target {
+                            ruff_python_ast::Expr::Name(n) => n.id.to_string(),
+                            _ => return None,
+                        };
+                        let value_range = assign.value.range();
+                        let new_expr = mutated_source
+                            .get(
+                                value_range.start().to_usize()
+                                    ..mutated_stmt_end(
+                                        value_range.end().to_usize(),
+                                        mutant,
+                                    ),
+                            )
+                            .unwrap_or("")
+                            .to_owned();
+                        return Some(MutationDiff::ClassAttr {
+                            class_qualname,
+                            name: attr_name,
+                            new_expr,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -143,6 +198,32 @@ fn derive_for_top_level(
 fn mutated_stmt_end(original_end: usize, mutant: &Mutant) -> usize {
     let delta = mutant.mutated_text.len() as isize - mutant.byte_length as isize;
     original_end.checked_add_signed(delta).unwrap_or(original_end)
+}
+
+/// Return the property accessor suffix for a method decorated with `@property`,
+/// `@x.setter`, or `@x.deleter`.
+///
+/// Returns `"fget"` for `@property`, `"fset"` for `@x.setter`, `"fdel"` for
+/// `@x.deleter`, and `""` for plain (non-property) methods.
+fn property_suffix(method: &ruff_python_ast::StmtFunctionDef) -> &'static str {
+    for decorator in &method.decorator_list {
+        match &decorator.expression {
+            ruff_python_ast::Expr::Name(name) if name.id.as_str() == "property" => {
+                return "fget";
+            }
+            ruff_python_ast::Expr::Attribute(attr) => {
+                let leaf = attr.attr.id.as_str();
+                if leaf == "setter" {
+                    return "fset";
+                }
+                if leaf == "deleter" {
+                    return "fdel";
+                }
+            }
+            _ => continue,
+        }
+    }
+    ""
 }
 
 /// Strip leading decorator lines (`@…`) from a function/class source block.
@@ -256,6 +337,50 @@ mod tests {
                 assert_eq!(new_expr.trim(), "1");
             }
             other => panic!("expected ConstantBind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_method_body_yields_class_method_variant() {
+        let original_src = "class Calc:\n    def add(self, a, b):\n        return a + b\n";
+        let mutated_src  = "class Calc:\n    def add(self, a, b):\n        return a - b\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let plus_offset = original_src.find('+').unwrap();
+        let mutant = make_mutant("calc.py", "+", "-", plus_offset);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ClassMethod { class_qualname, method_name, new_source } => {
+                assert_eq!(class_qualname, "Calc");
+                assert_eq!(method_name, "add");
+                assert!(new_source.contains("return a - b"));
+            }
+            other => panic!("expected ClassMethod, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_attr_yields_class_attr_variant() {
+        let original_src = "class Cfg:\n    LIMIT = 10\n";
+        let mutated_src  = "class Cfg:\n    LIMIT = 11\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let offset = original_src.find("10").unwrap();
+        let mutant = make_mutant("cfg.py", "10", "11", offset);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ClassAttr { class_qualname, name, new_expr } => {
+                assert_eq!(class_qualname, "Cfg");
+                assert_eq!(name, "LIMIT");
+                assert_eq!(new_expr.trim(), "11");
+            }
+            other => panic!("expected ClassAttr, got {other:?}"),
         }
     }
 
