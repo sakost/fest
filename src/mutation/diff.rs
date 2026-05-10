@@ -75,6 +75,11 @@ pub fn derive_diff(
     _mutated_ast: &ModModule,
     mutated_source: &str,
 ) -> Vec<MutationDiff> {
+    if mutant.mutator_name == "remove_decorator" {
+        if let Some(d) = derive_decorator_removal(mutant, original_ast, mutated_source) {
+            return vec![d];
+        }
+    }
     let mutation_start = mutant.byte_offset;
     for stmt in &original_ast.body {
         let range = stmt.range();
@@ -87,6 +92,44 @@ pub fn derive_diff(
         }
     }
     Vec::new()
+}
+
+/// Derive a [`MutationDiff::ModuleAttr`] for a decorator-removal mutant.
+///
+/// Searches the original AST for a top-level `FunctionDef` or `ClassDef` whose
+/// byte range contains the mutant's byte offset (decorator lines are included in
+/// the node's range), then slices the mutated source to produce the post-removal
+/// statement body and wraps it in [`MutationDiff::ModuleAttr`].
+///
+/// Returns `None` if no matching top-level statement is found.
+#[allow(
+    clippy::string_slice,
+    reason = "byte offsets originate from the AST and are always valid UTF-8 boundaries"
+)]
+fn derive_decorator_removal(
+    mutant: &Mutant,
+    original_ast: &ModModule,
+    mutated_source: &str,
+) -> Option<MutationDiff> {
+    for stmt in &original_ast.body {
+        let range = stmt.range();
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        if !(start <= mutant.byte_offset && mutant.byte_offset < end) {
+            continue;
+        }
+        let name = match stmt {
+            Stmt::FunctionDef(f) => f.name.id.to_string(),
+            Stmt::ClassDef(c) => c.name.id.to_string(),
+            _ => continue,
+        };
+        let stmt_end_in_mutated = mutated_stmt_end(end, mutant);
+        let new_source = strip_decorators(
+            mutated_source.get(start..stmt_end_in_mutated).unwrap_or(""),
+        );
+        return Some(MutationDiff::ModuleAttr { name, new_source });
+    }
+    None
 }
 
 /// Recursively descend into a function definition to find the innermost function
@@ -444,6 +487,36 @@ mod tests {
                 assert!(new_source.starts_with("def inner"));
             }
             other => panic!("expected FunctionBody for outer.inner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decorator_removal_yields_module_attr_variant() {
+        let original_src = "@cache\ndef foo():\n    return 1\n";
+        let mutated_src  = "def foo():\n    return 1\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let mutant = Mutant {
+            file_path: "decor.py".into(),
+            line: 1,
+            column: 1,
+            byte_offset: 0,
+            byte_length: "@cache\n".len(),
+            original_text: "@cache\n".into(),
+            mutated_text: String::new(),
+            mutator_name: "remove_decorator".to_owned(),
+        };
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ModuleAttr { name, new_source } => {
+                assert_eq!(name, "foo");
+                assert!(new_source.contains("def foo"));
+                assert!(!new_source.contains("@cache"));
+            }
+            other => panic!("expected ModuleAttr, got {other:?}"),
         }
     }
 
