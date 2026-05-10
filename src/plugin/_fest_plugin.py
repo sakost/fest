@@ -193,7 +193,8 @@ def _unwrap_descriptor(descriptor: Any, suffix: str) -> Any:
             return descriptor.fset
         if suffix == "fdel":
             return descriptor.fdel
-        return descriptor.fget
+        # Empty or unknown suffix on a property — caller raises a clearer error.
+        return None
     if isinstance(descriptor, types.FunctionType):
         return descriptor
     return None
@@ -238,6 +239,18 @@ class MutationApplier:
         old_kwdefaults = target_func.__kwdefaults__
         old_annotations = dict(target_func.__annotations__)
         old_func_dict = dict(target_func.__dict__)
+        # Record undo BEFORE any destructive op. Restore is idempotent so a
+        # later ValueError from __code__ assignment leaves the function
+        # unchanged and the recorded undo a no-op.
+        journal.append(
+            _restore_function,
+            target_func,
+            old_code,
+            old_defaults,
+            old_kwdefaults,
+            old_annotations,
+            old_func_dict,
+        )
         try:
             target_func.__code__ = new_func.__code__
         except ValueError:
@@ -248,15 +261,6 @@ class MutationApplier:
         target_func.__annotations__ = dict(new_func.__annotations__)
         target_func.__dict__.clear()
         target_func.__dict__.update(new_func.__dict__)
-        journal.append(
-            _restore_function,
-            target_func,
-            old_code,
-            old_defaults,
-            old_kwdefaults,
-            old_annotations,
-            old_func_dict,
-        )
 
     def _apply_nested_function_body(
         self, qualname: str, new_source: str, journal: PatchJournal,
@@ -334,12 +338,9 @@ class MutationApplier:
         old_kwdefaults = target_func.__kwdefaults__
         old_annotations = dict(target_func.__annotations__)
         old_func_dict = dict(target_func.__dict__)
-        target_func.__code__ = new_func.__code__
-        target_func.__defaults__ = new_func.__defaults__
-        target_func.__kwdefaults__ = new_func.__kwdefaults__
-        target_func.__annotations__ = dict(new_func.__annotations__)
-        target_func.__dict__.clear()
-        target_func.__dict__.update(new_func.__dict__)
+        # Record undo BEFORE any destructive op. Restore is idempotent so a
+        # later exception mid-flight leaves the function unchanged and the
+        # recorded undo a no-op.
         journal.append(
             _restore_function,
             target_func,
@@ -349,6 +350,12 @@ class MutationApplier:
             old_annotations,
             old_func_dict,
         )
+        target_func.__code__ = new_func.__code__
+        target_func.__defaults__ = new_func.__defaults__
+        target_func.__kwdefaults__ = new_func.__kwdefaults__
+        target_func.__annotations__ = dict(new_func.__annotations__)
+        target_func.__dict__.clear()
+        target_func.__dict__.update(new_func.__dict__)
 
     def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
         cls = self._resolve_qualname(change["class_qualname"])
