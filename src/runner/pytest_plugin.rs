@@ -163,10 +163,14 @@ impl PersistentWorker {
     /// Spawn a new persistent pytest worker.
     ///
     /// Prepares the temp environment, spawns pytest, accepts the
-    /// connection, and reads the READY message.
+    /// connection, and reads the READY message.  After receiving READY,
+    /// sends a `ready_ack` message carrying the project plugin index.
     ///
     /// `startup_timeout` bounds the time allowed for pytest to start and
     /// collect tests (much longer than per-mutant timeout for large suites).
+    ///
+    /// `index` is the project-level [`crate::plugin_index::PluginIndex`]
+    /// sent to the plugin as the `ready_ack` payload.
     ///
     /// # Errors
     ///
@@ -174,6 +178,7 @@ impl PersistentWorker {
     async fn spawn(
         startup_timeout: Duration,
         project_dir: &std::path::Path,
+        index: Arc<crate::plugin_index::PluginIndex>,
     ) -> Result<Self, Error> {
         let env = prepare_worker_env()?;
 
@@ -205,6 +210,7 @@ impl PersistentWorker {
         let stream = accept_or_child_exit(&mut child, env.listener, startup_timeout).await?;
         let (reader, writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
+        let mut writer = writer;
 
         // Read READY message.
         let ready_msg = read_message(&mut buf_reader).await?;
@@ -214,6 +220,10 @@ impl PersistentWorker {
                 "expected 'ready' message from worker, got '{ready_type}'"
             )));
         }
+
+        // Send ready_ack with the project index.
+        let ack = build_ready_ack_message(&index);
+        write_message(&mut writer, &ack).await?;
 
         Ok(Self {
             _temp_dir: env.temp_dir,
@@ -377,6 +387,10 @@ pub struct PytestPluginRunner {
 
     /// Project directory, set during `start()` for oneshot fallback.
     project_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+
+    /// Project plugin index, computed during `start()` and sent to each
+    /// worker as the `ready_ack` handshake payload.
+    project_index: std::sync::Mutex<Option<Arc<crate::plugin_index::PluginIndex>>>,
 }
 
 impl PytestPluginRunner {
@@ -388,6 +402,7 @@ impl PytestPluginRunner {
             timeout: Duration::from_secs(timeout_secs),
             pool: std::sync::Mutex::new(None),
             project_dir: std::sync::Mutex::new(None),
+            project_index: std::sync::Mutex::new(None),
         }
     }
 }
@@ -412,6 +427,16 @@ impl Runner for PytestPluginRunner {
             *dir_guard = Some(project_dir.to_path_buf());
         }
 
+        // Scan the project to build the plugin index sent to each worker.
+        let scanned = match crate::plugin_index::scan_project(project_dir) {
+            Ok(idx) => idx,
+            Err(_err) => crate::plugin_index::PluginIndex::default(),
+        };
+        let index_arc = Arc::new(scanned);
+        if let Ok(mut guard) = self.project_index.lock() {
+            *guard = Some(Arc::clone(&index_arc));
+        }
+
         // Use a much longer timeout for startup (pytest must collect all
         // tests before connecting). For large suites this can take tens
         // of seconds. When timeout is zero (tests), skip the floor.
@@ -423,10 +448,10 @@ impl Runner for PytestPluginRunner {
         for _idx in 0..num_workers {
             let worker_dir = dir.clone();
             let worker_timeout = startup_timeout;
-            let handle =
-                tokio::spawn(
-                    async move { PersistentWorker::spawn(worker_timeout, &worker_dir).await },
-                );
+            let worker_index = Arc::clone(&index_arc);
+            let handle = tokio::spawn(async move {
+                PersistentWorker::spawn(worker_timeout, &worker_dir, worker_index).await
+            });
             handles.push(handle);
         }
 
@@ -582,9 +607,10 @@ async fn run_oneshot(
     // tests), but the per-mutant timeout is used for the actual test run.
     let startup_timeout = compute_startup_timeout(timeout);
 
+    let default_index = Arc::new(crate::plugin_index::PluginIndex::default());
     let spawn_result = tokio::time::timeout(
         startup_timeout,
-        PersistentWorker::spawn(startup_timeout, project_dir),
+        PersistentWorker::spawn(startup_timeout, project_dir, default_index),
     )
     .await;
 
