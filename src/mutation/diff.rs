@@ -161,17 +161,7 @@ fn descend_function(
             continue;
         }
         if let Stmt::FunctionDef(nested) = inner_stmt {
-            if let Some(d) = descend_function(nested, mutated_source, mutant, &outer_qualname) {
-                return Some(d);
-            }
-            let stmt_end = mutated_stmt_end(end, mutant);
-            let new_source = strip_decorators(
-                mutated_source.get(start..stmt_end).unwrap_or(""),
-            );
-            return Some(MutationDiff::FunctionBody {
-                qualname: format!("{}.{}", outer_qualname, nested.name.id),
-                new_source,
-            });
+            return descend_function(nested, mutated_source, mutant, &outer_qualname);
         }
     }
     let range = func.range();
@@ -551,5 +541,55 @@ mod tests {
         let restored: MutationDiff = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, restored);
         assert!(json.contains("\"kind\":\"function_body\""));
+    }
+
+    #[test]
+    fn property_setter_yields_fset_suffix() {
+        let original_src = "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v + 1\n";
+        let mutated_src = "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v - 1\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let plus_offset = original_src.find("v + 1").unwrap() + 2;
+        let mutant = make_mutant("p.py", "+", "-", plus_offset);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ClassMethod { class_qualname, method_name, .. } => {
+                assert_eq!(class_qualname, "Foo");
+                assert_eq!(method_name, "x.fset");
+            }
+            other => panic!("expected ClassMethod with x.fset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_deleter_yields_fdel_suffix() {
+        let original_src = concat!(
+            "class Foo:\n",
+            "    @x.deleter\n",
+            "    def x(self):\n",
+            "        self._x = 1\n",
+        );
+        let mutated_src = concat!(
+            "class Foo:\n",
+            "    @x.deleter\n",
+            "    def x(self):\n",
+            "        self._x = 2\n",
+        );
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let offset = original_src.find("= 1").unwrap() + 2;
+        let mutant = make_mutant("p.py", "1", "2", offset);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ClassMethod { class_qualname, method_name, .. } => {
+                assert_eq!(class_qualname, "Foo");
+                assert_eq!(method_name, "x.fdel");
+            }
+            other => panic!("expected ClassMethod with x.fdel, got {other:?}"),
+        }
     }
 }
