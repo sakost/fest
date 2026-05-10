@@ -52,3 +52,33 @@ def test_function_body_preserves_identity_after_mutation(target_module):
 
     journal.rollback()
     assert target_module.foo(5) == 6
+
+
+def test_nested_function_body_via_co_consts(target_module):
+    src = (
+        "def outer():\n"
+        "    def inner():\n"
+        "        return 1\n"
+        "    return inner\n"
+    )
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    target_module.outer.__module__ = target_module.__name__
+    outer_id = id(target_module.outer)
+
+    idx = ReverseImportIndex()
+    applier = MutationApplier(target_module, idx)
+    journal = PatchJournal()
+
+    change = {
+        "kind": "function_body",
+        "qualname": "outer.inner",
+        "new_source": "def inner():\n    return 2\n",
+    }
+    applier.apply(change, journal)
+
+    inner = target_module.outer()
+    assert inner() == 2
+    assert id(target_module.outer) == outer_id
+
+    journal.rollback()
+    assert target_module.outer()() == 1

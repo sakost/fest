@@ -261,7 +261,26 @@ class MutationApplier:
     def _apply_nested_function_body(
         self, qualname: str, new_source: str, journal: PatchJournal,
     ) -> None:
-        raise NotImplementedError("nested — Task 6.3")
+        parent_qualname, leaf = qualname.rsplit(".", 1)
+        parent_obj = self._resolve_qualname(parent_qualname)
+        parent = _drill_to_function(parent_obj)
+        new_inner = self._compile_function(new_source, parent)
+        old_consts = parent.__code__.co_consts
+        replaced = False
+        new_consts: list[Any] = []
+        for c in old_consts:
+            if isinstance(c, types.CodeType) and c.co_name == leaf and not replaced:
+                new_consts.append(new_inner.__code__)
+                replaced = True
+            else:
+                new_consts.append(c)
+        if not replaced:
+            raise RuntimeError(
+                f"nested function {qualname!r}: no matching co_consts entry",
+            )
+        old_parent_code = parent.__code__
+        parent.__code__ = old_parent_code.replace(co_consts=tuple(new_consts))
+        journal.append(_restore_code, parent, old_parent_code)
 
     def _fallback_function_rebind(
         self, qualname: str, new_func: Any, journal: PatchJournal,
