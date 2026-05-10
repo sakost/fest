@@ -318,7 +318,37 @@ class MutationApplier:
             journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
     def _apply_class_method(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        raise NotImplementedError
+        cls = self._resolve_qualname(change["class_qualname"])
+        method_name = change["method_name"]
+        leaf, _, suffix = method_name.partition(".")
+        descriptor = cls.__dict__[leaf]
+        target_func = _unwrap_descriptor(descriptor, suffix)
+        if target_func is None:
+            raise RuntimeError(
+                f"class method {change['class_qualname']!r}.{method_name!r}: "
+                "no underlying function",
+            )
+        new_func = self._compile_function(change["new_source"], target_func)
+        old_code = target_func.__code__
+        old_defaults = target_func.__defaults__
+        old_kwdefaults = target_func.__kwdefaults__
+        old_annotations = dict(target_func.__annotations__)
+        old_func_dict = dict(target_func.__dict__)
+        target_func.__code__ = new_func.__code__
+        target_func.__defaults__ = new_func.__defaults__
+        target_func.__kwdefaults__ = new_func.__kwdefaults__
+        target_func.__annotations__ = dict(new_func.__annotations__)
+        target_func.__dict__.clear()
+        target_func.__dict__.update(new_func.__dict__)
+        journal.append(
+            _restore_function,
+            target_func,
+            old_code,
+            old_defaults,
+            old_kwdefaults,
+            old_annotations,
+            old_func_dict,
+        )
 
     def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
         raise NotImplementedError

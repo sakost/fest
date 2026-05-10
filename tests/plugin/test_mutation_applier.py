@@ -103,3 +103,96 @@ def test_constant_rebind_updates_target_and_consumer(target_module):
     journal.rollback()
     assert target_module.MAX == 100
     assert consumer["MAX"] == 100
+
+
+def test_class_method_plain_swap(target_module):
+    src = "class Calc:\n    def add(self, a, b):\n        return a + b\n"
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    Calc = target_module.Calc
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    applier.apply(
+        {
+            "kind": "class_method",
+            "class_qualname": "Calc",
+            "method_name": "add",
+            "new_source": "def add(self, a, b):\n    return a - b\n",
+        },
+        journal,
+    )
+
+    assert Calc().add(5, 3) == 2
+    journal.rollback()
+    assert Calc().add(5, 3) == 8
+
+
+def test_class_method_staticmethod_swap(target_module):
+    src = "class C:\n    @staticmethod\n    def k():\n        return 1\n"
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    C = target_module.C
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    applier.apply(
+        {
+            "kind": "class_method",
+            "class_qualname": "C",
+            "method_name": "k",
+            "new_source": "def k():\n    return 2\n",
+        },
+        journal,
+    )
+
+    assert C.k() == 2
+    journal.rollback()
+    assert C.k() == 1
+
+
+def test_class_method_classmethod_swap(target_module):
+    src = "class C:\n    @classmethod\n    def m(cls):\n        return 1\n"
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    C = target_module.C
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    applier.apply(
+        {
+            "kind": "class_method",
+            "class_qualname": "C",
+            "method_name": "m",
+            "new_source": "def m(cls):\n    return 2\n",
+        },
+        journal,
+    )
+
+    assert C.m() == 2
+    journal.rollback()
+    assert C.m() == 1
+
+
+def test_property_fget_mutation(target_module):
+    src = (
+        "class C:\n"
+        "    @property\n"
+        "    def x(self):\n"
+        "        return 1\n"
+    )
+    exec(compile(src, "<test>", "exec"), target_module.__dict__)
+    C = target_module.C
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    applier.apply(
+        {
+            "kind": "class_method",
+            "class_qualname": "C",
+            "method_name": "x.fget",
+            "new_source": "def x(self):\n    return 2\n",
+        },
+        journal,
+    )
+
+    assert C().x == 2
+    journal.rollback()
+    assert C().x == 1
