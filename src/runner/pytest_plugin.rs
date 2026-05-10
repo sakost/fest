@@ -258,7 +258,12 @@ impl PersistentWorker {
                 range: ruff_text_size::TextRange::default(),
                 body: Vec::new(),
             });
-        let diff = crate::mutation::diff::derive_diff(mutant, &original_ast, &mutated_ast, &mutated_source);
+        let diff = crate::mutation::diff::derive_diff(
+            mutant,
+            &original_ast,
+            &mutated_ast,
+            &mutated_source,
+        );
         let msg = build_mutant_message(mutant, &mutated_source, tests, &diff);
 
         let result = tokio::time::timeout(timeout, async {
@@ -439,14 +444,13 @@ impl Runner for PytestPluginRunner {
             Ok(idx) => idx,
             #[expect(
                 clippy::print_stderr,
-                reason = "operator-facing diagnostic for a degraded-mode \
-                          fallback; the project has no logging dep and \
-                          the error must not abort the run"
+                reason = "operator-facing diagnostic for a degraded-mode fallback; the project \
+                          has no logging dep and the error must not abort the run"
             )]
             Err(err) => {
                 eprintln!(
-                    "fest: scan_project failed at {}: {err}; \
-                     reverse-import index falling back to runtime layer only",
+                    "fest: scan_project failed at {}: {err}; reverse-import index falling back to \
+                     runtime layer only",
                     project_dir.display(),
                 );
                 crate::plugin_index::PluginIndex::default()
@@ -1655,15 +1659,18 @@ mod tests {
             "tests/test_calc.py::test_add".to_owned(),
             "tests/test_calc.py::test_double_add".to_owned(),
         ];
-        let result = runner.run_mutant(&mutant, &source, &tests).await
+        let result = runner
+            .run_mutant(&mutant, &source, &tests)
+            .await
             .expect("run_mutant");
 
         // The consumer test (`test_double_add` uses `from src.calc import add`)
         // must observe the mutation — status should be Killed, not Survived.
         assert_eq!(
-            result.status, MutantStatus::Killed,
-            "consumer didn't see the mutation; reverse-import index broken? \
-             actual status: {:?}", result.status,
+            result.status,
+            MutantStatus::Killed,
+            "consumer didn't see the mutation; reverse-import index broken? actual status: {:?}",
+            result.status,
         );
 
         runner.stop().await.expect("stop");

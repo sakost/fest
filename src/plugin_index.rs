@@ -43,7 +43,11 @@ pub struct PluginIndex {
 
 /// Parse a single source file and emit its [`PluginIndex`] contribution.
 #[must_use]
-pub fn scan_source(source: &str, consumer_module: &str, file_path: &std::path::Path) -> PluginIndex {
+pub fn scan_source(
+    source: &str,
+    consumer_module: &str,
+    file_path: &std::path::Path,
+) -> PluginIndex {
     let parsed = match parse_module(source) {
         Ok(p) => p,
         Err(_) => return PluginIndex::default(),
@@ -121,7 +125,11 @@ fn walk_stmt_for_calls(
         }
     }
 
-    let mut visitor = CallVisitor { source, file: file_path, out };
+    let mut visitor = CallVisitor {
+        source,
+        file: file_path,
+        out,
+    };
     walk_stmt(&mut visitor, stmt);
 }
 
@@ -162,7 +170,9 @@ fn resolve_import_from(
     level: u32,
 ) -> String {
     if level == 0 {
-        return explicit.as_ref().map_or(String::new(), |id| id.id.to_string());
+        return explicit
+            .as_ref()
+            .map_or(String::new(), |id| id.id.to_string());
     }
     let parts: Vec<&str> = consumer_module.split('.').collect();
     let drop = level as usize;
@@ -275,7 +285,11 @@ mod tests {
     fn scan_source_handles_multi_name_import() {
         let src = "from foo import a, b as c, d\n";
         let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
-        let keys: Vec<_> = index.import_bindings.iter().map(|b| b.consumer_key.clone()).collect();
+        let keys: Vec<_> = index
+            .import_bindings
+            .iter()
+            .map(|b| b.consumer_key.clone())
+            .collect();
         assert_eq!(keys, vec!["a", "c", "d"]);
     }
 
@@ -299,7 +313,12 @@ mod tests {
     fn scan_source_detects_dynamic_import_module() {
         let src = "import importlib\nimportlib.import_module('foo')\n";
         let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
-        assert!(index.reload_warnings.iter().any(|w| w.kind == "import_module"));
+        assert!(
+            index
+                .reload_warnings
+                .iter()
+                .any(|w| w.kind == "import_module")
+        );
     }
 
     #[test]

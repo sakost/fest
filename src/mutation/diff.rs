@@ -124,9 +124,8 @@ fn derive_decorator_removal(
             _ => continue,
         };
         let stmt_end_in_mutated = mutated_stmt_end(end, mutant);
-        let new_source = strip_decorators(
-            mutated_source.get(start..stmt_end_in_mutated).unwrap_or(""),
-        );
+        let new_source =
+            strip_decorators(mutated_source.get(start..stmt_end_in_mutated).unwrap_or(""));
         return Some(MutationDiff::ModuleAttr { name, new_source });
     }
     None
@@ -167,9 +166,7 @@ fn descend_function(
     let range = func.range();
     let stmt_start = range.start().to_usize();
     let stmt_end = mutated_stmt_end(range.end().to_usize(), mutant);
-    let new_source = strip_decorators(
-        mutated_source.get(stmt_start..stmt_end).unwrap_or(""),
-    );
+    let new_source = strip_decorators(mutated_source.get(stmt_start..stmt_end).unwrap_or(""));
     Some(MutationDiff::FunctionBody {
         qualname: outer_qualname,
         new_source,
@@ -224,9 +221,8 @@ fn derive_for_top_level(
                             format!("{}.{}", method.name.id, suffix)
                         };
                         let stmt_end = mutated_stmt_end(end, mutant);
-                        let new_source = strip_decorators(
-                            mutated_source.get(start..stmt_end).unwrap_or(""),
-                        );
+                        let new_source =
+                            strip_decorators(mutated_source.get(start..stmt_end).unwrap_or(""));
                         return Some(MutationDiff::ClassMethod {
                             class_qualname,
                             method_name,
@@ -243,10 +239,7 @@ fn derive_for_top_level(
                         let new_expr = mutated_source
                             .get(
                                 value_range.start().to_usize()
-                                    ..mutated_stmt_end(
-                                        value_range.end().to_usize(),
-                                        mutant,
-                                    ),
+                                    ..mutated_stmt_end(value_range.end().to_usize(), mutant),
                             )
                             .unwrap_or("")
                             .to_owned();
@@ -271,7 +264,9 @@ fn derive_for_top_level(
 /// than the original (e.g. decorator removal replaces `@cache\n` with `""`).
 fn mutated_stmt_end(original_end: usize, mutant: &Mutant) -> usize {
     let delta = mutant.mutated_text.len() as isize - mutant.byte_length as isize;
-    original_end.checked_add_signed(delta).unwrap_or(original_end)
+    original_end
+        .checked_add_signed(delta)
+        .unwrap_or(original_end)
 }
 
 /// Return the property accessor suffix for a method decorated with `@property`,
@@ -357,7 +352,10 @@ mod tests {
 
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::FunctionBody { qualname, new_source } => {
+            MutationDiff::FunctionBody {
+                qualname,
+                new_source,
+            } => {
                 assert_eq!(qualname, "add");
                 assert!(new_source.starts_with("def add"));
                 assert!(new_source.contains("return a - b"));
@@ -417,7 +415,7 @@ mod tests {
     #[test]
     fn class_method_body_yields_class_method_variant() {
         let original_src = "class Calc:\n    def add(self, a, b):\n        return a + b\n";
-        let mutated_src  = "class Calc:\n    def add(self, a, b):\n        return a - b\n";
+        let mutated_src = "class Calc:\n    def add(self, a, b):\n        return a - b\n";
         let original_ast = parse(original_src);
         let mutated_ast = parse(mutated_src);
         let plus_offset = original_src.find('+').unwrap();
@@ -427,7 +425,11 @@ mod tests {
 
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::ClassMethod { class_qualname, method_name, new_source } => {
+            MutationDiff::ClassMethod {
+                class_qualname,
+                method_name,
+                new_source,
+            } => {
                 assert_eq!(class_qualname, "Calc");
                 assert_eq!(method_name, "add");
                 assert!(new_source.contains("return a - b"));
@@ -439,7 +441,7 @@ mod tests {
     #[test]
     fn class_attr_yields_class_attr_variant() {
         let original_src = "class Cfg:\n    LIMIT = 10\n";
-        let mutated_src  = "class Cfg:\n    LIMIT = 11\n";
+        let mutated_src = "class Cfg:\n    LIMIT = 11\n";
         let original_ast = parse(original_src);
         let mutated_ast = parse(mutated_src);
         let offset = original_src.find("10").unwrap();
@@ -449,7 +451,11 @@ mod tests {
 
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::ClassAttr { class_qualname, name, new_expr } => {
+            MutationDiff::ClassAttr {
+                class_qualname,
+                name,
+                new_expr,
+            } => {
                 assert_eq!(class_qualname, "Cfg");
                 assert_eq!(name, "LIMIT");
                 assert_eq!(new_expr.trim(), "11");
@@ -461,7 +467,7 @@ mod tests {
     #[test]
     fn nested_function_yields_dotted_qualname() {
         let original_src = "def outer():\n    def inner():\n        return 1\n    return inner\n";
-        let mutated_src  = "def outer():\n    def inner():\n        return 2\n    return inner\n";
+        let mutated_src = "def outer():\n    def inner():\n        return 2\n    return inner\n";
         let original_ast = parse(original_src);
         let mutated_ast = parse(mutated_src);
         let offset = original_src.find("1\n").unwrap();
@@ -471,7 +477,10 @@ mod tests {
 
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::FunctionBody { qualname, new_source } => {
+            MutationDiff::FunctionBody {
+                qualname,
+                new_source,
+            } => {
                 assert_eq!(qualname, "outer.inner");
                 assert!(new_source.contains("return 2"));
                 assert!(new_source.starts_with("def inner"));
@@ -483,7 +492,7 @@ mod tests {
     #[test]
     fn decorator_removal_yields_module_attr_variant() {
         let original_src = "@cache\ndef foo():\n    return 1\n";
-        let mutated_src  = "def foo():\n    return 1\n";
+        let mutated_src = "def foo():\n    return 1\n";
         let original_ast = parse(original_src);
         let mutated_ast = parse(mutated_src);
         let mutant = Mutant {
@@ -528,7 +537,12 @@ mod tests {
             mutator_name: "remove_decorator".to_owned(),
         };
         // Must not panic.
-        drop(derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src));
+        drop(derive_diff(
+            &mutant,
+            &original_ast,
+            &mutated_ast,
+            mutated_src,
+        ));
     }
 
     #[test]
@@ -545,8 +559,10 @@ mod tests {
 
     #[test]
     fn property_setter_yields_fset_suffix() {
-        let original_src = "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v + 1\n";
-        let mutated_src = "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v - 1\n";
+        let original_src =
+            "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v + 1\n";
+        let mutated_src =
+            "class Foo:\n    @x.setter\n    def x(self, v):\n        self._x = v - 1\n";
         let original_ast = parse(original_src);
         let mutated_ast = parse(mutated_src);
         let plus_offset = original_src.find("v + 1").unwrap() + 2;
@@ -555,7 +571,11 @@ mod tests {
         let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::ClassMethod { class_qualname, method_name, .. } => {
+            MutationDiff::ClassMethod {
+                class_qualname,
+                method_name,
+                ..
+            } => {
                 assert_eq!(class_qualname, "Foo");
                 assert_eq!(method_name, "x.fset");
             }
@@ -585,7 +605,11 @@ mod tests {
         let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
         assert_eq!(diffs.len(), 1);
         match &diffs[0] {
-            MutationDiff::ClassMethod { class_qualname, method_name, .. } => {
+            MutationDiff::ClassMethod {
+                class_qualname,
+                method_name,
+                ..
+            } => {
                 assert_eq!(class_qualname, "Foo");
                 assert_eq!(method_name, "x.fdel");
             }
