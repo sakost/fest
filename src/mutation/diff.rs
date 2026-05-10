@@ -116,6 +116,22 @@ fn derive_for_top_level(
                 new_source,
             })
         }
+        Stmt::Assign(assign) => {
+            let target = assign.targets.first()?;
+            let name = match target {
+                ruff_python_ast::Expr::Name(n) => n.id.to_string(),
+                _ => return None,
+            };
+            let value_range = assign.value.range();
+            let new_expr = mutated_source
+                .get(
+                    value_range.start().to_usize()
+                        ..mutated_stmt_end(value_range.end().to_usize(), mutant),
+                )
+                .unwrap_or("")
+                .to_owned();
+            Some(MutationDiff::ConstantBind { name, new_expr })
+        }
         _ => None,
     }
 }
@@ -192,6 +208,54 @@ mod tests {
                 assert!(new_source.contains("return a - b"));
             }
             other => panic!("expected FunctionBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_level_constant_yields_constant_bind_variant() {
+        let original_src = "MAX = 100\n";
+        let mutated_src = "MAX = 101\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let mutant = make_mutant("config.py", "100", "101", 6);
+
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ConstantBind { name, new_expr } => {
+                assert_eq!(name, "MAX");
+                assert_eq!(new_expr.trim(), "101");
+            }
+            other => panic!("expected ConstantBind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constant_bind_handles_shrinking_mutation() {
+        // "100" -> "1" — shrinks by 2 bytes.
+        let original_src = "MAX = 100\n";
+        let mutated_src = "MAX = 1\n";
+        let original_ast = parse(original_src);
+        let mutated_ast = parse(mutated_src);
+        let mutant = Mutant {
+            file_path: "config.py".into(),
+            line: 1,
+            column: 1,
+            byte_offset: 6,
+            byte_length: 3,
+            original_text: "100".to_owned(),
+            mutated_text: "1".to_owned(),
+            mutator_name: "test".to_owned(),
+        };
+        let diffs = derive_diff(&mutant, &original_ast, &mutated_ast, mutated_src);
+        assert_eq!(diffs.len(), 1);
+        match &diffs[0] {
+            MutationDiff::ConstantBind { name, new_expr } => {
+                assert_eq!(name, "MAX");
+                assert_eq!(new_expr.trim(), "1");
+            }
+            other => panic!("expected ConstantBind, got {other:?}"),
         }
     }
 
