@@ -255,3 +255,29 @@ def test_module_attr_rebind_runs_def_block(target_module):
     journal.rollback()
     assert target_module.foo() == 1
     assert consumer["foo"]() == 1
+
+
+def test_journal_restores_first_change_when_second_apply_raises(target_module):
+    target_module.MAX = 100
+    consumer = {"MAX": 100}
+    idx = ReverseImportIndex()
+    idx.add(target_module.__name__, "MAX", consumer, "MAX")
+
+    applier = MutationApplier(target_module, idx)
+    journal = PatchJournal()
+
+    applier.apply(
+        {"kind": "constant_bind", "name": "MAX", "new_expr": "101"},
+        journal,
+    )
+    assert target_module.MAX == 101
+
+    with pytest.raises(SyntaxError):
+        applier.apply(
+            {"kind": "constant_bind", "name": "MAX", "new_expr": "(("},
+            journal,
+        )
+
+    journal.rollback()
+    assert target_module.MAX == 100
+    assert consumer["MAX"] == 100
