@@ -407,6 +407,48 @@ class MutationApplier:
         raise RuntimeError(f"compiled source produced no function: {new_source!r}")
 
 
+class _ThreadCleanupRegistry:
+    """LIFO registry of cleanup callbacks invoked between mutants."""
+
+    def __init__(self) -> None:
+        self._callbacks: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def register(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Register a callback to be invoked once at the next mutant boundary."""
+        self._callbacks.append((fn, args, kwargs))
+
+    def run_all(self) -> list[BaseException]:
+        """Pop and invoke each callback in LIFO order; return collected errors."""
+        errors: list[BaseException] = []
+        while self._callbacks:
+            fn, args, kwargs = self._callbacks.pop()
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        return errors
+
+
+_GLOBAL_THREAD_CLEANUP = _ThreadCleanupRegistry()
+
+
+@pytest.fixture
+def fest_thread_cleanup():
+    """Register cleanup callbacks invoked between mutants.
+
+    Usage::
+
+        def test_with_workers(fest_thread_cleanup):
+            pool = ThreadPoolExecutor(max_workers=4)
+            fest_thread_cleanup(pool.shutdown, wait=True)
+            ...  # use pool here
+    """
+    def register(fn, *args, **kwargs):
+        _GLOBAL_THREAD_CLEANUP.register(fn, *args, **kwargs)
+
+    yield register
+
+
 def pytest_addoption(parser: Any) -> None:
     """Register the ``--fest-socket`` CLI option."""
     parser.addoption(
