@@ -236,7 +236,20 @@ impl PersistentWorker {
         timeout: Duration,
     ) -> Result<MutantStatus, Error> {
         let mutated_source = mutant.apply_to_source(source);
-        let msg = build_mutant_message(mutant, &mutated_source, tests);
+        let original_ast = ruff_python_parser::parse_module(source)
+            .map(|p| p.into_syntax())
+            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+                range: ruff_text_size::TextRange::default(),
+                body: Vec::new(),
+            });
+        let mutated_ast = ruff_python_parser::parse_module(&mutated_source)
+            .map(|p| p.into_syntax())
+            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+                range: ruff_text_size::TextRange::default(),
+                body: Vec::new(),
+            });
+        let diff = crate::mutation::diff::derive_diff(mutant, &original_ast, &mutated_ast, &mutated_source);
+        let msg = build_mutant_message(mutant, &mutated_source, tests, &diff);
 
         let result = tokio::time::timeout(timeout, async {
             write_message(&mut self.writer, &msg).await?;
@@ -780,13 +793,19 @@ fn extract_type(msg: &str) -> Result<String, Error> {
 }
 
 /// Build the JSON `MUTANT` message to send to the plugin.
-fn build_mutant_message(mutant: &Mutant, mutated_source: &str, tests: &[String]) -> String {
+fn build_mutant_message(
+    mutant: &Mutant,
+    mutated_source: &str,
+    tests: &[String],
+    diff: &[crate::mutation::MutationDiff],
+) -> String {
     let file_path_str = mutant.file_path.display().to_string();
     let msg = serde_json::json!({
         "type": "mutant",
         "file": file_path_str,
         "module": file_to_module(&file_path_str),
         "mutated_source": mutated_source,
+        "diff": diff,
         "tests": tests,
     });
     msg.to_string()
@@ -1053,7 +1072,7 @@ mod tests {
         let mutated = "x = a - b";
         let tests = vec!["test_calc.py::test_add".to_owned()];
 
-        let msg = build_mutant_message(&mutant, mutated, &tests);
+        let msg = build_mutant_message(&mutant, mutated, &tests, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap_or_else(|err| {
             #[allow(clippy::panic, reason = "test assertion")]
             {
@@ -1089,7 +1108,7 @@ mod tests {
             "test_b.py::test_two".to_owned(),
         ];
 
-        let msg = build_mutant_message(&mutant, "x = a - b", &tests);
+        let msg = build_mutant_message(&mutant, "x = a - b", &tests, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap_or_else(|err| {
             #[allow(clippy::panic, reason = "test assertion")]
             {
@@ -1435,7 +1454,7 @@ mod tests {
 
         // Send MUTANT.
         let mutant = make_test_mutant();
-        let msg = build_mutant_message(&mutant, "x = a - b", &["test.py::test_x".to_owned()]);
+        let msg = build_mutant_message(&mutant, "x = a - b", &["test.py::test_x".to_owned()], &[]);
         write_message(&mut writer, &msg)
             .await
             .unwrap_or_else(|err| {
@@ -1477,6 +1496,35 @@ mod tests {
                 panic!("mock should finish: {err}");
             }
         });
+    }
+
+    /// `build_mutant_message` includes the diff array.
+    #[test]
+    fn build_mutant_message_includes_diff_field() {
+        let mutant = Mutant {
+            file_path: "calc.py".into(),
+            line: 1,
+            column: 1,
+            byte_offset: 0,
+            byte_length: 1,
+            original_text: "+".into(),
+            mutated_text: "-".into(),
+            mutator_name: "arithmetic".to_owned(),
+        };
+        let diff = vec![crate::mutation::MutationDiff::FunctionBody {
+            qualname: "add".into(),
+            new_source: "def add(a, b):\n    return a - b\n".into(),
+        }];
+        let msg = build_mutant_message(
+            &mutant,
+            "def add(a, b):\n    return a - b\n",
+            &["t1".to_owned()],
+            &diff,
+        );
+        let value: serde_json::Value = serde_json::from_str(&msg).expect("json");
+        assert_eq!(value["type"], "mutant");
+        assert!(value["diff"].is_array());
+        assert_eq!(value["diff"][0]["kind"], "function_body");
     }
 
     /// `WorkerPool` borrow/return cycle works correctly.
