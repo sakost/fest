@@ -64,6 +64,65 @@ class PatchJournal:
         return errors
 
 
+class ReverseImportIndex:
+    """Maps `(target_module, name)` to consumer dict slots that bound it.
+
+    Built once after pytest collection — runtime layer scans
+    ``sys.modules`` and the AST layer is ingested via
+    :py:meth:`ingest_ast_layer` from the Rust handshake.
+    """
+
+    def __init__(self) -> None:
+        self._index: dict[tuple[str, str], list[tuple[dict[str, Any], str]]] = {}
+
+    def lookup(
+        self, target_module: str, name: str
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Return all consumer (dict, key) pairs that bound `target_module.name`."""
+        return list(self._index.get((target_module, name), ()))
+
+    def add(
+        self,
+        target_module: str,
+        name: str,
+        consumer_dict: dict[str, Any],
+        key: str,
+    ) -> None:
+        """Record a single binding."""
+        self._index.setdefault((target_module, name), []).append((consumer_dict, key))
+
+    @classmethod
+    def build_runtime_layer(cls) -> "ReverseImportIndex":
+        """Build the index by walking sys.modules at startup time."""
+        idx = cls()
+        for mod_name, mod in list(sys.modules.items()):
+            mod_dict = getattr(mod, "__dict__", None)
+            if mod_dict is None:
+                continue
+            for key, value in list(mod_dict.items()):
+                src_mod = getattr(value, "__module__", None)
+                src_name = (
+                    getattr(value, "__qualname__", None)
+                    or getattr(value, "__name__", None)
+                )
+                if not src_mod or not src_name or src_mod == mod_name:
+                    continue
+                idx.add(src_mod, src_name, mod_dict, key)
+        return idx
+
+    def ingest_ast_layer(self, bindings: list[dict[str, str]]) -> None:
+        """Add bindings produced by the Rust-side project AST scan."""
+        for entry in bindings:
+            consumer_mod_name = entry.get("consumer_module", "")
+            consumer_key = entry.get("consumer_key", "")
+            target_mod = entry.get("target_module", "")
+            target_name = entry.get("target_name", "")
+            consumer_mod = sys.modules.get(consumer_mod_name)
+            if consumer_mod is None:
+                continue
+            self.add(target_mod, target_name, consumer_mod.__dict__, consumer_key)
+
+
 def pytest_addoption(parser: Any) -> None:
     """Register the ``--fest-socket`` CLI option."""
     parser.addoption(
