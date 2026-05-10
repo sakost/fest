@@ -564,6 +564,26 @@ def _check_pytest_version() -> None:
         )
 
 
+_THREAD_WARNED = False
+
+
+def _emit_thread_warning_if_needed() -> None:
+    """Print a one-time warning if multiple threads are alive at mutant boundary."""
+    global _THREAD_WARNED
+    if _THREAD_WARNED:
+        return
+    import threading
+    if threading.active_count() > 1:
+        _THREAD_WARNED = True
+        print(
+            f"fest: detected {threading.active_count()} active threads at "
+            "mutant boundary; tests using threads must clean them up in "
+            "teardown for accurate plugin-backend results, or use "
+            "--backend=subprocess.",
+            file=sys.stderr,
+        )
+
+
 def _handle_mutant(
     session: Any,
     msg: dict[str, Any],
@@ -588,6 +608,11 @@ def _handle_mutant(
         target_module = types.ModuleType(module_name)
         target_module.__file__ = file_path
         sys.modules[module_name] = target_module
+
+    _emit_thread_warning_if_needed()
+    cleanup_errors = _GLOBAL_THREAD_CLEANUP.run_all()
+    for err in cleanup_errors:
+        print(f"fest: thread cleanup callback failed: {err}", file=sys.stderr)
 
     journal = PatchJournal()
     applier = MutationApplier(target_module, rev_index)
