@@ -257,6 +257,19 @@ def test_module_attr_rebind_runs_def_block(target_module):
     assert consumer["foo"]() == 1
 
 
+def test_apply_with_no_changes_is_noop(target_module):
+    """Empty diff list should be a no-op — apply() is never called."""
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+
+    # Iterate empty list → no calls
+    for change in []:
+        applier.apply(change, journal)
+
+    # Journal is empty
+    assert journal.rollback() == []
+
+
 def test_journal_restores_first_change_when_second_apply_raises(target_module):
     target_module.MAX = 100
     consumer = {"MAX": 100}

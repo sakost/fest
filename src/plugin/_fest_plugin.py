@@ -283,8 +283,8 @@ class MutationApplier:
                 f"nested function {qualname!r}: no matching co_consts entry",
             )
         old_parent_code = parent.__code__
-        parent.__code__ = old_parent_code.replace(co_consts=tuple(new_consts))
         journal.append(_restore_code, parent, old_parent_code)
+        parent.__code__ = old_parent_code.replace(co_consts=tuple(new_consts))
 
     def _fallback_function_rebind(
         self, qualname: str, new_func: Any, journal: PatchJournal,
@@ -432,7 +432,7 @@ class _ThreadCleanupRegistry:
 _GLOBAL_THREAD_CLEANUP = _ThreadCleanupRegistry()
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def fest_thread_cleanup():
     """Register cleanup callbacks invoked between mutants.
 
@@ -613,6 +613,13 @@ def _handle_mutant(
     cleanup_errors = _GLOBAL_THREAD_CLEANUP.run_all()
     for err in cleanup_errors:
         print(f"fest: thread cleanup callback failed: {err}", file=sys.stderr)
+
+    if not diff:
+        return {
+            "type": "result",
+            "status": "error",
+            "error_message": "no diff entries — mutation kind unsupported by IR derivation",
+        }
 
     journal = PatchJournal()
     applier = MutationApplier(target_module, rev_index)
