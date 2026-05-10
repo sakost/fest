@@ -163,10 +163,14 @@ impl PersistentWorker {
     /// Spawn a new persistent pytest worker.
     ///
     /// Prepares the temp environment, spawns pytest, accepts the
-    /// connection, and reads the READY message.
+    /// connection, and reads the READY message.  After receiving READY,
+    /// sends a `ready_ack` message carrying the project plugin index.
     ///
     /// `startup_timeout` bounds the time allowed for pytest to start and
     /// collect tests (much longer than per-mutant timeout for large suites).
+    ///
+    /// `index` is the project-level [`crate::plugin_index::PluginIndex`]
+    /// sent to the plugin as the `ready_ack` payload.
     ///
     /// # Errors
     ///
@@ -174,6 +178,7 @@ impl PersistentWorker {
     async fn spawn(
         startup_timeout: Duration,
         project_dir: &std::path::Path,
+        index: Arc<crate::plugin_index::PluginIndex>,
     ) -> Result<Self, Error> {
         let env = prepare_worker_env()?;
 
@@ -205,6 +210,7 @@ impl PersistentWorker {
         let stream = accept_or_child_exit(&mut child, env.listener, startup_timeout).await?;
         let (reader, writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
+        let mut writer = writer;
 
         // Read READY message.
         let ready_msg = read_message(&mut buf_reader).await?;
@@ -214,6 +220,10 @@ impl PersistentWorker {
                 "expected 'ready' message from worker, got '{ready_type}'"
             )));
         }
+
+        // Send ready_ack with the project index.
+        let ack = build_ready_ack_message(&index);
+        write_message(&mut writer, &ack).await?;
 
         Ok(Self {
             _temp_dir: env.temp_dir,
@@ -236,7 +246,25 @@ impl PersistentWorker {
         timeout: Duration,
     ) -> Result<MutantStatus, Error> {
         let mutated_source = mutant.apply_to_source(source);
-        let msg = build_mutant_message(mutant, &mutated_source, tests);
+        let original_ast = ruff_python_parser::parse_module(source)
+            .map(|p| p.into_syntax())
+            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+                range: ruff_text_size::TextRange::default(),
+                body: Vec::new(),
+            });
+        let mutated_ast = ruff_python_parser::parse_module(&mutated_source)
+            .map(|p| p.into_syntax())
+            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+                range: ruff_text_size::TextRange::default(),
+                body: Vec::new(),
+            });
+        let diff = crate::mutation::diff::derive_diff(
+            mutant,
+            &original_ast,
+            &mutated_ast,
+            &mutated_source,
+        );
+        let msg = build_mutant_message(mutant, &mutated_source, tests, &diff);
 
         let result = tokio::time::timeout(timeout, async {
             write_message(&mut self.writer, &msg).await?;
@@ -364,6 +392,10 @@ pub struct PytestPluginRunner {
 
     /// Project directory, set during `start()` for oneshot fallback.
     project_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+
+    /// Project plugin index, computed during `start()` and sent to each
+    /// worker as the `ready_ack` handshake payload.
+    project_index: std::sync::Mutex<Option<Arc<crate::plugin_index::PluginIndex>>>,
 }
 
 impl PytestPluginRunner {
@@ -375,6 +407,7 @@ impl PytestPluginRunner {
             timeout: Duration::from_secs(timeout_secs),
             pool: std::sync::Mutex::new(None),
             project_dir: std::sync::Mutex::new(None),
+            project_index: std::sync::Mutex::new(None),
         }
     }
 }
@@ -399,6 +432,35 @@ impl Runner for PytestPluginRunner {
             *dir_guard = Some(project_dir.to_path_buf());
         }
 
+        // Scan the project to build the plugin index sent to each worker.
+        // On failure, fall back to an empty index — the plugin's runtime
+        // layer (sys.modules walk) still provides partial coverage, but
+        // raw module-level constants imported via `from X import C` will
+        // not be rebound in consumers. Surface the error to stderr so
+        // operators can diagnose misconfigured project_dir or permission
+        // issues; do not abort because partial accuracy is better than
+        // a hard failure here.
+        let scanned = match crate::plugin_index::scan_project(project_dir) {
+            Ok(idx) => idx,
+            #[expect(
+                clippy::print_stderr,
+                reason = "operator-facing diagnostic for a degraded-mode fallback; the project \
+                          has no logging dep and the error must not abort the run"
+            )]
+            Err(err) => {
+                eprintln!(
+                    "fest: scan_project failed at {}: {err}; reverse-import index falling back to \
+                     runtime layer only",
+                    project_dir.display(),
+                );
+                crate::plugin_index::PluginIndex::default()
+            }
+        };
+        let index_arc = Arc::new(scanned);
+        if let Ok(mut guard) = self.project_index.lock() {
+            *guard = Some(Arc::clone(&index_arc));
+        }
+
         // Use a much longer timeout for startup (pytest must collect all
         // tests before connecting). For large suites this can take tens
         // of seconds. When timeout is zero (tests), skip the floor.
@@ -410,10 +472,10 @@ impl Runner for PytestPluginRunner {
         for _idx in 0..num_workers {
             let worker_dir = dir.clone();
             let worker_timeout = startup_timeout;
-            let handle =
-                tokio::spawn(
-                    async move { PersistentWorker::spawn(worker_timeout, &worker_dir).await },
-                );
+            let worker_index = Arc::clone(&index_arc);
+            let handle = tokio::spawn(async move {
+                PersistentWorker::spawn(worker_timeout, &worker_dir, worker_index).await
+            });
             handles.push(handle);
         }
 
@@ -569,9 +631,10 @@ async fn run_oneshot(
     // tests), but the per-mutant timeout is used for the actual test run.
     let startup_timeout = compute_startup_timeout(timeout);
 
+    let default_index = Arc::new(crate::plugin_index::PluginIndex::default());
     let spawn_result = tokio::time::timeout(
         startup_timeout,
-        PersistentWorker::spawn(startup_timeout, project_dir),
+        PersistentWorker::spawn(startup_timeout, project_dir, default_index),
     )
     .await;
 
@@ -780,14 +843,31 @@ fn extract_type(msg: &str) -> Result<String, Error> {
 }
 
 /// Build the JSON `MUTANT` message to send to the plugin.
-fn build_mutant_message(mutant: &Mutant, mutated_source: &str, tests: &[String]) -> String {
+fn build_mutant_message(
+    mutant: &Mutant,
+    mutated_source: &str,
+    tests: &[String],
+    diff: &[crate::mutation::MutationDiff],
+) -> String {
     let file_path_str = mutant.file_path.display().to_string();
     let msg = serde_json::json!({
         "type": "mutant",
         "file": file_path_str,
         "module": file_to_module(&file_path_str),
         "mutated_source": mutated_source,
+        "diff": diff,
         "tests": tests,
+    });
+    msg.to_string()
+}
+
+/// Build the JSON `ready_ack` message sent to the plugin in response
+/// to its `ready` message.
+fn build_ready_ack_message(index: &crate::plugin_index::PluginIndex) -> String {
+    let msg = serde_json::json!({
+        "type": "ready_ack",
+        "import_bindings": index.import_bindings,
+        "reload_warnings": index.reload_warnings,
     });
     msg.to_string()
 }
@@ -1053,7 +1133,7 @@ mod tests {
         let mutated = "x = a - b";
         let tests = vec!["test_calc.py::test_add".to_owned()];
 
-        let msg = build_mutant_message(&mutant, mutated, &tests);
+        let msg = build_mutant_message(&mutant, mutated, &tests, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap_or_else(|err| {
             #[allow(clippy::panic, reason = "test assertion")]
             {
@@ -1089,7 +1169,7 @@ mod tests {
             "test_b.py::test_two".to_owned(),
         ];
 
-        let msg = build_mutant_message(&mutant, "x = a - b", &tests);
+        let msg = build_mutant_message(&mutant, "x = a - b", &tests, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap_or_else(|err| {
             #[allow(clippy::panic, reason = "test assertion")]
             {
@@ -1435,7 +1515,7 @@ mod tests {
 
         // Send MUTANT.
         let mutant = make_test_mutant();
-        let msg = build_mutant_message(&mutant, "x = a - b", &["test.py::test_x".to_owned()]);
+        let msg = build_mutant_message(&mutant, "x = a - b", &["test.py::test_x".to_owned()], &[]);
         write_message(&mut writer, &msg)
             .await
             .unwrap_or_else(|err| {
@@ -1479,6 +1559,53 @@ mod tests {
         });
     }
 
+    /// `build_ready_ack_message` serializes the index correctly.
+    #[test]
+    fn build_ready_ack_message_serializes_index() {
+        let index = crate::plugin_index::PluginIndex {
+            import_bindings: vec![crate::plugin_index::ImportBinding {
+                consumer_module: "consumer".into(),
+                consumer_key: "x".into(),
+                target_module: "target".into(),
+                target_name: "x".into(),
+            }],
+            reload_warnings: vec![],
+        };
+        let msg = build_ready_ack_message(&index);
+        let val: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(val["type"], "ready_ack");
+        assert_eq!(val["import_bindings"][0]["target_module"], "target");
+    }
+
+    /// `build_mutant_message` includes the diff array.
+    #[test]
+    fn build_mutant_message_includes_diff_field() {
+        let mutant = Mutant {
+            file_path: "calc.py".into(),
+            line: 1,
+            column: 1,
+            byte_offset: 0,
+            byte_length: 1,
+            original_text: "+".into(),
+            mutated_text: "-".into(),
+            mutator_name: "arithmetic".to_owned(),
+        };
+        let diff = vec![crate::mutation::MutationDiff::FunctionBody {
+            qualname: "add".into(),
+            new_source: "def add(a, b):\n    return a - b\n".into(),
+        }];
+        let msg = build_mutant_message(
+            &mutant,
+            "def add(a, b):\n    return a - b\n",
+            &["t1".to_owned()],
+            &diff,
+        );
+        let value: serde_json::Value = serde_json::from_str(&msg).expect("json");
+        assert_eq!(value["type"], "mutant");
+        assert!(value["diff"].is_array());
+        assert_eq!(value["diff"][0]["kind"], "function_body");
+    }
+
     /// `WorkerPool` borrow/return cycle works correctly.
     #[tokio::test]
     async fn worker_pool_borrow_return_cycle() {
@@ -1494,5 +1621,73 @@ mod tests {
         let result = runner.run_mutant(&mutant, source, &tests).await;
         // Either Ok or Err is fine — we just verify it doesn't hang.
         let _status = result;
+    }
+
+    /// Integration test: run a real mutant through the plugin pipeline
+    /// against the `from_imports` fixture and verify the consumer
+    /// (which uses `from src.calc import add`) sees the mutation —
+    /// i.e. Plan G's reverse-import rebinding actually works end-to-end.
+    ///
+    /// Ignored by default — requires a working python with pytest on PATH.
+    #[tokio::test]
+    #[ignore = "requires python+pytest on PATH; run with --include-ignored"]
+    async fn plugin_run_mutant_propagates_to_consumer_via_index() {
+        use crate::mutation::{Mutant, MutantStatus};
+
+        let fixture = Path::new("tests/fixtures/from_imports");
+        if !fixture.exists() {
+            return;
+        }
+        // Skip cleanly if pytest is not available on the project's python.
+        let python = crate::python::resolve_python(fixture);
+        let py_check = std::process::Command::new(&python)
+            .args(["-c", "import pytest"])
+            .output();
+        if !py_check.is_ok_and(|out| out.status.success()) {
+            #[expect(clippy::print_stderr, reason = "test skip diagnostic")]
+            {
+                eprintln!(
+                    "plugin_run_mutant test: skipped — pytest not available on {}",
+                    python.display()
+                );
+            }
+            return;
+        }
+        let runner = PytestPluginRunner::new(60_u64);
+        runner.start(1, fixture).await.expect("start");
+
+        // Mutate `def add(a, b): return a + b` to `return a - b`.
+        let calc_path = fixture.join("src/calc.py");
+        let source = std::fs::read_to_string(&calc_path).expect("read calc.py");
+        let plus_byte = source.find("a + b").expect("find expr") + 2;
+        let mutant = Mutant {
+            file_path: calc_path.clone(),
+            line: 1,
+            column: 1,
+            byte_offset: plus_byte,
+            byte_length: 1,
+            original_text: "+".to_owned(),
+            mutated_text: "-".to_owned(),
+            mutator_name: "arithmetic".to_owned(),
+        };
+        let tests: Vec<String> = vec![
+            "tests/test_calc.py::test_add".to_owned(),
+            "tests/test_calc.py::test_double_add".to_owned(),
+        ];
+        let result = runner
+            .run_mutant(&mutant, &source, &tests)
+            .await
+            .expect("run_mutant");
+
+        // The consumer test (`test_double_add` uses `from src.calc import add`)
+        // must observe the mutation — status should be Killed, not Survived.
+        assert_eq!(
+            result.status,
+            MutantStatus::Killed,
+            "consumer didn't see the mutation; reverse-import index broken? actual status: {:?}",
+            result.status,
+        );
+
+        runner.stop().await.expect("stop");
     }
 }

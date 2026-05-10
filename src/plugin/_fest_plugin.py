@@ -28,6 +28,426 @@ from typing import Any
 import pytest
 from _pytest.runner import runtestprotocol
 
+# Aliases for Python's source-execution and source-evaluation builtins.
+# Centralising the names here makes every dynamic-source call site
+# greppable for `_PY_EXEC` / `_PY_EVAL` and keeps the security-sensitive
+# names isolated to one location.
+_PY_EXEC = exec
+_PY_EVAL = eval
+
+
+class PatchJournal:
+    """Append-only undo log used during a single mutant lifecycle.
+
+    Each ``append(undo_fn, *args)`` records a callable; ``rollback()``
+    invokes them in reverse order. Exceptions in undo callables are
+    caught and returned to the caller — partial-failure does not abort
+    the rest of the rollback.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def append(self, undo_fn: Any, *args: Any) -> None:
+        """Record an undo callable to be invoked on rollback."""
+        self._entries.append((undo_fn, args))
+
+    def rollback(self) -> list[BaseException]:
+        """Run every recorded undo in reverse order; return collected errors."""
+        errors: list[BaseException] = []
+        for undo_fn, args in reversed(self._entries):
+            try:
+                undo_fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        self._entries.clear()
+        return errors
+
+
+class ReverseImportIndex:
+    """Maps `(target_module, name)` to consumer dict slots that bound it.
+
+    Built once after pytest collection — runtime layer scans
+    ``sys.modules`` and the AST layer is ingested via
+    :py:meth:`ingest_ast_layer` from the Rust handshake.
+    """
+
+    def __init__(self) -> None:
+        self._index: dict[tuple[str, str], list[tuple[dict[str, Any], str]]] = {}
+
+    def lookup(
+        self, target_module: str, name: str
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Return all consumer (dict, key) pairs that bound `target_module.name`."""
+        return list(self._index.get((target_module, name), ()))
+
+    def add(
+        self,
+        target_module: str,
+        name: str,
+        consumer_dict: dict[str, Any],
+        key: str,
+    ) -> None:
+        """Record a single binding."""
+        self._index.setdefault((target_module, name), []).append((consumer_dict, key))
+
+    @classmethod
+    def build_runtime_layer(cls) -> "ReverseImportIndex":
+        """Build the index by walking sys.modules at startup time."""
+        idx = cls()
+        for mod_name, mod in list(sys.modules.items()):
+            mod_dict = getattr(mod, "__dict__", None)
+            if mod_dict is None:
+                continue
+            for key, value in list(mod_dict.items()):
+                src_mod = getattr(value, "__module__", None)
+                src_name = (
+                    getattr(value, "__qualname__", None)
+                    or getattr(value, "__name__", None)
+                )
+                if not src_mod or not src_name or src_mod == mod_name:
+                    continue
+                idx.add(src_mod, src_name, mod_dict, key)
+        return idx
+
+    def ingest_ast_layer(self, bindings: list[dict[str, str]]) -> None:
+        """Add bindings produced by the Rust-side project AST scan."""
+        for entry in bindings:
+            consumer_mod_name = entry.get("consumer_module", "")
+            consumer_key = entry.get("consumer_key", "")
+            target_mod = entry.get("target_module", "")
+            target_name = entry.get("target_name", "")
+            consumer_mod = sys.modules.get(consumer_mod_name)
+            if consumer_mod is None:
+                continue
+            self.add(target_mod, target_name, consumer_mod.__dict__, consumer_key)
+
+
+_MISSING = object()
+
+
+def _drill_to_function(value: Any) -> Any:
+    """Follow ``__wrapped__`` chains until a plain function is reached."""
+    seen: set[int] = set()
+    cur = value
+    while not isinstance(cur, types.FunctionType):
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        nxt = getattr(cur, "__wrapped__", None)
+        if nxt is None or nxt is cur:
+            break
+        cur = nxt
+    return cur
+
+
+def _restore_function(
+    func: Any,
+    code: Any,
+    defaults: Any,
+    kwdefaults: Any,
+    annotations: dict[str, Any],
+    func_dict: dict[str, Any],
+) -> None:
+    """Restore a function to its pre-mutation state."""
+    func.__code__ = code
+    func.__defaults__ = defaults
+    func.__kwdefaults__ = kwdefaults
+    func.__annotations__ = dict(annotations)
+    func.__dict__.clear()
+    func.__dict__.update(func_dict)
+
+
+def _restore_code(func: Any, code: Any) -> None:
+    """Restore just a function's `__code__` attribute."""
+    func.__code__ = code
+
+
+def _restore_dict_slot(target_dict: dict[str, Any], key: str, old_value: Any) -> None:
+    """Restore a dict slot, deleting if the original value was missing."""
+    if old_value is _MISSING:
+        target_dict.pop(key, None)
+    else:
+        target_dict[key] = old_value
+
+
+def _restore_class_attr(cls: type, name: str, old_value: Any) -> None:
+    """Restore a class attribute, deleting if the original value was missing."""
+    if old_value is _MISSING:
+        try:
+            delattr(cls, name)
+        except AttributeError:
+            pass
+    else:
+        setattr(cls, name, old_value)
+
+
+def _unwrap_descriptor(descriptor: Any, suffix: str) -> Any:
+    """Unwrap a class-body descriptor to the underlying function."""
+    if isinstance(descriptor, (staticmethod, classmethod)):
+        return descriptor.__func__
+    if isinstance(descriptor, property):
+        if suffix == "fget":
+            return descriptor.fget
+        if suffix == "fset":
+            return descriptor.fset
+        if suffix == "fdel":
+            return descriptor.fdel
+        # Empty or unknown suffix on a property — caller raises a clearer error.
+        return None
+    if isinstance(descriptor, types.FunctionType):
+        return descriptor
+    return None
+
+
+class MutationApplier:
+    """Dispatches MutationDiff entries to per-kind appliers."""
+
+    def __init__(
+        self,
+        target_module: types.ModuleType,
+        index: ReverseImportIndex,
+    ) -> None:
+        self.target_module = target_module
+        self.index = index
+
+    def apply(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        """Apply a single MutationDiff entry, recording undo to journal."""
+        kind = change.get("kind", "")
+        handler = {
+            "function_body": self._apply_function_body,
+            "constant_bind": self._apply_constant_rebind,
+            "class_method": self._apply_class_method,
+            "class_attr": self._apply_class_attr,
+            "module_attr": self._apply_module_attr,
+        }.get(kind)
+        if handler is None:
+            raise ValueError(f"unknown mutation kind: {kind!r}")
+        handler(change, journal)
+
+    def _apply_function_body(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        qualname = change["qualname"]
+        new_source = change["new_source"]
+        if "." in qualname:
+            self._apply_nested_function_body(qualname, new_source, journal)
+            return
+        wrapped = self.target_module.__dict__[qualname]
+        target_func = _drill_to_function(wrapped)
+        new_func = self._compile_function(new_source, target_func)
+        old_code = target_func.__code__
+        old_defaults = target_func.__defaults__
+        old_kwdefaults = target_func.__kwdefaults__
+        old_annotations = dict(target_func.__annotations__)
+        old_func_dict = dict(target_func.__dict__)
+        # Record undo BEFORE any destructive op. Restore is idempotent so a
+        # later ValueError from __code__ assignment leaves the function
+        # unchanged and the recorded undo a no-op.
+        journal.append(
+            _restore_function,
+            target_func,
+            old_code,
+            old_defaults,
+            old_kwdefaults,
+            old_annotations,
+            old_func_dict,
+        )
+        try:
+            target_func.__code__ = new_func.__code__
+        except ValueError:
+            self._fallback_function_rebind(qualname, new_func, journal)
+            return
+        target_func.__defaults__ = new_func.__defaults__
+        target_func.__kwdefaults__ = new_func.__kwdefaults__
+        target_func.__annotations__ = dict(new_func.__annotations__)
+        target_func.__dict__.clear()
+        target_func.__dict__.update(new_func.__dict__)
+
+    def _apply_nested_function_body(
+        self, qualname: str, new_source: str, journal: PatchJournal,
+    ) -> None:
+        parent_qualname, leaf = qualname.rsplit(".", 1)
+        parent_obj = self._resolve_qualname(parent_qualname)
+        parent = _drill_to_function(parent_obj)
+        new_inner = self._compile_function(new_source, parent)
+        old_consts = parent.__code__.co_consts
+        replaced = False
+        new_consts: list[Any] = []
+        for c in old_consts:
+            if isinstance(c, types.CodeType) and c.co_name == leaf and not replaced:
+                new_consts.append(new_inner.__code__)
+                replaced = True
+            else:
+                new_consts.append(c)
+        if not replaced:
+            raise RuntimeError(
+                f"nested function {qualname!r}: no matching co_consts entry",
+            )
+        old_parent_code = parent.__code__
+        journal.append(_restore_code, parent, old_parent_code)
+        parent.__code__ = old_parent_code.replace(co_consts=tuple(new_consts))
+
+    def _fallback_function_rebind(
+        self, qualname: str, new_func: Any, journal: PatchJournal,
+    ) -> None:
+        if "." in qualname:
+            owner_path, leaf = qualname.rsplit(".", 1)
+            owner = self._resolve_qualname(owner_path)
+            owner_dict = owner.__dict__ if not isinstance(owner, dict) else owner
+        else:
+            leaf = qualname
+            owner_dict = self.target_module.__dict__
+        old_value = owner_dict.get(leaf, _MISSING)
+        owner_dict[leaf] = new_func
+        journal.append(_restore_dict_slot, owner_dict, leaf, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, leaf,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_func
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
+
+    def _apply_constant_rebind(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        name = change["name"]
+        compiled = compile(change["new_expr"], "<fest constant>", "eval")
+        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
+        target_dict = self.target_module.__dict__
+        old_value = target_dict.get(name, _MISSING)
+        target_dict[name] = new_value
+        journal.append(_restore_dict_slot, target_dict, name, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, name,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_value
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
+
+    def _apply_class_method(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        cls = self._resolve_qualname(change["class_qualname"])
+        method_name = change["method_name"]
+        leaf, _, suffix = method_name.partition(".")
+        descriptor = cls.__dict__[leaf]
+        target_func = _unwrap_descriptor(descriptor, suffix)
+        if target_func is None:
+            raise RuntimeError(
+                f"class method {change['class_qualname']!r}.{method_name!r}: "
+                "no underlying function",
+            )
+        new_func = self._compile_function(change["new_source"], target_func)
+        old_code = target_func.__code__
+        old_defaults = target_func.__defaults__
+        old_kwdefaults = target_func.__kwdefaults__
+        old_annotations = dict(target_func.__annotations__)
+        old_func_dict = dict(target_func.__dict__)
+        # Record undo BEFORE any destructive op. Restore is idempotent so a
+        # later exception mid-flight leaves the function unchanged and the
+        # recorded undo a no-op.
+        journal.append(
+            _restore_function,
+            target_func,
+            old_code,
+            old_defaults,
+            old_kwdefaults,
+            old_annotations,
+            old_func_dict,
+        )
+        target_func.__code__ = new_func.__code__
+        target_func.__defaults__ = new_func.__defaults__
+        target_func.__kwdefaults__ = new_func.__kwdefaults__
+        target_func.__annotations__ = dict(new_func.__annotations__)
+        target_func.__dict__.clear()
+        target_func.__dict__.update(new_func.__dict__)
+
+    def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        cls = self._resolve_qualname(change["class_qualname"])
+        name = change["name"]
+        compiled = compile(change["new_expr"], "<fest class attr>", "eval")
+        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
+        old_value = cls.__dict__.get(name, _MISSING)
+        setattr(cls, name, new_value)
+        journal.append(_restore_class_attr, cls, name, old_value)
+
+    def _apply_module_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
+        name = change["name"]
+        compiled = compile(change["new_source"], "<fest module attr>", "exec")
+        ns: dict[str, Any] = dict(self.target_module.__dict__)
+        local_ns: dict[str, Any] = {}
+        _PY_EXEC(compiled, ns, local_ns)
+        if name not in local_ns:
+            raise RuntimeError(
+                f"module attr {name!r}: compiled source did not bind {name!r}",
+            )
+        new_value = local_ns[name]
+        target_dict = self.target_module.__dict__
+        old_value = target_dict.get(name, _MISSING)
+        target_dict[name] = new_value
+        journal.append(_restore_dict_slot, target_dict, name, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, name,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_value
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
+
+    def _resolve_qualname(self, qualname: str) -> Any:
+        """Resolve a dotted qualname against the target module."""
+        cur: Any = self.target_module
+        for part in qualname.split("."):
+            cur = getattr(cur, part) if not isinstance(cur, dict) else cur[part]
+        return cur
+
+    def _compile_function(self, new_source: str, like: Any) -> Any:
+        """Compile a `def` source block into a function in `like`'s globals."""
+        ns: dict[str, Any] = dict(like.__globals__)
+        compiled = compile(new_source, "<fest mutation>", "exec")
+        local_ns: dict[str, Any] = {}
+        _PY_EXEC(compiled, ns, local_ns)
+        for value in local_ns.values():
+            if isinstance(value, types.FunctionType):
+                return value
+        raise RuntimeError(f"compiled source produced no function: {new_source!r}")
+
+
+class _ThreadCleanupRegistry:
+    """LIFO registry of cleanup callbacks invoked between mutants."""
+
+    def __init__(self) -> None:
+        self._callbacks: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def register(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Register a callback to be invoked once at the next mutant boundary."""
+        self._callbacks.append((fn, args, kwargs))
+
+    def run_all(self) -> list[BaseException]:
+        """Pop and invoke each callback in LIFO order; return collected errors."""
+        errors: list[BaseException] = []
+        while self._callbacks:
+            fn, args, kwargs = self._callbacks.pop()
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        return errors
+
+
+_GLOBAL_THREAD_CLEANUP = _ThreadCleanupRegistry()
+
+
+@pytest.fixture(scope="session")
+def fest_thread_cleanup():
+    """Register cleanup callbacks invoked between mutants.
+
+    Usage::
+
+        def test_with_workers(fest_thread_cleanup):
+            pool = ThreadPoolExecutor(max_workers=4)
+            fest_thread_cleanup(pool.shutdown, wait=True)
+            ...  # use pool here
+    """
+    def register(fn, *args, **kwargs):
+        _GLOBAL_THREAD_CLEANUP.register(fn, *args, **kwargs)
+
+    yield register
+
 
 def pytest_addoption(parser: Any) -> None:
     """Register the ``--fest-socket`` CLI option."""
@@ -40,32 +460,28 @@ def pytest_addoption(parser: Any) -> None:
 
 
 def pytest_runtestloop(session: Any) -> bool:
-    """Run the fest event loop after collection, replacing the default test loop.
-
-    Returns ``True`` to tell pytest we handled test execution ourselves.
-    """
+    """Run the fest event loop after collection."""
     socket_path: str | None = session.config.getoption("fest_socket")
     if socket_path is None:
         return False
 
     _check_pytest_version()
 
-    # Build nodeid -> Item index from collected items.
     item_index: dict[str, Any] = {}
     for item in session.items:
         item_index[item.nodeid] = item
 
-    # Build abs_path -> module_name cache from currently loaded modules.
     file_to_mod = _build_file_module_index()
 
     conn = _connect(socket_path)
     if conn is None:
         return True
-
-    # Use a generous timeout; the Rust side enforces per-mutant timeouts.
     conn.settimeout(None)
+
     test_ids = [item.nodeid for item in session.items]
     _send(conn, {"type": "ready", "tests": test_ids})
+
+    rev_index = ReverseImportIndex.build_runtime_layer()
 
     buf = b""
     while True:
@@ -94,8 +510,12 @@ def pytest_runtestloop(session: Any) -> bool:
             if msg_type == "shutdown":
                 conn.close()
                 return True
+            if msg_type == "ready_ack":
+                rev_index.ingest_ast_layer(msg.get("import_bindings", []))
+                _emit_reload_warnings(msg.get("reload_warnings", []))
+                continue
             if msg_type == "mutant":
-                result = _handle_mutant(session, msg, item_index, file_to_mod)
+                result = _handle_mutant(session, msg, item_index, file_to_mod, rev_index)
                 _send(conn, result)
             else:
                 _send(
@@ -109,6 +529,24 @@ def pytest_runtestloop(session: Any) -> bool:
 
     conn.close()
     return True
+
+
+def _emit_reload_warnings(warnings: list[dict[str, Any]]) -> None:
+    """Print up to 5 reload-warning lines to stderr at startup."""
+    capped = warnings[:5]
+    for w in capped:
+        print(
+            f"fest: detected {w.get('kind')} at {w.get('file')}:{w.get('line')} "
+            "- plugin backend cannot guarantee accuracy. "
+            "Consider --backend=subprocess for affected tests.",
+            file=sys.stderr,
+        )
+    if len(warnings) > len(capped):
+        print(
+            f"fest: ... {len(warnings) - len(capped)} more reload/dynamic-import "
+            "warnings suppressed.",
+            file=sys.stderr,
+        )
 
 
 def _check_pytest_version() -> None:
@@ -126,47 +564,68 @@ def _check_pytest_version() -> None:
         )
 
 
+_THREAD_WARNED = False
+
+
+def _emit_thread_warning_if_needed() -> None:
+    """Print a one-time warning if multiple threads are alive at mutant boundary."""
+    global _THREAD_WARNED
+    if _THREAD_WARNED:
+        return
+    import threading
+    if threading.active_count() > 1:
+        _THREAD_WARNED = True
+        print(
+            f"fest: detected {threading.active_count()} active threads at "
+            "mutant boundary; tests using threads must clean them up in "
+            "teardown for accurate plugin-backend results, or use "
+            "--backend=subprocess.",
+            file=sys.stderr,
+        )
+
+
 def _handle_mutant(
     session: Any,
     msg: dict[str, Any],
     item_index: dict[str, Any],
     file_to_mod: dict[str, str],
+    rev_index: "ReverseImportIndex",
 ) -> dict[str, Any]:
-    """Apply a mutation, run the relevant tests, restore, and return a result."""
+    """Apply a mutation, run tests, restore, return a result."""
     file_path: str = msg.get("file", "")
     module_name: str = msg.get("module", "")
-    mutated_source: str = msg.get("mutated_source", "")
+    diff: list[dict[str, Any]] = msg.get("diff", [])
     test_ids: list[str] = msg.get("tests", [])
 
-    # Prefer cached __file__-based lookup: handles src-layout and editable
-    # installs where a naive path-to-module conversion gives the wrong name.
     found = file_to_mod.get(os.path.abspath(file_path))
     if found:
         module_name = found
     elif not module_name:
         module_name = _file_to_module(file_path)
-    original_module = sys.modules.get(module_name)
-    saved_dict: dict[str, Any] | None = None
 
-    try:
-        code = compile(mutated_source, file_path, "exec")
-    except SyntaxError as exc:
+    target_module = sys.modules.get(module_name)
+    if target_module is None:
+        target_module = types.ModuleType(module_name)
+        target_module.__file__ = file_path
+        sys.modules[module_name] = target_module
+
+    _emit_thread_warning_if_needed()
+    cleanup_errors = _GLOBAL_THREAD_CLEANUP.run_all()
+    for err in cleanup_errors:
+        print(f"fest: thread cleanup callback failed: {err}", file=sys.stderr)
+
+    if not diff:
         return {
             "type": "result",
             "status": "error",
-            "error_message": f"compile error: {exc}",
+            "error_message": "no diff entries — mutation kind unsupported by IR derivation",
         }
 
+    journal = PatchJournal()
+    applier = MutationApplier(target_module, rev_index)
     try:
-        if original_module is not None:
-            saved_dict = dict(vars(original_module))
-            _exec_code(code, vars(original_module))
-        else:
-            mod = types.ModuleType(module_name)
-            mod.__file__ = file_path
-            sys.modules[module_name] = mod
-            _exec_code(code, vars(mod))
-
+        for change in diff:
+            applier.apply(change, journal)
         status = _run_tests(session, test_ids, item_index)
         return {"type": "result", "status": status}
     except Exception as exc:  # noqa: BLE001
@@ -176,23 +635,9 @@ def _handle_mutant(
             "error_message": f"runtime error: {exc}",
         }
     finally:
-        if original_module is not None and saved_dict is not None:
-            vars(original_module).clear()
-            vars(original_module).update(saved_dict)
-        elif original_module is None and module_name in sys.modules:
-            del sys.modules[module_name]
-
-
-def _exec_code(code: types.CodeType, namespace: dict[str, Any]) -> None:
-    """Execute compiled code in the given namespace.
-
-    Separated into its own function to keep the security-sensitive call
-    isolated and auditable.
-    """
-    # This is intentional: fest needs to load mutated Python source code
-    # into the target module's namespace for mutation testing.
-    glob = namespace  # noqa: A001
-    exec(code, glob)  # noqa: S102  -- required for mutation testing
+        errors = journal.rollback()
+        for err in errors:
+            print(f"fest: rollback step failed: {err}", file=sys.stderr)
 
 
 def _run_tests(
