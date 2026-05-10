@@ -225,7 +225,63 @@ class MutationApplier:
         handler(change, journal)
 
     def _apply_function_body(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        raise NotImplementedError
+        qualname = change["qualname"]
+        new_source = change["new_source"]
+        if "." in qualname:
+            self._apply_nested_function_body(qualname, new_source, journal)
+            return
+        wrapped = self.target_module.__dict__[qualname]
+        target_func = _drill_to_function(wrapped)
+        new_func = self._compile_function(new_source, target_func)
+        old_code = target_func.__code__
+        old_defaults = target_func.__defaults__
+        old_kwdefaults = target_func.__kwdefaults__
+        old_annotations = dict(target_func.__annotations__)
+        old_func_dict = dict(target_func.__dict__)
+        try:
+            target_func.__code__ = new_func.__code__
+        except ValueError:
+            self._fallback_function_rebind(qualname, new_func, journal)
+            return
+        target_func.__defaults__ = new_func.__defaults__
+        target_func.__kwdefaults__ = new_func.__kwdefaults__
+        target_func.__annotations__ = dict(new_func.__annotations__)
+        target_func.__dict__.clear()
+        target_func.__dict__.update(new_func.__dict__)
+        journal.append(
+            _restore_function,
+            target_func,
+            old_code,
+            old_defaults,
+            old_kwdefaults,
+            old_annotations,
+            old_func_dict,
+        )
+
+    def _apply_nested_function_body(
+        self, qualname: str, new_source: str, journal: PatchJournal,
+    ) -> None:
+        raise NotImplementedError("nested — Task 6.3")
+
+    def _fallback_function_rebind(
+        self, qualname: str, new_func: Any, journal: PatchJournal,
+    ) -> None:
+        if "." in qualname:
+            owner_path, leaf = qualname.rsplit(".", 1)
+            owner = self._resolve_qualname(owner_path)
+            owner_dict = owner.__dict__ if not isinstance(owner, dict) else owner
+        else:
+            leaf = qualname
+            owner_dict = self.target_module.__dict__
+        old_value = owner_dict.get(leaf, _MISSING)
+        owner_dict[leaf] = new_func
+        journal.append(_restore_dict_slot, owner_dict, leaf, old_value)
+        for consumer_dict, consumer_key in self.index.lookup(
+            self.target_module.__name__, leaf,
+        ):
+            old_consumer = consumer_dict.get(consumer_key, _MISSING)
+            consumer_dict[consumer_key] = new_func
+            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
     def _apply_constant_rebind(self, change: dict[str, Any], journal: PatchJournal) -> None:
         raise NotImplementedError
