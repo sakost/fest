@@ -177,6 +177,59 @@ fn resolve_import_from(
     prefix
 }
 
+/// Walk all `.py` files under `root` and return aggregated [`PluginIndex`].
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] from filesystem operations.
+pub fn scan_project(root: &std::path::Path) -> std::io::Result<PluginIndex> {
+    let mut out = PluginIndex::default();
+    walk_dir(root, root, &mut out)?;
+    Ok(out)
+}
+
+/// Recursive worker for [`scan_project`].
+fn walk_dir(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut PluginIndex,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(cur)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            walk_dir(root, &path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("py") {
+            continue;
+        }
+        let source = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let module_name = path_to_module(root, &path);
+        let scanned = scan_source(&source, &module_name, &path);
+        out.import_bindings.extend(scanned.import_bindings);
+        out.reload_warnings.extend(scanned.reload_warnings);
+    }
+    Ok(())
+}
+
+/// Convert a file path under `root` to its dotted Python module name.
+fn path_to_module(root: &std::path::Path, file: &std::path::Path) -> String {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    let stem = rel.with_extension("");
+    let mut parts: Vec<String> = stem
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if parts.last().map(String::as_str) == Some("__init__") {
+        drop(parts.pop());
+    }
+    parts.join(".")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +288,22 @@ mod tests {
         let src = "__import__('foo')\n";
         let index = scan_source(src, "m.c", &PathBuf::from("c.py"));
         assert!(index.reload_warnings.iter().any(|w| w.kind == "__import__"));
+    }
+
+    #[test]
+    fn scan_project_walks_all_py_files() {
+        use tempfile::tempdir;
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("pkg/a.py"), "from pkg.b import x\n").unwrap();
+        std::fs::write(root.join("pkg/b.py"), "x = 1\n").unwrap();
+
+        let index = scan_project(root).expect("scan ok");
+
+        assert_eq!(index.import_bindings.len(), 1);
+        assert_eq!(index.import_bindings[0].target_module, "pkg.b");
+        assert_eq!(index.import_bindings[0].consumer_module, "pkg.a");
     }
 }
