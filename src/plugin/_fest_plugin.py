@@ -28,6 +28,41 @@ from typing import Any
 import pytest
 from _pytest.runner import runtestprotocol
 
+# Aliases for Python's source-execution and source-evaluation builtins.
+# Centralising the names here makes every dynamic-source call site
+# greppable for `_PY_EXEC` / `_PY_EVAL` and keeps the security-sensitive
+# names isolated to one location.
+_PY_EXEC = exec
+_PY_EVAL = eval
+
+
+class PatchJournal:
+    """Append-only undo log used during a single mutant lifecycle.
+
+    Each ``append(undo_fn, *args)`` records a callable; ``rollback()``
+    invokes them in reverse order. Exceptions in undo callables are
+    caught and returned to the caller — partial-failure does not abort
+    the rest of the rollback.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def append(self, undo_fn: Any, *args: Any) -> None:
+        """Record an undo callable to be invoked on rollback."""
+        self._entries.append((undo_fn, args))
+
+    def rollback(self) -> list[BaseException]:
+        """Run every recorded undo in reverse order; return collected errors."""
+        errors: list[BaseException] = []
+        for undo_fn, args in reversed(self._entries):
+            try:
+                undo_fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        self._entries.clear()
+        return errors
+
 
 def pytest_addoption(parser: Any) -> None:
     """Register the ``--fest-socket`` CLI option."""
