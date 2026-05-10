@@ -114,11 +114,10 @@ impl Runner for SubprocessRunner {
             ))
         })?;
 
-        // 4. Spawn pytest with timeout.
-        //    PYTHONDONTWRITEBYTECODE=1 prevents Python from writing .pyc
-        //    files so that stale bytecode caches never shadow a restored
-        //    source file (the mtime-based invalidation can miss rapid
-        //    write→restore cycles that land in the same second).
+        // 4. Spawn pytest with timeout. PYTHONDONTWRITEBYTECODE=1 prevents Python from writing .pyc
+        //    files so that stale bytecode caches never shadow a restored source file (the
+        //    mtime-based invalidation can miss rapid write→restore cycles that land in the same
+        //    second).
         let mut cmd = Command::new(crate::python::resolve_python(&self.project_dir));
         let _cmd_ref = cmd
             .env("PYTHONDONTWRITEBYTECODE", "1")
