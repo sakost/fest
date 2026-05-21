@@ -75,3 +75,55 @@ def test_ast_layer_skips_unloaded_consumers():
     idx = ReverseImportIndex()
     idx.ingest_ast_layer(bindings)
     assert idx.lookup("tgt", "Q") == []
+
+
+def test_pending_star_import_resolves_with_runtime_all(tmp_path, monkeypatch):
+    """When models exposes __all__ at runtime, pending star imports
+    synthesize one binding per name."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "pkg_dyn1").mkdir()
+    (tmp_path / "pkg_dyn1" / "__init__.py").write_text("")
+    (tmp_path / "pkg_dyn1" / "models_dyn.py").write_text(
+        "__all__ = ['A']\nA = 1\nB = 2\n",
+    )
+    (tmp_path / "pkg_dyn1" / "api_dyn.py").write_text("from pkg_dyn1.models_dyn import *\n")
+    import importlib
+    importlib.invalidate_caches()
+    import pkg_dyn1.api_dyn  # noqa: F401
+
+    idx = ReverseImportIndex()
+    idx.ingest_pending_star_imports([
+        {"consumer_module": "pkg_dyn1.api_dyn", "target_module": "pkg_dyn1.models_dyn"},
+    ])
+    # `A` is in __all__ → binding registered. `B` is not.
+    assert idx.lookup("pkg_dyn1.models_dyn", "A"), "A in __all__ should be bound"
+    assert not idx.lookup("pkg_dyn1.models_dyn", "B"), "B not in __all__"
+
+
+def test_pending_star_import_falls_back_to_vars_when_all_missing(tmp_path, monkeypatch):
+    """No __all__ → register every non-underscore public name."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "pkg_dyn2").mkdir()
+    (tmp_path / "pkg_dyn2" / "__init__.py").write_text("")
+    (tmp_path / "pkg_dyn2" / "noall.py").write_text("Open = 1\n_Hidden = 2\n")
+    (tmp_path / "pkg_dyn2" / "api.py").write_text("from pkg_dyn2.noall import *\n")
+    import importlib
+    importlib.invalidate_caches()
+    import pkg_dyn2.api  # noqa: F401
+
+    idx = ReverseImportIndex()
+    idx.ingest_pending_star_imports([
+        {"consumer_module": "pkg_dyn2.api", "target_module": "pkg_dyn2.noall"},
+    ])
+    assert idx.lookup("pkg_dyn2.noall", "Open"), "non-underscore name should bind"
+    assert not idx.lookup("pkg_dyn2.noall", "_Hidden"), \
+        "underscore-prefixed should be filtered out"
+
+
+def test_pending_star_import_silent_skip_on_import_failure():
+    """If the source module can't be imported, no bindings, no crash."""
+    idx = ReverseImportIndex()
+    idx.ingest_pending_star_imports([
+        {"consumer_module": "no.such.consumer", "target_module": "no.such.module"},
+    ])
+    assert not idx.lookup("no.such.module", "anything")

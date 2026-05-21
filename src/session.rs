@@ -9,7 +9,7 @@ use rusqlite::{Connection, params};
 
 use crate::{
     Error,
-    mutation::{Mutant, MutantResult, MutantStatus},
+    mutation::{Mutant, MutantResult, MutantStatus, SkipReason},
 };
 
 /// Schema version for migration compatibility.
@@ -250,7 +250,8 @@ impl Session {
             MutantStatus::Killed
             | MutantStatus::Survived
             | MutantStatus::Timeout
-            | MutantStatus::NoCoverage => None,
+            | MutantStatus::NoCoverage
+            | MutantStatus::Skipped { .. } => None,
         };
 
         #[allow(
@@ -472,6 +473,7 @@ impl Session {
                 "timeout" => stats.timeout = count,
                 "no_coverage" => stats.no_coverage = count,
                 "error" => stats.error = count,
+                s if s.starts_with("skipped") => stats.skipped += count,
                 _ => {}
             }
         }
@@ -511,16 +513,28 @@ pub struct SessionStats {
     pub no_coverage: usize,
     /// Number of errored mutants.
     pub error: usize,
+    /// Number of skipped mutants.
+    pub skipped: usize,
 }
 
 /// Convert a [`MutantStatus`] to a database string.
+#[allow(
+    clippy::pattern_type_mismatch,
+    reason = "matching on &MutantStatus / &SkipReason requires this suppression"
+)]
 const fn status_to_str(status: &MutantStatus) -> &'static str {
-    match *status {
+    match status {
         MutantStatus::Killed => "killed",
         MutantStatus::Survived => "survived",
         MutantStatus::Timeout => "timeout",
         MutantStatus::NoCoverage => "no_coverage",
         MutantStatus::Error(_) => "error",
+        MutantStatus::Skipped { reason } => match reason {
+            SkipReason::UnmappableTarget => "skipped:unmappable_target",
+            SkipReason::ConditionMutation => "skipped:condition_mutation",
+            SkipReason::UnsupportedStatement => "skipped:unsupported_statement",
+            SkipReason::MissingClassScope => "skipped:missing_class_scope",
+        },
     }
 }
 
@@ -532,6 +546,19 @@ fn str_to_status(status: &str, error_message: Option<String>) -> MutantStatus {
         "timeout" => MutantStatus::Timeout,
         "no_coverage" => MutantStatus::NoCoverage,
         "error" => MutantStatus::Error(error_message.unwrap_or_default()),
+        "skipped:unmappable_target" => MutantStatus::Skipped {
+            reason: SkipReason::UnmappableTarget,
+        },
+        "skipped:condition_mutation" => MutantStatus::Skipped {
+            reason: SkipReason::ConditionMutation,
+        },
+        // Back-compat: bare "skipped" (older sessions) maps to UnsupportedStatement.
+        "skipped:unsupported_statement" | "skipped" => MutantStatus::Skipped {
+            reason: SkipReason::UnsupportedStatement,
+        },
+        "skipped:missing_class_scope" => MutantStatus::Skipped {
+            reason: SkipReason::MissingClassScope,
+        },
         _ => MutantStatus::Error(format!("unknown status: {status}")),
     }
 }
@@ -834,5 +861,47 @@ mod tests {
 
         let seed = session.get_metadata("seed").expect("get seed");
         assert_eq!(seed, None);
+    }
+
+    /// `status_to_str` / `str_to_status` roundtrip preserves all `SkipReason` variants.
+    #[test]
+    fn status_round_trip_preserves_skip_reason() {
+        for reason in [
+            SkipReason::UnmappableTarget,
+            SkipReason::ConditionMutation,
+            SkipReason::UnsupportedStatement,
+            SkipReason::MissingClassScope,
+        ] {
+            let s = status_to_str(&MutantStatus::Skipped {
+                reason: reason.clone(),
+            });
+            let back = str_to_status(s, None);
+            assert_eq!(back, MutantStatus::Skipped { reason });
+        }
+    }
+
+    /// `count_by_status` counts skipped mutants correctly.
+    #[test]
+    fn count_by_status_includes_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let session = Session::open(&db_path).expect("open");
+
+        let mutant = test_mutant();
+        session.store_mutants(&[mutant.clone()]).expect("store");
+
+        let result = MutantResult {
+            mutant,
+            status: MutantStatus::Skipped {
+                reason: SkipReason::UnmappableTarget,
+            },
+            tests_run: Vec::new(),
+            duration: core::time::Duration::from_secs(0_u64),
+        };
+        session.update_result(&result).expect("update");
+
+        let stats = session.count_by_status().expect("stats");
+        assert_eq!(stats.skipped, 1_usize);
+        assert_eq!(stats.pending, 0_usize);
     }
 }

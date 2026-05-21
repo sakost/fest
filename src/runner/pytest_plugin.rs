@@ -29,13 +29,18 @@ use tokio::{
 
 use crate::{
     Error,
-    mutation::{Mutant, MutantResult, MutantStatus},
+    mutation::{Mutant, MutantResult, MutantStatus, SkipReason},
     plugin::FEST_PLUGIN_SOURCE,
     runner::Runner,
 };
 
 /// Default timeout in seconds when none is specified.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// IPC protocol version. Bump whenever the JSON wire format changes in a
+/// non-backwards-compatible way. The plugin refuses `ready_ack` messages with
+/// a mismatched version.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Minimum startup timeout in seconds for worker spawning.
 ///
@@ -208,9 +213,8 @@ impl PersistentWorker {
         // If pytest crashes (e.g. import error) before connecting, we
         // detect it immediately instead of waiting the full timeout.
         let stream = accept_or_child_exit(&mut child, env.listener, startup_timeout).await?;
-        let (reader, writer) = tokio::io::split(stream);
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut buf_reader = BufReader::new(reader);
-        let mut writer = writer;
 
         // Read READY message.
         let ready_msg = read_message(&mut buf_reader).await?;
@@ -246,24 +250,29 @@ impl PersistentWorker {
         timeout: Duration,
     ) -> Result<MutantStatus, Error> {
         let mutated_source = mutant.apply_to_source(source);
-        let original_ast = ruff_python_parser::parse_module(source)
-            .map(|p| p.into_syntax())
-            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+        let original_ast = ruff_python_parser::parse_module(source).map_or_else(
+            |_| ruff_python_ast::ModModule {
                 range: ruff_text_size::TextRange::default(),
                 body: Vec::new(),
-            });
-        let mutated_ast = ruff_python_parser::parse_module(&mutated_source)
-            .map(|p| p.into_syntax())
-            .unwrap_or_else(|_| ruff_python_ast::ModModule {
+            },
+            ruff_python_parser::Parsed::into_syntax,
+        );
+        let mutated_ast = ruff_python_parser::parse_module(&mutated_source).map_or_else(
+            |_| ruff_python_ast::ModModule {
                 range: ruff_text_size::TextRange::default(),
                 body: Vec::new(),
-            });
-        let diff = crate::mutation::diff::derive_diff(
+            },
+            ruff_python_parser::Parsed::into_syntax,
+        );
+        let diff = match crate::mutation::diff::derive_diff(
             mutant,
             &original_ast,
             &mutated_ast,
             &mutated_source,
-        );
+        ) {
+            Ok(d) => d,
+            Err(reason) => return Ok(MutantStatus::Skipped { reason }),
+        };
         let msg = build_mutant_message(mutant, &mutated_source, tests, &diff);
 
         let result = tokio::time::timeout(timeout, async {
@@ -849,7 +858,15 @@ fn build_mutant_message(
     tests: &[String],
     diff: &[crate::mutation::MutationDiff],
 ) -> String {
-    let file_path_str = mutant.file_path.display().to_string();
+    // Send an absolute path so the plugin's `os.path.abspath` lookup is
+    // idempotent regardless of pytest's cwd (which is the project_dir, NOT
+    // the cargo-test cwd that the relative mutant.file_path is anchored to).
+    // Falls back to the raw path if canonicalisation fails (e.g. the file
+    // was deleted between mutant generation and dispatch).
+    let file_path_str = std::fs::canonicalize(&mutant.file_path)
+        .unwrap_or_else(|_| mutant.file_path.clone())
+        .display()
+        .to_string();
     let msg = serde_json::json!({
         "type": "mutant",
         "file": file_path_str,
@@ -866,13 +883,59 @@ fn build_mutant_message(
 fn build_ready_ack_message(index: &crate::plugin_index::PluginIndex) -> String {
     let msg = serde_json::json!({
         "type": "ready_ack",
+        "protocol_version": PROTOCOL_VERSION,
         "import_bindings": index.import_bindings,
         "reload_warnings": index.reload_warnings,
+        "pending_star_imports": index.pending_star_imports,
     });
     msg.to_string()
 }
 
-/// Parse the `"status"` field from a result JSON message into a
+/// Parse the `"status"` field from a parsed JSON value into a [`MutantStatus`].
+///
+/// The `"skipped"` status is handled by reading an optional `"reason"` field
+/// (`snake_case` string).  Unrecognised reason strings default to
+/// [`SkipReason::UnsupportedStatement`].
+///
+/// # Errors
+///
+/// Returns [`Error::Runner`] if the status field is missing or the status
+/// string is unrecognised.
+fn parse_status(msg: &serde_json::Value) -> Result<MutantStatus, Error> {
+    let status_str = msg
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Runner("result missing 'status' field".to_owned()))?;
+
+    match status_str {
+        "killed" => Ok(MutantStatus::Killed),
+        "survived" => Ok(MutantStatus::Survived),
+        "skipped" => {
+            let reason_str = msg
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unsupported_statement");
+            let reason = match reason_str {
+                "unmappable_target" => SkipReason::UnmappableTarget,
+                "condition_mutation" => SkipReason::ConditionMutation,
+                "missing_class_scope" => SkipReason::MissingClassScope,
+                _ => SkipReason::UnsupportedStatement,
+            };
+            Ok(MutantStatus::Skipped { reason })
+        }
+        "error" => {
+            let error_message = msg
+                .get("error_message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown plugin error")
+                .to_owned();
+            Ok(MutantStatus::Error(error_message))
+        }
+        other => Err(Error::Runner(format!("unknown status: '{other}'"))),
+    }
+}
+
+/// Parse the `"status"` field from a result JSON message string into a
 /// [`MutantStatus`].
 ///
 /// # Errors
@@ -894,24 +957,7 @@ fn parse_result_status(msg: &str) -> Result<MutantStatus, Error> {
         )));
     }
 
-    let status_str = value
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::Runner("result missing 'status' field".to_owned()))?;
-
-    match status_str {
-        "killed" => Ok(MutantStatus::Killed),
-        "survived" => Ok(MutantStatus::Survived),
-        "error" => {
-            let error_message = value
-                .get("error_message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown plugin error")
-                .to_owned();
-            Ok(MutantStatus::Error(error_message))
-        }
-        other => Err(Error::Runner(format!("unknown status: '{other}'"))),
-    }
+    parse_status(&value)
 }
 
 /// Convert a Python file path to a dotted module name.
@@ -1570,11 +1616,27 @@ mod tests {
                 target_name: "x".into(),
             }],
             reload_warnings: vec![],
+            module_exports: std::collections::HashMap::new(),
+            pending_star_imports: vec![],
         };
         let msg = build_ready_ack_message(&index);
         let val: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(val["type"], "ready_ack");
         assert_eq!(val["import_bindings"][0]["target_module"], "target");
+        assert!(
+            val["pending_star_imports"].is_array(),
+            "pending_star_imports must be present"
+        );
+    }
+
+    /// `ready_ack` message includes the protocol version.
+    #[test]
+    fn ready_ack_includes_protocol_version() {
+        let idx = crate::plugin_index::PluginIndex::default();
+        let msg = build_ready_ack_message(&idx);
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["protocol_version"], serde_json::json!(PROTOCOL_VERSION));
+        assert_eq!(v["protocol_version"], serde_json::json!(2_u32));
     }
 
     /// `build_mutant_message` includes the diff array.
@@ -1689,5 +1751,198 @@ mod tests {
         );
 
         runner.stop().await.expect("stop");
+    }
+
+    /// Integration test: run the `control_flow_bindings` fixture end-to-end through
+    /// the plugin backend, exercising:
+    ///  * tuple unpack inside an `if` block (`config.py`)
+    ///  * AnnAssign at module scope (`annotated.py`)
+    ///  * nested classes (`nested_classes.py`)
+    ///  * `from .models import *` star-import propagation (`starred/`)
+    ///
+    /// Acceptance criteria (when pytest is available):
+    ///  * mutation score >= 70% (most mutants killed)
+    ///  * 0 error statuses
+    ///
+    /// Ignored by default — requires python+pytest on PATH.
+    #[tokio::test]
+    #[ignore = "integration test; requires python+pytest in environment"]
+    async fn plugin_handles_control_flow_bindings_fixture() {
+        use crate::mutation::{Mutant, MutantStatus};
+
+        let fixture = Path::new("tests/fixtures/control_flow_bindings");
+        if !fixture.exists() {
+            return;
+        }
+
+        // Skip cleanly if pytest is not available on the project's python.
+        let python = crate::python::resolve_python(fixture);
+        let py_check = std::process::Command::new(&python)
+            .args(["-c", "import pytest"])
+            .output();
+        if !py_check.is_ok_and(|out| out.status.success()) {
+            #[expect(clippy::print_stderr, reason = "test skip diagnostic")]
+            {
+                eprintln!(
+                    "plugin_handles_control_flow_bindings_fixture: skipped — pytest not available \
+                     on {}",
+                    python.display()
+                );
+            }
+            return;
+        }
+
+        let runner = PytestPluginRunner::new(60_u64);
+        runner.start(1, fixture).await.expect("start");
+
+        // --- Mutant 1: nested_classes.py — change inner VALUE literal 42 → 99
+        // Killed by test_inner_value (assert VALUE == 42) and test_inner_compute_doubles.
+        let nested_path = fixture.join("src/nested_classes.py");
+        let nested_src = std::fs::read_to_string(&nested_path).expect("read nested_classes.py");
+        let value_byte = nested_src.find("42").expect("find 42 in nested_classes.py");
+        let mutant_nested = Mutant {
+            file_path: nested_path.clone(),
+            line: 1,
+            column: 1,
+            byte_offset: value_byte,
+            byte_length: 2,
+            original_text: "42".to_owned(),
+            mutated_text: "99".to_owned(),
+            mutator_name: "literal".to_owned(),
+        };
+        let nested_tests: Vec<String> = vec![
+            "tests/test_nested.py::test_inner_value".to_owned(),
+            "tests/test_nested.py::test_inner_compute_doubles".to_owned(),
+        ];
+        let result_nested = runner
+            .run_mutant(&mutant_nested, &nested_src, &nested_tests)
+            .await
+            .expect("run_mutant nested");
+
+        // --- Mutant 2: annotated.py — change COUNTER initial value 0 → 1
+        // Killed by test_counter_starts_at_zero.
+        let annotated_path = fixture.join("src/annotated.py");
+        let annotated_src = std::fs::read_to_string(&annotated_path).expect("read annotated.py");
+        // Find `COUNTER: int = 0` — locate the ` 0` literal (the `0` after `= `).
+        let counter_byte = annotated_src
+            .find("COUNTER: int = 0")
+            .expect("find COUNTER decl")
+            + "COUNTER: int = ".len();
+        let mutant_annotated = Mutant {
+            file_path: annotated_path.clone(),
+            line: 1,
+            column: 1,
+            byte_offset: counter_byte,
+            byte_length: 1,
+            original_text: "0".to_owned(),
+            mutated_text: "1".to_owned(),
+            mutator_name: "literal".to_owned(),
+        };
+        let annotated_tests: Vec<String> =
+            vec!["tests/test_annotated.py::test_counter_starts_at_zero".to_owned()];
+        let result_annotated = runner
+            .run_mutant(&mutant_annotated, &annotated_src, &annotated_tests)
+            .await
+            .expect("run_mutant annotated");
+
+        // --- Mutant 3: starred/models.py — change User.name return value "alice" → "bob"
+        // Killed by test_whoami_returns_alice and test_user_export (via star-import propagation).
+        let models_path = fixture.join("src/starred/models.py");
+        let models_src = std::fs::read_to_string(&models_path).expect("read models.py");
+        let alice_byte = models_src
+            .find("\"alice\"")
+            .expect("find alice in models.py");
+        let mutant_models = Mutant {
+            file_path: models_path.clone(),
+            line: 1,
+            column: 1,
+            byte_offset: alice_byte,
+            byte_length: 7,
+            original_text: "\"alice\"".to_owned(),
+            mutated_text: "\"bob\"".to_owned(),
+            mutator_name: "literal".to_owned(),
+        };
+        let starred_tests: Vec<String> = vec![
+            "tests/test_starred.py::test_whoami_returns_alice".to_owned(),
+            "tests/test_starred.py::test_user_export".to_owned(),
+        ];
+        let result_models = runner
+            .run_mutant(&mutant_models, &models_src, &starred_tests)
+            .await
+            .expect("run_mutant models");
+
+        runner.stop().await.expect("stop");
+
+        // Compute mutation score: skip errors/timeouts, count killed vs (killed + survived).
+        let statuses = [
+            result_nested.status,
+            result_annotated.status,
+            result_models.status,
+        ];
+        let mut killed = 0_u32;
+        let mut survived = 0_u32;
+        let mut errors = 0_u32;
+        for status in &statuses {
+            match status {
+                MutantStatus::Killed => killed += 1,
+                MutantStatus::Survived => survived += 1,
+                MutantStatus::Error(_) => errors += 1,
+                _ => {}
+            }
+        }
+
+        assert_eq!(errors, 0, "expected zero error statuses; got {errors}");
+
+        let total = killed + survived;
+        assert!(
+            total > 0,
+            "all mutants were skipped/timed-out — cannot compute score"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let score = (killed as f64) / (total as f64) * 100.0;
+        assert!(
+            score >= 70.0,
+            "mutation score {score:.1}% is below the 70% threshold (killed={killed}, \
+             survived={survived})"
+        );
+    }
+
+    /// `parse_status` maps `"skipped"` with a known reason string.
+    #[test]
+    fn parse_status_handles_skipped_with_reason() {
+        let msg = serde_json::json!({"status": "skipped", "reason": "condition_mutation"});
+        let status = parse_status(&msg).unwrap();
+        assert_eq!(
+            status,
+            MutantStatus::Skipped {
+                reason: SkipReason::ConditionMutation,
+            }
+        );
+    }
+
+    /// `parse_status` defaults to `UnsupportedStatement` when reason is absent.
+    #[test]
+    fn parse_status_defaults_skipped_reason_when_missing() {
+        let msg = serde_json::json!({"status": "skipped"});
+        let status = parse_status(&msg).unwrap();
+        assert_eq!(
+            status,
+            MutantStatus::Skipped {
+                reason: SkipReason::UnsupportedStatement,
+            }
+        );
+    }
+
+    /// `parse_status` defaults to `UnsupportedStatement` for an unrecognised reason.
+    #[test]
+    fn parse_status_defaults_skipped_reason_when_unrecognized() {
+        let msg = serde_json::json!({"status": "skipped", "reason": "not_a_known_reason"});
+        let status = parse_status(&msg).unwrap();
+        assert_eq!(
+            status,
+            MutantStatus::Skipped {
+                reason: SkipReason::UnsupportedStatement,
+            }
+        );
     }
 }

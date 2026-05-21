@@ -122,8 +122,48 @@ class ReverseImportIndex:
                 continue
             self.add(target_mod, target_name, consumer_mod.__dict__, consumer_key)
 
+    def ingest_pending_star_imports(
+        self, pending: list[dict[str, str]],
+    ) -> None:
+        """Resolve ``from X import *`` bindings deferred by the Rust scan.
+
+        For each entry, imports the source module and registers each name
+        in ``__all__`` (or every non-underscore name in ``vars(mod)`` if
+        ``__all__`` is missing). Import failures are silently skipped —
+        propagation just won't reach that consumer.
+        """
+        import importlib  # noqa: PLC0415 — lazy import, importlib not needed at module load
+        for entry in pending:
+            consumer_name = entry.get("consumer_module", "")
+            target_name = entry.get("target_module", "")
+            consumer_mod = sys.modules.get(consumer_name)
+            if consumer_mod is None:
+                continue
+            try:
+                source_mod = importlib.import_module(target_name)
+            except Exception:  # noqa: BLE001 — best-effort runtime fallback
+                continue
+            names = getattr(source_mod, "__all__", None)
+            if names is None:
+                names = [n for n in vars(source_mod) if not n.startswith("_")]
+            for name in names:
+                self.add(target_name, name, consumer_mod.__dict__, name)
+
 
 _MISSING = object()
+
+_PLUGIN_PROTOCOL_VERSION = 2
+
+
+class _SkippedMutation(Exception):
+    """Raised by an applier when a mutation should be marked Skipped.
+
+    Carries a `reason` string consumed by the dispatch loop.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _drill_to_function(value: Any) -> Any:
@@ -216,9 +256,8 @@ class MutationApplier:
         kind = change.get("kind", "")
         handler = {
             "function_body": self._apply_function_body,
-            "constant_bind": self._apply_constant_rebind,
+            "statement_bind": self._apply_statement_bind,
             "class_method": self._apply_class_method,
-            "class_attr": self._apply_class_attr,
             "module_attr": self._apply_module_attr,
         }.get(kind)
         if handler is None:
@@ -306,20 +345,63 @@ class MutationApplier:
             consumer_dict[consumer_key] = new_func
             journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
 
-    def _apply_constant_rebind(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        name = change["name"]
-        compiled = compile(change["new_expr"], "<fest constant>", "eval")
-        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
-        target_dict = self.target_module.__dict__
-        old_value = target_dict.get(name, _MISSING)
-        target_dict[name] = new_value
-        journal.append(_restore_dict_slot, target_dict, name, old_value)
-        for consumer_dict, consumer_key in self.index.lookup(
-            self.target_module.__name__, name,
-        ):
-            old_consumer = consumer_dict.get(consumer_key, _MISSING)
-            consumer_dict[consumer_key] = new_value
-            journal.append(_restore_dict_slot, consumer_dict, consumer_key, old_consumer)
+    def _apply_statement_bind(
+        self, change: dict[str, Any], journal: PatchJournal,
+    ) -> None:
+        """Apply a statement-level binding mutation.
+
+        Module scope: exec the mutated statement against the module dict and
+        propagate every name in change["names"] through the reverse-import index.
+
+        Class scope: exec into a class-namespace dict (seeded with the current
+        class __dict__ so AugAssign / forward-refs work), then setattr each
+        bound name back onto the class. Class-scope mutations do not propagate
+        via the reverse-import index (consumers hold the class itself, not
+        individual attributes by name).
+        """
+        scope = change["scope"]
+        if scope["kind"] == "module":
+            target_dict = self.target_module.__dict__
+            for name in change["names"]:
+                prior = target_dict.get(name, _MISSING)
+                journal.append(_restore_dict_slot, target_dict, name, prior)
+            compiled = compile(change["stmt_source"], "<fest statement>", "exec")
+            _PY_EXEC(compiled, target_dict)
+            for name in change["names"]:
+                new_value = target_dict[name]
+                for consumer_dict, consumer_key in self.index.lookup(
+                    self.target_module.__name__, name,
+                ):
+                    old_consumer = consumer_dict.get(consumer_key, _MISSING)
+                    consumer_dict[consumer_key] = new_value
+                    journal.append(
+                        _restore_dict_slot, consumer_dict, consumer_key, old_consumer,
+                    )
+        else:
+            # Class scope.
+            try:
+                target_class = self._resolve_qualname(scope["qualname"])
+            except (AttributeError, KeyError):
+                raise _SkippedMutation(reason="missing_class_scope") from None
+            if target_class is None or not isinstance(target_class, type):
+                raise _SkippedMutation(reason="missing_class_scope")
+            module_globals = self.target_module.__dict__
+            # Seed locals with current class attrs so AugAssign / forward refs
+            # find prior bindings. mappingproxy → real dict.
+            class_ns: dict[str, Any] = dict(target_class.__dict__)
+            # Journal BEFORE the mutation (use _restore_class_attr because
+            # target_class.__dict__ is a mappingproxy and cannot be written to
+            # directly).
+            for name in change["names"]:
+                prior = target_class.__dict__.get(name, _MISSING)
+                journal.append(_restore_class_attr, target_class, name, prior)
+            compiled = compile(change["stmt_source"], "<fest statement>", "exec")
+            _PY_EXEC(compiled, module_globals, class_ns)
+            # Apply each named binding back onto the class.
+            for name in change["names"]:
+                if name in class_ns:
+                    setattr(target_class, name, class_ns[name])
+            # No reverse-index propagation for class scope.
 
     def _apply_class_method(self, change: dict[str, Any], journal: PatchJournal) -> None:
         cls = self._resolve_qualname(change["class_qualname"])
@@ -356,15 +438,6 @@ class MutationApplier:
         target_func.__annotations__ = dict(new_func.__annotations__)
         target_func.__dict__.clear()
         target_func.__dict__.update(new_func.__dict__)
-
-    def _apply_class_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
-        cls = self._resolve_qualname(change["class_qualname"])
-        name = change["name"]
-        compiled = compile(change["new_expr"], "<fest class attr>", "eval")
-        new_value = _PY_EVAL(compiled, self.target_module.__dict__)
-        old_value = cls.__dict__.get(name, _MISSING)
-        setattr(cls, name, new_value)
-        journal.append(_restore_class_attr, cls, name, old_value)
 
     def _apply_module_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
         name = change["name"]
@@ -511,7 +584,18 @@ def pytest_runtestloop(session: Any) -> bool:
                 conn.close()
                 return True
             if msg_type == "ready_ack":
+                ack_ver = msg.get("protocol_version")
+                if ack_ver != _PLUGIN_PROTOCOL_VERSION:
+                    print(
+                        f"[fest plugin] protocol version mismatch: runner={ack_ver}, "
+                        f"plugin={_PLUGIN_PROTOCOL_VERSION}. Aborting.",
+                        file=sys.stderr,
+                    )
+                    return True
                 rev_index.ingest_ast_layer(msg.get("import_bindings", []))
+                rev_index.ingest_pending_star_imports(
+                    msg.get("pending_star_imports", []),
+                )
                 _emit_reload_warnings(msg.get("reload_warnings", []))
                 continue
             if msg_type == "mutant":
@@ -617,23 +701,37 @@ def _handle_mutant(
     if not diff:
         return {
             "type": "result",
-            "status": "error",
-            "error_message": "no diff entries — mutation kind unsupported by IR derivation",
+            "status": "skipped",
+            "reason": "unsupported_statement",
         }
 
     journal = PatchJournal()
     applier = MutationApplier(target_module, rev_index)
     try:
         for change in diff:
-            applier.apply(change, journal)
+            try:
+                applier.apply(change, journal)
+            except _SkippedMutation as exc:
+                journal.rollback()
+                return {"type": "result", "status": "skipped", "reason": exc.reason}
+            except SyntaxError as exc:
+                journal.rollback()
+                return {
+                    "type": "result",
+                    "status": "error",
+                    "error_message": f"generated_syntax_error: {exc}",
+                }
+            except Exception as exc:  # noqa: BLE001
+                # Mutated code raised at exec — treat as killed (the mutation
+                # broke import-time behavior, which IS the test signal).
+                journal.rollback()
+                return {
+                    "type": "result",
+                    "status": "killed",
+                    "killed_by": f"exec_raised: {type(exc).__name__}",
+                }
         status = _run_tests(session, test_ids, item_index)
         return {"type": "result", "status": status}
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "type": "result",
-            "status": "error",
-            "error_message": f"runtime error: {exc}",
-        }
     finally:
         errors = journal.rollback()
         for err in errors:

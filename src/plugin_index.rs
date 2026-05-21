@@ -39,29 +39,162 @@ pub struct PluginIndex {
     pub import_bindings: Vec<ImportBinding>,
     /// All occurrences of `importlib.reload` / dynamic-import calls.
     pub reload_warnings: Vec<ReloadWarning>,
+    /// Module → static `__all__` literal contents, when expressible as a
+    /// list/tuple of string literals. Modules with dynamic `__all__` or no
+    /// `__all__` are absent.
+    #[serde(default)]
+    pub module_exports: std::collections::HashMap<String, Vec<String>>,
+    /// Star-imports awaiting runtime resolution (source module had no
+    /// static `__all__` we could parse). Populated by Task 13.
+    #[serde(default)]
+    pub pending_star_imports: Vec<PendingStarImport>,
+}
+
+/// A `from X import *` binding that couldn't be statically resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingStarImport {
+    /// Dotted name of the consumer (the file containing `from X import *`).
+    pub consumer_module: String,
+    /// Resolved source module name.
+    pub target_module: String,
+}
+
+impl PluginIndex {
+    /// Merge another index into this one.
+    #[inline]
+    pub fn merge(&mut self, other: Self) {
+        self.import_bindings.extend(other.import_bindings);
+        self.reload_warnings.extend(other.reload_warnings);
+        self.module_exports.extend(other.module_exports);
+        self.pending_star_imports.extend(other.pending_star_imports);
+    }
+
+    /// Walk every recorded `from X import *` placeholder and either synthesize
+    /// one named [`ImportBinding`] per name in the target's static `__all__`
+    /// (when [`PluginIndex::module_exports`] has it), or convert the
+    /// placeholder to a [`PendingStarImport`] for the plugin to resolve at
+    /// runtime.
+    #[inline]
+    pub fn resolve_star_imports(&mut self) {
+        // Partition into placeholders and real bindings without borrowing
+        // self twice. Two owned Vecs, then write back.
+        let owned = core::mem::take(&mut self.import_bindings);
+        let mut placeholders: Vec<ImportBinding> = Vec::new();
+        let mut kept: Vec<ImportBinding> = Vec::with_capacity(owned.len());
+        for binding in owned {
+            if binding.target_name == "*" {
+                placeholders.push(binding);
+            } else {
+                kept.push(binding);
+            }
+        }
+        self.import_bindings = kept;
+        for ph in placeholders {
+            if let Some(names) = self.module_exports.get(&ph.target_module).cloned() {
+                for name in names {
+                    self.import_bindings.push(ImportBinding {
+                        consumer_module: ph.consumer_module.clone(),
+                        consumer_key: name.clone(),
+                        target_module: ph.target_module.clone(),
+                        target_name: name,
+                    });
+                }
+            } else {
+                self.pending_star_imports.push(PendingStarImport {
+                    consumer_module: ph.consumer_module,
+                    target_module: ph.target_module,
+                });
+            }
+        }
+    }
 }
 
 /// Parse a single source file and emit its [`PluginIndex`] contribution.
+#[inline]
 #[must_use]
 pub fn scan_source(
     source: &str,
     consumer_module: &str,
     file_path: &std::path::Path,
 ) -> PluginIndex {
-    let parsed = match parse_module(source) {
-        Ok(p) => p,
-        Err(_) => return PluginIndex::default(),
+    let Ok(parsed) = parse_module(source) else {
+        return PluginIndex::default();
     };
     let ast: ModModule = parsed.into_syntax();
     let mut out = PluginIndex::default();
     for stmt in &ast.body {
         collect_from_stmt(stmt, source, consumer_module, file_path, &mut out);
     }
+    if let Some(names) = extract_static_all(&ast) {
+        let _prev = out.module_exports.insert(consumer_module.to_owned(), names);
+    }
     out
+}
+
+/// Extract a static `__all__` list from a parsed module body.
+///
+/// Returns `Some(names)` only when `__all__` is assigned a list or tuple
+/// literal whose elements are all string literals. Any other shape
+/// (function call, list comprehension, conditional, non-string elements)
+/// returns `None`, and the caller treats the module's `__all__` as dynamic.
+#[allow(
+    clippy::pattern_type_mismatch,
+    reason = "matching on &Stmt and &Expr references from AST iteration; adding & is more verbose"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only List and Tuple are valid static __all__ shapes; all other Expr variants \
+              continue"
+)]
+fn extract_static_all(ast: &ModModule) -> Option<Vec<String>> {
+    use ruff_python_ast::{Expr, Stmt};
+    for stmt in &ast.body {
+        let (target, value): (&Expr, &Expr) = match stmt {
+            Stmt::Assign(assign) => {
+                // Single bare-Name target __all__ only.
+                let [target] = assign.targets.as_slice() else {
+                    continue;
+                };
+                (target, &*assign.value)
+            }
+            Stmt::AnnAssign(ann) => {
+                // `__all__: list[str] = [...]` — value must be present.
+                let Some(value) = ann.value.as_deref() else {
+                    continue;
+                };
+                (&*ann.target, value)
+            }
+            _ => continue,
+        };
+        let Expr::Name(name_expr) = target else {
+            continue;
+        };
+        if name_expr.id.as_str() != "__all__" {
+            continue;
+        }
+        let elts: &[Expr] = match value {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tup) => &tup.elts,
+            _ => continue,
+        };
+        let mut names = Vec::with_capacity(elts.len());
+        for elt in elts {
+            let Expr::StringLiteral(s) = elt else {
+                return None;
+            };
+            names.push(s.value.to_str().to_owned());
+        }
+        return Some(names);
+    }
+    None
 }
 
 /// Collect `from`-import bindings AND reload/dynamic-import warnings
 /// from a single top-level statement.
+#[allow(
+    clippy::pattern_type_mismatch,
+    reason = "matching on &Stmt reference; adding & to pattern is more verbose"
+)]
 fn collect_from_stmt(
     stmt: &Stmt,
     source: &str,
@@ -70,10 +203,20 @@ fn collect_from_stmt(
     out: &mut PluginIndex,
 ) {
     if let Stmt::ImportFrom(import) = stmt {
-        let level = u32::from(import.level);
-        let target_module = resolve_import_from(consumer_module, &import.module, level);
+        let level = import.level;
+        let target_module = resolve_import_from(consumer_module, import.module.as_ref(), level);
         for alias in &import.names {
             let target_name = alias.name.id.to_string();
+            // `from X import *` — emit a star placeholder for later resolution.
+            if target_name == "*" {
+                out.import_bindings.push(ImportBinding {
+                    consumer_module: consumer_module.to_owned(),
+                    consumer_key: "*".to_owned(),
+                    target_module: target_module.clone(),
+                    target_name: "*".to_owned(),
+                });
+                continue;
+            }
             let consumer_key = alias
                 .asname
                 .as_ref()
@@ -110,16 +253,21 @@ fn walk_stmt_for_calls(
     }
 
     impl<'src> Visitor<'src> for CallVisitor<'src> {
+        #[allow(
+            clippy::pattern_type_mismatch,
+            reason = "matching on &Expr reference from visitor; adding & to pattern is more \
+                      verbose"
+        )]
         fn visit_expr(&mut self, expr: &'src ruff_python_ast::Expr) {
-            if let ruff_python_ast::Expr::Call(call) = expr {
-                if let Some(kind) = classify_call(&call.func) {
-                    let line = line_at(self.source, call.range().start().to_usize());
-                    self.out.reload_warnings.push(ReloadWarning {
-                        file: self.file.to_path_buf(),
-                        line,
-                        kind: kind.to_owned(),
-                    });
-                }
+            if let ruff_python_ast::Expr::Call(call) = expr
+                && let Some(kind) = classify_call(&call.func)
+            {
+                let line = line_at(self.source, call.range().start().to_usize());
+                self.out.reload_warnings.push(ReloadWarning {
+                    file: self.file.to_path_buf(),
+                    line,
+                    kind: kind.to_owned(),
+                });
             }
             walk_expr(self, expr);
         }
@@ -135,10 +283,27 @@ fn walk_stmt_for_calls(
 
 /// Classify a call expression as `reload` / `import_module` / `__import__`,
 /// or `None` for unrelated calls.
+#[allow(
+    clippy::pattern_type_mismatch,
+    reason = "matching on &Expr references; adding & to each arm is more verbose"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only Attribute and Name variants are relevant for import classification; all others \
+              return None"
+)]
 fn classify_call(callee: &ruff_python_ast::Expr) -> Option<&'static str> {
     match callee {
         ruff_python_ast::Expr::Attribute(attr) => {
             let leaf = attr.attr.id.as_str();
+            #[allow(
+                clippy::pattern_type_mismatch,
+                reason = "matching on &Expr reference from Box<Expr>; adding & is more verbose"
+            )]
+            #[allow(
+                clippy::wildcard_enum_match_arm,
+                reason = "only Name is meaningful as importlib base; all others return None"
+            )]
             let base = match attr.value.as_ref() {
                 ruff_python_ast::Expr::Name(n) => n.id.as_str(),
                 _ => return None,
@@ -166,18 +331,16 @@ fn line_at(source: &str, byte_offset: usize) -> u32 {
 /// dotted module name, taking relative-import dot-level into account.
 fn resolve_import_from(
     consumer_module: &str,
-    explicit: &Option<ruff_python_ast::Identifier>,
+    explicit: Option<&ruff_python_ast::Identifier>,
     level: u32,
 ) -> String {
     if level == 0 {
-        return explicit
-            .as_ref()
-            .map_or(String::new(), |id| id.id.to_string());
+        return explicit.map_or(String::new(), |id| id.id.to_string());
     }
     let parts: Vec<&str> = consumer_module.split('.').collect();
     let drop = level as usize;
     let prefix_end = parts.len().saturating_sub(drop);
-    let mut prefix: String = parts[..prefix_end].join(".");
+    let mut prefix: String = parts.get(..prefix_end).unwrap_or_default().join(".");
     if let Some(extra) = explicit {
         if !prefix.is_empty() {
             prefix.push('.');
@@ -192,9 +355,11 @@ fn resolve_import_from(
 /// # Errors
 ///
 /// Returns [`std::io::Error`] from filesystem operations.
+#[inline]
 pub fn scan_project(root: &std::path::Path) -> std::io::Result<PluginIndex> {
     let mut out = PluginIndex::default();
     walk_dir(root, root, &mut out)?;
+    out.resolve_star_imports();
     Ok(out)
 }
 
@@ -207,8 +372,8 @@ fn walk_dir(
     cur: &std::path::Path,
     out: &mut PluginIndex,
 ) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(cur)? {
-        let entry = entry?;
+    for dir_entry in std::fs::read_dir(cur)? {
+        let entry = dir_entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
@@ -224,14 +389,12 @@ fn walk_dir(
         if path.extension().and_then(|s| s.to_str()) != Some("py") {
             continue;
         }
-        let source = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
         };
         let module_name = path_to_module(root, &path);
         let scanned = scan_source(&source, &module_name, &path);
-        out.import_bindings.extend(scanned.import_bindings);
-        out.reload_warnings.extend(scanned.reload_warnings);
+        out.merge(scanned);
     }
     Ok(())
 }
@@ -304,6 +467,38 @@ mod tests {
     }
 
     #[test]
+    fn aliased_reexport_records_target_and_local_names_separately() {
+        let src = "from pkg.models import User as MyUser\n";
+        let index = scan_source(src, "pkg.api", &PathBuf::from("pkg/api.py"));
+        assert_eq!(
+            index.import_bindings.len(),
+            1,
+            "expected one binding for aliased import, got {:?}",
+            index.import_bindings
+        );
+        let b = &index.import_bindings[0];
+        assert_eq!(b.consumer_module, "pkg.api");
+        assert_eq!(
+            b.consumer_key, "MyUser",
+            "consumer_key must be the alias (MyUser)"
+        );
+        assert_eq!(b.target_module, "pkg.models");
+        assert_eq!(
+            b.target_name, "User",
+            "target_name must be the original name (User)"
+        );
+    }
+
+    #[test]
+    fn aliased_reexport_without_as_keeps_names_equal() {
+        let src = "from pkg.models import User\n";
+        let index = scan_source(src, "pkg.api", &PathBuf::from("pkg/api.py"));
+        let b = &index.import_bindings[0];
+        assert_eq!(b.consumer_key, "User");
+        assert_eq!(b.target_name, "User");
+    }
+
+    #[test]
     fn scan_source_resolves_relative_one_dot() {
         let src = "from .sib import x\n";
         let index = scan_source(src, "myproj.subpkg.consumer", &PathBuf::from("c.py"));
@@ -373,6 +568,145 @@ mod tests {
         // Only the real source is scanned; the __pycache__ entry is skipped.
         assert_eq!(index.import_bindings.len(), 1);
         assert_eq!(index.import_bindings[0].target_module, "foo");
+    }
+
+    #[test]
+    fn scan_source_detects_static_all_literal() {
+        let src = r#"
+__all__ = ["User", "Group"]
+class User: pass
+class Group: pass
+class _Private: pass
+"#;
+        let index = scan_source(src, "pkg.models", std::path::Path::new("pkg/models.py"));
+        assert_eq!(
+            index.module_exports.get("pkg.models"),
+            Some(&vec!["User".to_owned(), "Group".to_owned()]),
+            "static __all__ list literal should populate module_exports",
+        );
+    }
+
+    #[test]
+    fn scan_source_detects_static_all_tuple_literal() {
+        let src = r#"__all__ = ("a", "b")
+a = 1
+b = 2
+"#;
+        let index = scan_source(src, "pkg.x", std::path::Path::new("pkg/x.py"));
+        assert_eq!(
+            index.module_exports.get("pkg.x"),
+            Some(&vec!["a".to_owned(), "b".to_owned()]),
+            "static __all__ tuple literal should populate module_exports",
+        );
+    }
+
+    #[test]
+    fn scan_source_detects_annotated_all_literal() {
+        let src = "__all__: list[str] = [\"A\", \"B\"]\nA = 1\nB = 2\n";
+        let index = scan_source(src, "pkg.ann", std::path::Path::new("pkg/ann.py"));
+        assert_eq!(
+            index.module_exports.get("pkg.ann"),
+            Some(&vec!["A".to_owned(), "B".to_owned()]),
+            "annotated __all__ list literal should populate module_exports",
+        );
+    }
+
+    #[test]
+    fn scan_source_skips_dynamic_all() {
+        let src = "__all__ = [n for n in dir() if not n.startswith('_')]\n";
+        let index = scan_source(src, "pkg.dyn", std::path::Path::new("pkg/dyn.py"));
+        assert!(
+            index.module_exports.get("pkg.dyn").is_none(),
+            "dynamic __all__ (list comp) should NOT produce static exports"
+        );
+    }
+
+    #[test]
+    fn scan_source_skips_non_string_all() {
+        // Mixed-type or non-string literals are ignored.
+        let src = "__all__ = [1, 2]\n";
+        let index = scan_source(src, "pkg.bad", std::path::Path::new("pkg/bad.py"));
+        assert!(
+            index.module_exports.get("pkg.bad").is_none(),
+            "non-string literal __all__ should be ignored"
+        );
+    }
+
+    #[test]
+    fn scan_source_no_all_leaves_module_exports_empty() {
+        let src = "class A: pass\nclass B: pass\n";
+        let index = scan_source(src, "pkg.noall", std::path::Path::new("pkg/noall.py"));
+        assert!(
+            index.module_exports.is_empty(),
+            "modules without __all__ should not appear in module_exports"
+        );
+    }
+
+    #[test]
+    fn star_import_resolves_via_static_all() {
+        let api = "from .models import *\n";
+        let models = "__all__ = [\"User\", \"Group\"]\nclass User: pass\nclass Group: pass\nclass \
+                      _P: pass\n";
+        let mut index = scan_source(api, "pkg.api", std::path::Path::new("pkg/api.py"));
+        let mods = scan_source(models, "pkg.models", std::path::Path::new("pkg/models.py"));
+        index.merge(mods);
+        index.resolve_star_imports();
+
+        let names: Vec<String> = index
+            .import_bindings
+            .iter()
+            .filter(|b| b.consumer_module == "pkg.api" && b.target_module == "pkg.models")
+            .map(|b| b.target_name.clone())
+            .collect();
+        assert_eq!(names, vec!["User".to_owned(), "Group".to_owned()]);
+        assert!(
+            index.pending_star_imports.is_empty(),
+            "static resolution should leave no pending entries"
+        );
+    }
+
+    #[test]
+    fn star_import_without_all_falls_through_to_pending() {
+        let api = "from .models import *\n";
+        let models = "class Open: pass\nclass _Hidden: pass\n"; // no __all__
+        let mut index = scan_source(api, "pkg.api", std::path::Path::new("pkg/api.py"));
+        let mods = scan_source(models, "pkg.models", std::path::Path::new("pkg/models.py"));
+        index.merge(mods);
+        index.resolve_star_imports();
+
+        assert!(
+            !index.pending_star_imports.is_empty(),
+            "missing __all__ should leave a pending entry for runtime resolution"
+        );
+        assert_eq!(index.pending_star_imports[0].consumer_module, "pkg.api");
+        assert_eq!(index.pending_star_imports[0].target_module, "pkg.models");
+        // The placeholder should not still be in import_bindings.
+        let star_count = index
+            .import_bindings
+            .iter()
+            .filter(|b| b.target_name == "*")
+            .count();
+        assert_eq!(
+            star_count, 0,
+            "star placeholders should be removed after resolve"
+        );
+    }
+
+    #[test]
+    fn star_import_resolution_is_idempotent() {
+        let api = "from .models import *\n";
+        let models = "__all__ = [\"A\"]\nclass A: pass\n";
+        let mut index = scan_source(api, "pkg.api", std::path::Path::new("pkg/api.py"));
+        let mods = scan_source(models, "pkg.models", std::path::Path::new("pkg/models.py"));
+        index.merge(mods);
+        index.resolve_star_imports();
+        let count_after_first = index.import_bindings.len();
+        index.resolve_star_imports();
+        assert_eq!(
+            index.import_bindings.len(),
+            count_after_first,
+            "second resolve should be a no-op"
+        );
     }
 
     #[cfg(unix)]

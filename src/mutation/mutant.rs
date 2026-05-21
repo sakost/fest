@@ -7,7 +7,7 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single source-level mutation.
 ///
@@ -59,8 +59,23 @@ impl Mutant {
     }
 }
 
+/// Why a mutant was skipped (not run through tests). Reported alongside the
+/// mutation score but excluded from the denominator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// AST target was not a bare `Name` (e.g. `d[k] = v`, `obj.x = v`).
+    UnmappableTarget,
+    /// Mutation landed on the test expression of `if`/`while`/`for` — out of scope.
+    ConditionMutation,
+    /// Statement kind not matched by any `derive_for_top_level` arm.
+    UnsupportedStatement,
+    /// Class qualname referenced by a class-scoped `StatementBind` did not resolve.
+    MissingClassScope,
+}
+
 /// Outcome of running the test suite against a single mutant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutantStatus {
     /// The test suite detected the mutant (at least one test failed).
     Killed,
@@ -70,6 +85,11 @@ pub enum MutantStatus {
     Timeout,
     /// No tests cover the mutated code, so the mutant was not exercised.
     NoCoverage,
+    /// fest couldn't represent or deliver this mutation. Not a tooling failure.
+    Skipped {
+        /// The specific reason this mutation was skipped.
+        reason: SkipReason,
+    },
     /// An unexpected error occurred while testing this mutant.
     Error(String),
 }
@@ -278,6 +298,47 @@ mod tests {
         };
 
         assert_eq!(mutant.apply_to_source(source), "x = a * b");
+    }
+
+    #[test]
+    fn skipped_status_with_reason_serializes_to_json() {
+        use serde_json::json;
+        let status = MutantStatus::Skipped {
+            reason: SkipReason::ConditionMutation,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v, json!({"Skipped": {"reason": "condition_mutation"}}));
+    }
+
+    #[test]
+    fn skipped_status_round_trips_through_serde() {
+        let status = MutantStatus::Skipped {
+            reason: SkipReason::UnmappableTarget,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: MutantStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn skip_reason_variants_all_serialize_to_snake_case() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(&SkipReason::UnmappableTarget).unwrap(),
+            json!("unmappable_target")
+        );
+        assert_eq!(
+            serde_json::to_value(&SkipReason::ConditionMutation).unwrap(),
+            json!("condition_mutation")
+        );
+        assert_eq!(
+            serde_json::to_value(&SkipReason::UnsupportedStatement).unwrap(),
+            json!("unsupported_statement")
+        );
+        assert_eq!(
+            serde_json::to_value(&SkipReason::MissingClassScope).unwrap(),
+            json!("missing_class_scope")
+        );
     }
 
     /// `apply_to_source` preserves surrounding multiline code.

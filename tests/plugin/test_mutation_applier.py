@@ -84,7 +84,7 @@ def test_nested_function_body_via_co_consts(target_module):
     assert target_module.outer()() == 1
 
 
-def test_constant_rebind_updates_target_and_consumer(target_module):
+def test_statement_bind_updates_target_and_consumer(target_module):
     target_module.MAX = 100
     consumer = {"MAX": 100}
     idx = ReverseImportIndex()
@@ -93,7 +93,12 @@ def test_constant_rebind_updates_target_and_consumer(target_module):
     journal = PatchJournal()
 
     applier.apply(
-        {"kind": "constant_bind", "name": "MAX", "new_expr": "101"},
+        {
+            "kind": "statement_bind",
+            "names": ["MAX"],
+            "stmt_source": "MAX = 101",
+            "scope": {"kind": "module"},
+        },
         journal,
     )
 
@@ -198,15 +203,20 @@ def test_property_fget_mutation(target_module):
     assert C().x == 1
 
 
-def test_class_attr_rebind(target_module):
+def test_statement_bind_class_scope_simple(target_module):
     src = "class C:\n    LIMIT = 10\n"
     exec(compile(src, "<test>", "exec"), target_module.__dict__)
     C = target_module.C
 
     applier = MutationApplier(target_module, ReverseImportIndex())
     journal = PatchJournal()
-    applier.apply(
-        {"kind": "class_attr", "class_qualname": "C", "name": "LIMIT", "new_expr": "11"},
+    applier._apply_statement_bind(
+        {
+            "kind": "statement_bind",
+            "names": ["LIMIT"],
+            "stmt_source": "LIMIT = 11",
+            "scope": {"kind": "class", "qualname": "C"},
+        },
         journal,
     )
 
@@ -301,6 +311,31 @@ def test_apply_with_no_changes_is_noop(target_module):
     assert journal.rollback() == []
 
 
+def test_statement_bind_aug_assign_uses_current_value(target_module):
+    """AugAssign reads the prior value from the namespace at exec time."""
+    target_module.COUNTER = 5
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    change = {
+        "kind": "statement_bind",
+        "names": ["COUNTER"],
+        "stmt_source": "COUNTER += 2",
+        "scope": {"kind": "module"},
+    }
+    applier.apply(change, journal)
+    assert target_module.COUNTER == 7  # 5 + 2 — reads current namespace value
+    journal.rollback()
+    assert target_module.COUNTER == 5
+
+
+@pytest.fixture
+def applier_setup(target_module):
+    """Return (applier, module, journal) bound to a fresh target module."""
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    return applier, target_module, journal
+
+
 def test_journal_restores_first_change_when_second_apply_raises(target_module):
     target_module.MAX = 100
     consumer = {"MAX": 100}
@@ -311,17 +346,102 @@ def test_journal_restores_first_change_when_second_apply_raises(target_module):
     journal = PatchJournal()
 
     applier.apply(
-        {"kind": "constant_bind", "name": "MAX", "new_expr": "101"},
+        {
+            "kind": "statement_bind",
+            "names": ["MAX"],
+            "stmt_source": "MAX = 101",
+            "scope": {"kind": "module"},
+        },
         journal,
     )
     assert target_module.MAX == 101
 
     with pytest.raises(SyntaxError):
         applier.apply(
-            {"kind": "constant_bind", "name": "MAX", "new_expr": "(("},
+            {
+                "kind": "statement_bind",
+                "names": ["MAX"],
+                "stmt_source": "MAX = ((",
+                "scope": {"kind": "module"},
+            },
             journal,
         )
 
     journal.rollback()
     assert target_module.MAX == 100
     assert consumer["MAX"] == 100
+
+
+def test_statement_bind_multi_name(applier_setup):
+    """Tuple unpack at module scope binds both names; rollback restores both."""
+    applier, module, journal = applier_setup
+    module.a = 99   # pre-state — verify journal restores
+    # 'b' is intentionally unset, so journal records _MISSING and rollback deletes.
+    change = {
+        "kind": "statement_bind",
+        "names": ["a", "b"],
+        "stmt_source": "a, b = 1, 3",
+        "scope": {"kind": "module"},
+    }
+    applier._apply_statement_bind(change, journal)
+    assert module.a == 1
+    assert module.b == 3
+    journal.rollback()
+    assert module.a == 99
+    assert not hasattr(module, "b"), "b was _MISSING pre-mutation; rollback should delete"
+
+
+def test_statement_bind_class_scope_exec_uses_module_globals(applier_setup):
+    """Class body sees module globals during exec — needed for forward refs."""
+    applier, module, journal = applier_setup
+    module.HELPER = lambda: 7
+    class C:
+        pass
+    module.C = C
+    change = {
+        "kind": "statement_bind",
+        "names": ["X"],
+        "stmt_source": "X = HELPER()",
+        "scope": {"kind": "class", "qualname": "C"},
+    }
+    applier._apply_statement_bind(change, journal)
+    assert C.X == 7
+    journal.rollback()
+    assert not hasattr(C, "X")
+
+
+def test_statement_bind_class_scope_missing_class_raises_skipped(applier_setup):
+    """If the class qualname doesn't resolve, raise _SkippedMutation."""
+    from _fest_plugin import _SkippedMutation
+    applier, module, journal = applier_setup
+    change = {
+        "kind": "statement_bind",
+        "names": ["X"],
+        "stmt_source": "X = 1",
+        "scope": {"kind": "class", "qualname": "NotARealClass"},
+    }
+    try:
+        applier._apply_statement_bind(change, journal)
+        raised = False
+    except _SkippedMutation as exc:
+        raised = True
+        assert exc.reason == "missing_class_scope"
+    assert raised, "expected _SkippedMutation for missing class"
+
+
+def test_statement_bind_class_scope_aug_assign_reads_current_value(applier_setup):
+    """AugAssign inside a class reads the current class attribute."""
+    applier, module, journal = applier_setup
+    class C:
+        counter = 5
+    module.C = C
+    change = {
+        "kind": "statement_bind",
+        "names": ["counter"],
+        "stmt_source": "counter += 2",
+        "scope": {"kind": "class", "qualname": "C"},
+    }
+    applier._apply_statement_bind(change, journal)
+    assert C.counter == 7
+    journal.rollback()
+    assert C.counter == 5

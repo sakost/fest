@@ -54,6 +54,7 @@ pub(super) const fn format_status_tag(status: &MutantStatus) -> &'static str {
         MutantStatus::Timeout => "TIMEOUT",
         MutantStatus::NoCoverage => "NO_COV",
         MutantStatus::Error(_) => "ERROR",
+        MutantStatus::Skipped { .. } => "SKIPPED",
     }
 }
 
@@ -136,6 +137,10 @@ fn status_icon_and_tag(
         ),
         MutantStatus::NoCoverage => (
             style("∅").dim().force_styling(true),
+            style(tag_owned).dim().force_styling(true),
+        ),
+        MutantStatus::Skipped { .. } => (
+            style("⊘").dim().force_styling(true),
             style(tag_owned).dim().force_styling(true),
         ),
     }

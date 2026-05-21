@@ -26,7 +26,7 @@ pub mod mutator;
 pub(crate) mod seed;
 
 pub use diff::MutationDiff;
-pub use mutant::{Mutant, MutantResult, MutantStatus};
+pub use mutant::{Mutant, MutantResult, MutantStatus, SkipReason};
 pub use mutator::{Mutation, MutationContext, Mutator, MutatorRegistry};
 
 /// Options for mutant generation that control filtering and per-file overrides.
