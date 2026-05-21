@@ -20,6 +20,7 @@ pub mod error;
 pub mod init;
 pub mod mutation;
 pub mod plugin;
+pub mod plugin_index;
 pub mod progress;
 pub mod python;
 pub mod report;

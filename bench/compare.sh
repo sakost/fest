@@ -120,6 +120,7 @@ run_fest() {
     FEST_TOTAL=$(echo "$FEST_OUTPUT" | grep -oP 'Mutants generated:\s*\K[0-9]+' || echo "?")
     FEST_KILLED=$(echo "$FEST_OUTPUT" | grep -oP 'Killed:\s*\K[0-9]+' | head -1 || echo "?")
     FEST_SURVIVED=$(echo "$FEST_OUTPUT" | grep -oP 'Survived:\s*\K[0-9]+' | head -1 || echo "?")
+    FEST_SKIPPED=$(echo "$FEST_OUTPUT" | grep -oP 'Skipped:\s*\K[0-9]+' | head -1 || echo "0")
     FEST_ERRORS=$(echo "$FEST_OUTPUT" | grep -oP 'Errors:\s*\K[0-9]+' | head -1 || echo "?")
     FEST_SCORE=$(echo "$FEST_OUTPUT" | grep -oP 'Mutation Score:\s*\K[0-9.]+%' || echo "?")
 
@@ -311,7 +312,7 @@ fi
 echo ""
 
 # Initialize result variables
-FEST_TIME="" FEST_TOTAL="" FEST_KILLED="" FEST_SURVIVED="" FEST_ERRORS="" FEST_SCORE=""
+FEST_TIME="" FEST_TOTAL="" FEST_KILLED="" FEST_SURVIVED="" FEST_SKIPPED="" FEST_ERRORS="" FEST_SCORE=""
 CR_TIME="" CR_TOTAL="" CR_KILLED="" CR_SURVIVED="" CR_ERRORS="" CR_SCORE=""
 
 # Run tools
@@ -331,6 +332,7 @@ printf "  %-20s %12s %12s\n"               "------" "----" "----------"
 printf "  %-20s %12s %12s\n" "Total mutants"  "$FEST_TOTAL"    "$CR_TOTAL"
 printf "  %-20s %12s %12s\n" "Killed"         "$FEST_KILLED"   "$CR_KILLED"
 printf "  %-20s %12s %12s\n" "Survived"       "$FEST_SURVIVED" "$CR_SURVIVED"
+printf "  %-20s %12s %12s\n" "Skipped"        "$FEST_SKIPPED"  "N/A"
 printf "  %-20s %12s %12s\n" "Errors"         "$FEST_ERRORS"   "$CR_ERRORS"
 printf "  %-20s %12s %12s\n" "Kill rate"      "$FEST_SCORE"    "$CR_SCORE"
 

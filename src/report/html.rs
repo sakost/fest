@@ -99,6 +99,7 @@ fn write_css_body(output: &mut String) {
         ".status-timeout { color: #856404; }\n",
         ".status-no-coverage { color: #383d41; }\n",
         ".status-error { color: #721c24; font-style: italic; }\n",
+        ".status-skipped { color: #d4a017; }\n",
     );
     output.push_str(css);
 }
@@ -133,6 +134,9 @@ fn write_summary_rows(report: &MutationReport, output: &mut String) -> Result<()
     write_summary_row(output, "Mutants tested", report.mutants_tested)?;
     write_summary_row(output, "Killed", report.killed)?;
     write_summary_row(output, "Survived", report.survived)?;
+    if report.skipped > 0 {
+        write_summary_row(output, "Skipped", report.skipped)?;
+    }
     write_summary_row(output, "Timeout", report.timeouts)?;
     write_summary_row(output, "Errors", report.errors)?;
     write_summary_row(output, "No coverage", report.no_coverage)?;
@@ -325,6 +329,7 @@ const fn status_css_class(status: &MutantStatus) -> &'static str {
         MutantStatus::Timeout => "status-timeout",
         MutantStatus::NoCoverage => "status-no-coverage",
         MutantStatus::Error(_) => "status-error",
+        MutantStatus::Skipped { .. } => "status-skipped",
     }
 }
 
@@ -336,6 +341,7 @@ const fn status_display_label(status: &MutantStatus) -> &'static str {
         MutantStatus::Timeout => "TIMEOUT",
         MutantStatus::NoCoverage => "NO COVERAGE",
         MutantStatus::Error(_) => "ERROR",
+        MutantStatus::Skipped { .. } => "SKIPPED",
     }
 }
 

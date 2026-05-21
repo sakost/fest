@@ -1,0 +1,3 @@
+[tool.fest]
+source = ["src"]
+test = ["tests"]
