@@ -203,6 +203,28 @@ def _restore_code(func: Any, code: Any) -> None:
     func.__code__ = code
 
 
+def _clear_memoization(wrapper: Any, journal: PatchJournal) -> None:
+    """Drop memoized results around a code swap on a cached function.
+
+    A ``functools.lru_cache``/``functools.cache`` wrapper holds results
+    computed by the *pre-mutation* code, so cached hits would mask the
+    mutation entirely (in a fresh subprocess the cache starts empty, which
+    is why only the persistent-worker backend is affected). Clearing must
+    also happen on rollback: results computed *under* the mutation must
+    not leak into subsequent mutants.
+    """
+    cache_clear = getattr(wrapper, "cache_clear", None)
+    if cache_clear is None:
+        return
+    cache_clear()
+    journal.append(_call_cache_clear, wrapper)
+
+
+def _call_cache_clear(wrapper: Any) -> None:
+    """Rollback step: clear a memoization cache."""
+    wrapper.cache_clear()
+
+
 def _restore_dict_slot(target_dict: dict[str, Any], key: str, old_value: Any) -> None:
     """Restore a dict slot, deleting if the original value was missing."""
     if old_value is _MISSING:
@@ -300,6 +322,7 @@ class MutationApplier:
         target_func.__annotations__ = dict(new_func.__annotations__)
         target_func.__dict__.clear()
         target_func.__dict__.update(new_func.__dict__)
+        _clear_memoization(wrapped, journal)
 
     def _apply_nested_function_body(
         self, qualname: str, new_source: str, journal: PatchJournal,
@@ -438,6 +461,7 @@ class MutationApplier:
         target_func.__annotations__ = dict(new_func.__annotations__)
         target_func.__dict__.clear()
         target_func.__dict__.update(new_func.__dict__)
+        _clear_memoization(descriptor, journal)
 
     def _apply_module_attr(self, change: dict[str, Any], journal: PatchJournal) -> None:
         name = change["name"]

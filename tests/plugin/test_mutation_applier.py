@@ -469,3 +469,42 @@ def test_handle_mutant_errors_when_no_test_ids_match(target_module):
     )
     assert result["status"] == "error"
     assert "matched" in result["error_message"]
+
+
+def test_function_body_clears_lru_cache_on_apply_and_rollback(target_module):
+    """Memoized results must not mask a mutation, nor leak past rollback.
+
+    Regression: tomli's ``@lru_cache`` ``cached_tz`` survived every mutant
+    in the plugin backend because earlier in-worker test runs had already
+    populated the cache; the mutated code never executed.
+    """
+    import functools
+
+    ns: dict = {"functools": functools}
+    exec(
+        "import functools\n"
+        "@functools.lru_cache(maxsize=None)\n"
+        "def compute(x):\n"
+        "    return x + 1\n",
+        ns,
+    )
+    target_module.compute = ns["compute"]
+    target_module.compute.__wrapped__.__globals__.update(target_module.__dict__)
+
+    assert target_module.compute(1) == 2  # populate the cache pre-mutation
+
+    applier = MutationApplier(target_module, ReverseImportIndex())
+    journal = PatchJournal()
+    change = {
+        "kind": "function_body",
+        "qualname": "compute",
+        "new_source": "def compute(x):\n    return x + 100\n",
+    }
+    applier.apply(change, journal)
+    assert target_module.compute(1) == 101, (
+        "cached pre-mutation result masked the mutation"
+    )
+    journal.rollback()
+    assert target_module.compute(1) == 2, (
+        "mutated result leaked through the cache after rollback"
+    )
