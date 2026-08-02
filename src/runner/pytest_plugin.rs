@@ -188,20 +188,7 @@ impl PersistentWorker {
         let env = prepare_worker_env()?;
 
         let mut child = Command::new(crate::python::resolve_python(project_dir))
-            .args([
-                "-m",
-                "pytest",
-                "-p",
-                "_fest_plugin",
-                "--fest-socket",
-                &env.socket_addr_str,
-                "-p",
-                "no:xdist",
-                "-o",
-                "addopts=",
-                "--no-header",
-                "-q",
-            ])
+            .args(build_worker_args(&env.socket_addr_str, project_dir))
             .current_dir(project_dir)
             .env("PYTHONPATH", &env.python_path)
             .stdout(std::process::Stdio::null())
@@ -320,6 +307,25 @@ struct WorkerPool {
 
     /// Receiver to borrow workers.
     receiver: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PersistentWorker>>,
+
+    /// Context for respawning replacements of discarded workers. `None`
+    /// disables respawning (unit tests).
+    respawn: Option<RespawnContext>,
+}
+
+/// Everything needed to spawn a replacement worker after a discard.
+///
+/// Without respawning, every timed-out mutant permanently shrinks the
+/// pool; once it is empty every remaining mutant is misreported as
+/// `Timeout` without ever running.
+#[derive(Clone)]
+struct RespawnContext {
+    /// Startup timeout for the replacement worker (pytest must collect).
+    startup_timeout: Duration,
+    /// Project directory the worker runs in.
+    project_dir: std::path::PathBuf,
+    /// Shared plugin index sent in the `ready_ack` handshake.
+    index: Arc<crate::plugin_index::PluginIndex>,
 }
 
 impl core::fmt::Debug for WorkerPool {
@@ -330,7 +336,7 @@ impl core::fmt::Debug for WorkerPool {
 
 impl WorkerPool {
     /// Create a new pool containing the given workers.
-    fn new(workers: Vec<PersistentWorker>) -> Self {
+    fn new(workers: Vec<PersistentWorker>, respawn: Option<RespawnContext>) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         for worker in workers {
             // Channel is unbounded and fresh — send cannot fail.
@@ -339,7 +345,32 @@ impl WorkerPool {
         Self {
             sender,
             receiver: tokio::sync::Mutex::new(receiver),
+            respawn,
         }
+    }
+
+    /// Discard an unhealthy worker and spawn a replacement in the
+    /// background so the pool does not shrink permanently.
+    ///
+    /// The replacement joins the pool when its pytest collection finishes;
+    /// if the respawn fails the pool shrinks by one (the borrow-timeout
+    /// safeguard in [`run_via_pool`] still prevents deadlock).
+    fn discard_and_respawn(self: &Arc<Self>, worker: PersistentWorker) {
+        let Some(ctx) = self.respawn.clone() else {
+            drop(tokio::spawn(async move { worker.shutdown().await }));
+            return;
+        };
+        let pool = Arc::clone(self);
+        drop(tokio::spawn(async move {
+            worker.shutdown().await;
+            match PersistentWorker::spawn(ctx.startup_timeout, &ctx.project_dir, ctx.index).await {
+                Ok(replacement) => pool.return_worker(replacement),
+                Err(_err) => {
+                    // Replacement failed (e.g. project env broke mid-run):
+                    // the pool shrinks by one; nothing else to do.
+                }
+            }
+        }));
     }
 
     /// Borrow a worker from the pool, blocking until one is available.
@@ -496,7 +527,14 @@ impl Runner for PytestPluginRunner {
             workers.push(worker);
         }
 
-        let worker_pool = Arc::new(WorkerPool::new(workers));
+        let worker_pool = Arc::new(WorkerPool::new(
+            workers,
+            Some(RespawnContext {
+                startup_timeout,
+                project_dir: dir,
+                index: index_arc,
+            }),
+        ));
         *self
             .pool
             .lock()
@@ -615,8 +653,9 @@ async fn run_via_pool(
     if worker_healthy {
         pool.return_worker(worker);
     } else {
-        // Worker may be in a bad state; discard it.
-        worker.shutdown().await;
+        // Worker may be in a bad state (e.g. stuck in a mutant's infinite
+        // loop); discard it and spawn a replacement in the background.
+        pool.discard_and_respawn(worker);
     }
 
     result
@@ -852,6 +891,35 @@ fn extract_type(msg: &str) -> Result<String, Error> {
 }
 
 /// Build the JSON `MUTANT` message to send to the plugin.
+/// Build the argv for a worker pytest process.
+///
+/// Pins `--rootdir` to the project dir: pytest's rootdir discovery scans
+/// every CLI argument that exists as a path, so without the pin the
+/// `--fest-socket` temp-dir path drags rootdir up to the common ancestor
+/// (e.g. `/tmp`). Collected item nodeids are rootdir-relative, so a wrong
+/// rootdir makes every runner-sent test ID miss the worker's item index.
+fn build_worker_args(socket_addr: &str, project_dir: &std::path::Path) -> Vec<String> {
+    // Absolutize: pytest resolves a relative --rootdir against its own cwd,
+    // which is already the project dir — a relative path would double up.
+    let rootdir = std::path::absolute(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    vec![
+        "-m".to_owned(),
+        "pytest".to_owned(),
+        "-p".to_owned(),
+        "_fest_plugin".to_owned(),
+        "--fest-socket".to_owned(),
+        socket_addr.to_owned(),
+        format!("--rootdir={}", rootdir.display()),
+        "-p".to_owned(),
+        "no:xdist".to_owned(),
+        "-o".to_owned(),
+        "addopts=".to_owned(),
+        "--no-header".to_owned(),
+        "-q".to_owned(),
+    ]
+}
+
+/// Build the JSON `mutant` message sent to a worker for one mutant run.
 fn build_mutant_message(
     mutant: &Mutant,
     mutated_source: &str,
@@ -1170,6 +1238,43 @@ mod tests {
         let msg = r#"{"status": "killed"}"#;
         let result = parse_result_status(msg);
         assert!(result.is_err());
+    }
+
+    /// Worker argv pins `--rootdir` so nodeids stay project-relative.
+    #[test]
+    fn worker_args_pin_rootdir_to_project_dir() {
+        let args = build_worker_args("/tmp/xyz/fest.sock", Path::new("/proj/app"));
+        assert!(
+            args.contains(&"--rootdir=/proj/app".to_owned()),
+            "worker argv must pin pytest rootdir to the project dir, got {args:?}"
+        );
+    }
+
+    /// A relative project dir must yield an absolute `--rootdir` — pytest
+    /// resolves a relative one against the worker cwd (the project dir),
+    /// doubling the path.
+    #[test]
+    fn worker_args_absolutize_relative_rootdir() {
+        let args = build_worker_args("/tmp/xyz/fest.sock", Path::new("rel/proj"));
+        let rootdir = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--rootdir="))
+            .expect("--rootdir present");
+        assert!(
+            Path::new(rootdir).is_absolute(),
+            "rootdir must be absolute, got {rootdir}"
+        );
+    }
+
+    /// The socket path must come through unchanged (paired with its flag).
+    #[test]
+    fn worker_args_include_socket_flag_and_value() {
+        let args = build_worker_args("/tmp/xyz/fest.sock", Path::new("/proj/app"));
+        let pos = args
+            .iter()
+            .position(|a| a == "--fest-socket")
+            .expect("--fest-socket flag present");
+        assert_eq!(args[pos + 1], "/tmp/xyz/fest.sock");
     }
 
     /// `build_mutant_message` produces valid JSON with expected fields.

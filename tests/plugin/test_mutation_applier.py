@@ -445,3 +445,27 @@ def test_statement_bind_class_scope_aug_assign_reads_current_value(applier_setup
     assert C.counter == 7
     journal.rollback()
     assert C.counter == 5
+
+
+def test_handle_mutant_errors_when_no_test_ids_match(target_module):
+    """A total test-id mismatch must surface as an error, not 'survived'.
+
+    Regression: pytest rootdir drift once made every worker nodeid carry a
+    path prefix, so no runner-sent test id matched and every mutant was
+    silently reported as survived.
+    """
+    from _fest_plugin import _handle_mutant
+
+    msg = {
+        "file": "src/applier_target_mod.py",
+        "module": target_module.__name__,
+        "diff": [{"kind": "statement_bind", "names": ["X"],
+                  "stmt_source": "X = 6", "scope": {"kind": "module"}}],
+        "tests": ["tests/test_a.py::test_one"],
+    }
+    item_index = {"prefix/tests/test_a.py::test_one": object()}
+    result = _handle_mutant(
+        None, msg, item_index, {}, ReverseImportIndex(),
+    )
+    assert result["status"] == "error"
+    assert "matched" in result["error_message"]

@@ -687,6 +687,21 @@ def _handle_mutant(
     elif not module_name:
         module_name = _file_to_module(file_path)
 
+    # A total test-id mismatch is an infrastructure failure (e.g. rootdir
+    # drift making nodeids non-comparable), never a legitimate survival.
+    # Surface it loudly instead of silently reporting "survived".
+    if test_ids and not any(t in item_index for t in test_ids):
+        sample_sent = test_ids[:2]
+        sample_have = list(item_index)[:2]
+        return {
+            "type": "result",
+            "status": "error",
+            "error_message": (
+                f"none of {len(test_ids)} test ids matched collected items; "
+                f"sent={sample_sent!r} collected={sample_have!r}"
+            ),
+        }
+
     target_module = sys.modules.get(module_name)
     if target_module is None:
         target_module = types.ModuleType(module_name)
@@ -738,6 +753,25 @@ def _handle_mutant(
             print(f"fest: rollback step failed: {err}", file=sys.stderr)
 
 
+class _LogreportFailureCollector:
+    """Capture failure reports emitted through ``pytest_runtest_logreport``.
+
+    ``unittest.subTest`` (and the pytest ``subtests`` fixture) report their
+    failures directly via the logreport hook — they are NOT part of
+    ``runtestprotocol``'s return value, and the parent call report stays
+    "passed" when only subtests fail. Without listening on the hook, a
+    mutation caught exclusively by subtests looks like a survival.
+    """
+
+    def __init__(self) -> None:
+        self.failed = False
+
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        """Record any setup/call failure routed through the hook."""
+        if report.when in ("setup", "call") and report.failed:
+            self.failed = True
+
+
 def _run_tests(
     session: Any, test_ids: list[str], item_index: dict[str, Any]
 ) -> str:
@@ -751,12 +785,22 @@ def _run_tests(
     if not items:
         return "survived"
 
-    for idx, item in enumerate(items):
-        nextitem = items[idx + 1] if idx + 1 < len(items) else None
-        reports = runtestprotocol(item, log=False, nextitem=nextitem)
-        for report in reports:
-            if report.when in ("setup", "call") and report.failed:
+    collector = _LogreportFailureCollector()
+    pluginmanager = session.config.pluginmanager
+    pluginmanager.register(collector)
+    try:
+        for idx, item in enumerate(items):
+            nextitem = items[idx + 1] if idx + 1 < len(items) else None
+            reports = runtestprotocol(item, log=False, nextitem=nextitem)
+            # Main-phase reports: returned directly (log=False keeps them
+            # off the hook). Subtest failures: hook-only, via collector.
+            for report in reports:
+                if report.when in ("setup", "call") and report.failed:
+                    return "killed"
+            if collector.failed:
                 return "killed"
+    finally:
+        pluginmanager.unregister(collector)
 
     return "survived"
 
