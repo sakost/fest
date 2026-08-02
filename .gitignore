@@ -6,6 +6,9 @@
 *.orig
 .DS_Store
 
+# Local Cargo config (per-machine linker overrides etc.)
+.cargo/
+
 # Mutation testing output (cargo-mutants)
 mutants.out/
 mutants.out.old/

@@ -5,10 +5,11 @@
 //! checking it against a threshold.
 
 use core::time::Duration;
+use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::mutation::{MutantResult, MutantStatus};
+use crate::mutation::{MutantResult, MutantStatus, SkipReason};
 
 /// Aggregated results of a complete mutation-testing run.
 ///
@@ -32,6 +33,10 @@ pub struct MutationReport {
     pub timeouts: usize,
     /// Number of mutants whose test run encountered an error.
     pub errors: usize,
+    /// Number of mutants that fest could not represent or deliver.
+    pub skipped: usize,
+    /// Per-reason breakdown of skipped mutants (key is the `snake_case` reason).
+    pub skip_reasons: HashMap<String, usize>,
     /// Individual results for every mutant tested.
     pub results: Vec<MutantResult>,
     /// Total wall-clock duration of the mutation-testing run.
@@ -45,6 +50,10 @@ impl MutationReport {
     ///
     /// Iterates through `results` to count killed, survived, timeout,
     /// no-coverage, and error outcomes.
+    #[allow(
+        clippy::pattern_type_mismatch,
+        reason = "matching on &MutantStatus / &SkipReason requires this suppression"
+    )]
     #[inline]
     #[must_use]
     pub fn from_results(
@@ -59,14 +68,21 @@ impl MutationReport {
         let mut timeouts: usize = 0;
         let mut no_coverage: usize = 0;
         let mut errors: usize = 0;
+        let mut skipped: usize = 0;
+        let mut skip_reasons: HashMap<String, usize> = HashMap::new();
 
         for result in &results {
-            match result.status {
+            match &result.status {
                 MutantStatus::Killed => killed += 1,
                 MutantStatus::Survived => survived += 1,
                 MutantStatus::Timeout => timeouts += 1,
                 MutantStatus::NoCoverage => no_coverage += 1,
                 MutantStatus::Error(_) => errors += 1,
+                MutantStatus::Skipped { reason } => {
+                    skipped += 1;
+                    let key = reason_to_snake_case(reason);
+                    *skip_reasons.entry(key.to_owned()).or_insert(0) += 1;
+                }
             }
         }
 
@@ -81,6 +97,8 @@ impl MutationReport {
             survived,
             timeouts,
             errors,
+            skipped,
+            skip_reasons,
             results,
             duration,
             seed,
@@ -89,19 +107,21 @@ impl MutationReport {
 
     /// Compute the mutation score as a percentage.
     ///
-    /// The score is `killed / tested * 100`. Returns `0.0` when no mutants
-    /// were tested.
+    /// The score is `killed / (killed + survived) * 100`. Skipped, timeout,
+    /// no-coverage, and error mutants are excluded from the denominator.
+    /// Returns `0.0` when no mutants were scored (killed or survived).
     #[inline]
     #[must_use]
     pub fn mutation_score(&self) -> f64 {
-        if self.mutants_tested == 0 {
+        let scored = self.killed + self.survived;
+        if scored == 0 {
             return 0.0;
         }
         #[allow(
             clippy::cast_precision_loss,
             reason = "mutant counts are small enough to fit in f64 mantissa"
         )]
-        let score = (self.killed as f64) / (self.mutants_tested as f64) * 100.0_f64;
+        let score = (self.killed as f64) / (scored as f64) * 100.0_f64;
         score
     }
 
@@ -112,5 +132,21 @@ impl MutationReport {
     #[must_use]
     pub fn passes_threshold(&self, threshold: f64) -> bool {
         self.mutation_score() >= threshold
+    }
+}
+
+/// Map a [`SkipReason`] variant to its `snake_case` key string.
+///
+/// Matches the serde `rename_all = "snake_case"` repr used on the enum.
+#[allow(
+    clippy::pattern_type_mismatch,
+    reason = "matching on &SkipReason requires this suppression"
+)]
+const fn reason_to_snake_case(reason: &SkipReason) -> &'static str {
+    match reason {
+        SkipReason::UnmappableTarget => "unmappable_target",
+        SkipReason::ConditionMutation => "condition_mutation",
+        SkipReason::UnsupportedStatement => "unsupported_statement",
+        SkipReason::MissingClassScope => "missing_class_scope",
     }
 }
