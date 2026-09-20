@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeSet, sync::Arc};
+#[cfg(unix)]
 use core::time::Duration;
 use std::{
     io,
@@ -30,6 +31,7 @@ use tokio::process::{Child, Command};
 ///
 /// Long enough for pytest to exit on its own; short enough that a timed-out
 /// mutant does not hold a worker slot noticeably longer.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Process groups (keyed by leader pid) that fest has spawned and not yet
@@ -59,7 +61,7 @@ impl ProcessRegistry {
     }
 
     /// Whether `pgid` is currently registered as a live group.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn contains(&self, pgid: i32) -> bool {
         self.groups().contains(&pgid)
     }
@@ -118,7 +120,7 @@ impl IsolatedChild {
     }
 
     /// The process group id, while the leader is still registered.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) const fn group_id(&self) -> Option<i32> {
         self.pgid
     }
@@ -184,18 +186,16 @@ impl Drop for IsolatedChild {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// Returns `true` while a process with `pid` still exists (zombies included).
-    #[cfg(unix)]
     fn process_alive(pid: i32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
     }
 
     /// Spawn `sh` forking a 30 s grandchild whose pid is written to `pid_file`.
-    #[cfg(unix)]
     fn spawn_forking_shell(
         pid_file: &std::path::Path,
         registry: &ProcessRegistry,
@@ -214,7 +214,6 @@ mod tests {
     }
 
     /// Block until the grandchild has announced its pid.
-    #[cfg(unix)]
     async fn read_grandchild_pid(pid_file: &std::path::Path) -> i32 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5_u64);
         loop {
@@ -232,7 +231,6 @@ mod tests {
     }
 
     /// Poll until `pid` is gone, failing after a few seconds.
-    #[cfg(unix)]
     async fn assert_dies(pid: i32, what: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5_u64);
         while process_alive(pid) && tokio::time::Instant::now() < deadline {
@@ -243,7 +241,6 @@ mod tests {
 
     /// A signal-driven abort must take every in-flight process tree with it,
     /// not only the direct children (issue #15).
-    #[cfg(unix)]
     #[tokio::test]
     async fn kill_all_kills_grandchildren() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -263,7 +260,6 @@ mod tests {
 
     /// A normally reaped child leaves no stale registry entry behind, so a
     /// later abort cannot signal a recycled pid.
-    #[cfg(unix)]
     #[tokio::test]
     async fn wait_unregisters_group() {
         let mut cmd = Command::new("sh");
@@ -284,7 +280,6 @@ mod tests {
 
     /// Dropping an un-reaped handle (e.g. a cancelled future) kills the tree
     /// rather than leaking it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn drop_without_wait_kills_tree() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -301,7 +296,6 @@ mod tests {
     }
 
     /// `kill_tree` escalates to `SIGKILL` for a leader that ignores `SIGTERM`.
-    #[cfg(unix)]
     #[tokio::test]
     async fn kill_tree_escalates_past_ignored_sigterm() {
         let mut cmd = Command::new("sh");
