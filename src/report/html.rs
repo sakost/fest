@@ -23,12 +23,12 @@ use crate::mutation::{MutantResult, MutantStatus};
 ///
 /// Returns [`crate::Error::Report`] if string formatting fails.
 #[inline]
-pub fn format_html(report: &MutationReport) -> Result<String, crate::Error> {
+pub fn format_html(report: &MutationReport, project_dir: &Path) -> Result<String, crate::Error> {
     let mut output = String::new();
 
     write_document_open(&mut output, report)?;
     write_summary_section(report, &mut output)?;
-    write_file_sections(report, &mut output)?;
+    write_file_sections(report, &mut output, project_dir)?;
     write_document_close(&mut output)?;
 
     Ok(output)
@@ -166,11 +166,16 @@ fn write_score_row(output: &mut String, score: f64) -> Result<(), crate::Error> 
 // ---------------------------------------------------------------------------
 
 /// Group mutation results by file and write a section for each file.
-fn write_file_sections(report: &MutationReport, output: &mut String) -> Result<(), crate::Error> {
+fn write_file_sections(
+    report: &MutationReport,
+    output: &mut String,
+    project_dir: &Path,
+) -> Result<(), crate::Error> {
     let grouped = group_results_by_file(&report.results);
 
     for (file_path, file_results) in &grouped {
-        write_single_file_section(file_path, file_results, output)?;
+        let heading = super::display_path(file_path, project_dir);
+        write_single_file_section(&heading, file_results, output)?;
     }
 
     Ok(())
@@ -199,11 +204,11 @@ fn group_results_by_file(results: &[MutantResult]) -> BTreeMap<PathBuf, Vec<&Mut
 
 /// Write the HTML section for a single source file.
 fn write_single_file_section(
-    file_path: &Path,
+    heading: &str,
     file_results: &[&MutantResult],
     output: &mut String,
 ) -> Result<(), crate::Error> {
-    let escaped_path = escape_html(&file_path.display().to_string());
+    let escaped_path = escape_html(heading);
     writeln!(output, "<div class=\"file-section\">").map_err(fmt_err)?;
     writeln!(output, "<h2>{escaped_path}</h2>").map_err(fmt_err)?;
 

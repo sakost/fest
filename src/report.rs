@@ -12,6 +12,8 @@ pub mod text;
 /// Core types for mutation-testing reports.
 pub mod types;
 
+use std::path::Path;
+
 pub use types::MutationReport;
 
 use crate::{Error, config::OutputFormat};
@@ -22,7 +24,8 @@ use crate::{Error, config::OutputFormat};
 /// [`OutputFormat::Text`]), ANSI colors are used to highlight the output.
 ///
 /// The text format lists every survived mutant after the statistics —
-/// that list is what a user acts on.
+/// that list is what a user acts on. File paths in the text and HTML
+/// formats are shown relative to `project_dir`.
 ///
 /// Returns the formatted report as a [`String`]. The caller decides where
 /// to write the output (stdout, file, etc.).
@@ -36,12 +39,26 @@ pub fn format_report(
     report: &MutationReport,
     format: &OutputFormat,
     colored: bool,
+    project_dir: &Path,
 ) -> Result<String, Error> {
     match *format {
-        OutputFormat::Text => text::format_text(report, colored),
+        OutputFormat::Text => text::format_text(report, colored, project_dir),
         OutputFormat::Json => json::format_json(report),
-        OutputFormat::Html => html::format_html(report),
+        OutputFormat::Html => html::format_html(report, project_dir),
     }
+}
+
+/// Render `path` relative to `project_dir` when it lies inside it.
+///
+/// Discovery yields paths prefixed with the project directory, which is
+/// noise in a report read from that directory; paths outside it (or when
+/// no prefix matches) are shown unchanged.
+#[must_use]
+pub(crate) fn display_path(path: &Path, project_dir: &Path) -> String {
+    path.strip_prefix(project_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +68,7 @@ pub fn format_report(
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::mutation::{Mutant, MutantResult, MutantStatus};
@@ -324,7 +341,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
         assert!(output.contains("fest mutation testing report"));
         assert!(output.contains("----------------------------"));
     }
@@ -355,7 +372,7 @@ mod tests {
             Duration::from_secs(30_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
 
         assert!(output.contains("Files scanned:"));
         assert!(output.contains("12"));
@@ -379,7 +396,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
 
         assert!(output.contains("Survived mutants:"));
         assert!(output.contains("src/parser.py:42"));
@@ -402,7 +419,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
 
         assert!(output.contains("Survived mutants:"));
         assert!(output.contains("src/parser.py:42"));
@@ -410,6 +427,77 @@ mod tests {
             output.contains("fest run -o html > fest.html"),
             "expected a hint towards the HTML report, got:\n{output}"
         );
+    }
+
+    /// Paths are shown relative to the project directory: the survivor list
+    /// should read `src/parser.py:42`, not the absolute path discovery
+    /// produced.
+    #[test]
+    fn text_report_shows_paths_relative_to_project_dir() {
+        let results = vec![make_result(
+            make_mutant(
+                "/proj/src/parser.py",
+                42_u32,
+                "ArithmeticOp",
+                "x + 1",
+                "x - 1",
+            ),
+            MutantStatus::Survived,
+        )];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output =
+            text::format_text(&report, false, Path::new("/proj")).expect("should format text");
+        assert!(output.contains("  src/parser.py:42"), "got:\n{output}");
+        assert!(!output.contains("/proj/src/parser.py"), "got:\n{output}");
+    }
+
+    /// A path outside the project directory is left as is.
+    #[test]
+    fn text_report_keeps_paths_outside_project_dir() {
+        let results = vec![make_result(
+            make_mutant("/elsewhere/mod.py", 3_u32, "ArithmeticOp", "x + 1", "x - 1"),
+            MutantStatus::Survived,
+        )];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output =
+            text::format_text(&report, false, Path::new("/proj")).expect("should format text");
+        assert!(output.contains("/elsewhere/mod.py:3"), "got:\n{output}");
+    }
+
+    /// The HTML file headings are project-relative too.
+    #[test]
+    fn html_report_file_heading_is_relative_to_project_dir() {
+        let results = vec![make_result(
+            make_mutant(
+                "/proj/src/parser.py",
+                42_u32,
+                "ArithmeticOp",
+                "x + 1",
+                "x - 1",
+            ),
+            MutantStatus::Killed,
+        )];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output = html::format_html(&report, Path::new("/proj")).expect("should format HTML");
+        assert!(output.contains("<h2>src/parser.py</h2>"), "got:\n{output}");
     }
 
     /// With nothing surviving there is nothing to act on, so no hint either.
@@ -426,7 +514,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
         assert!(!output.contains("Survived mutants:"));
         assert!(!output.contains("fest run -o html"));
     }
@@ -445,7 +533,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
 
         assert!(!output.contains("Survived mutants:"));
     }
@@ -478,7 +566,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
         assert!(output.contains("Killed:"), "should show Killed line");
         assert!(output.contains("Survived:"), "should show Survived line");
         assert!(output.contains("Skipped:"), "should show Skipped line");
@@ -509,7 +597,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
 
         assert!(output.contains("no coverage"));
     }
@@ -654,8 +742,8 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output =
-            format_report(&report, &OutputFormat::Text, false).expect("should format text");
+        let output = format_report(&report, &OutputFormat::Text, false, Path::new("."))
+            .expect("should format text");
         assert!(output.contains("fest mutation testing report"));
     }
 
@@ -669,8 +757,8 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output =
-            format_report(&report, &OutputFormat::Json, false).expect("should format JSON");
+        let output = format_report(&report, &OutputFormat::Json, false, Path::new("."))
+            .expect("should format JSON");
         let _value: serde_json::Value =
             serde_json::from_str(&output).expect("should be valid JSON");
     }
@@ -685,8 +773,8 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output =
-            format_report(&report, &OutputFormat::Html, false).expect("should format HTML");
+        let output = format_report(&report, &OutputFormat::Html, false, Path::new("."))
+            .expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
         assert!(output.contains("fest mutation testing report"));
     }
@@ -703,7 +791,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
     }
 
@@ -717,7 +805,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("<title>fest mutation testing report</title>"));
     }
 
@@ -731,7 +819,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("<style>"));
         assert!(output.contains(".killed"));
         assert!(output.contains(".survived"));
@@ -759,7 +847,7 @@ mod tests {
             Duration::from_secs(5_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
 
         assert!(output.contains("Files scanned"));
         assert!(output.contains("Mutants generated"));
@@ -782,7 +870,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("100.0%"));
     }
 
@@ -800,7 +888,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("src/parser.py"));
     }
 
@@ -818,7 +906,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("class=\"line killed\""));
     }
 
@@ -836,7 +924,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("class=\"line survived\""));
     }
 
@@ -854,7 +942,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("class=\"line no-coverage\""));
     }
 
@@ -878,7 +966,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("class=\"line survived\""));
     }
 
@@ -902,7 +990,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         // Not all killed, so should be grey (no-coverage class).
         assert!(output.contains("class=\"line no-coverage\""));
     }
@@ -921,7 +1009,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("ArithmeticOp"));
         assert!(output.contains("[KILLED]"));
         assert!(output.contains("<code>+</code>"));
@@ -942,7 +1030,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("[SURVIVED]"));
     }
 
@@ -960,7 +1048,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("[TIMEOUT]"));
     }
 
@@ -981,7 +1069,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("[SKIPPED]"), "should have [SKIPPED] label");
         assert!(
             output.contains("status-skipped"),
@@ -1011,7 +1099,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("[ERROR]"));
     }
 
@@ -1029,7 +1117,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("a &lt; b"));
         assert!(output.contains("a &gt; b"));
     }
@@ -1048,7 +1136,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("a &amp; b"));
     }
 
@@ -1066,7 +1154,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("&quot;hello&quot;"));
     }
 
@@ -1084,7 +1172,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("&#39;world&#39;"));
     }
 
@@ -1108,7 +1196,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("alpha.py"));
         assert!(output.contains("beta.py"));
     }
@@ -1123,7 +1211,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("<!DOCTYPE html>"));
         assert!(output.contains("</html>"));
         assert!(output.contains("0.0%"));
@@ -1139,7 +1227,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         // Should not contain external stylesheet links.
         assert!(!output.contains("<link rel=\"stylesheet\""));
         // Should contain inline styles.
@@ -1156,7 +1244,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("</body>"));
         assert!(output.contains("</html>"));
         // Body should close before html.
@@ -1185,7 +1273,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         // Should show both mutation details.
         assert!(output.contains("<code>-</code>"));
         assert!(output.contains("<code>*</code>"));
@@ -1226,7 +1314,7 @@ mod tests {
             Duration::from_secs(2_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("Timeout"));
         assert!(output.contains("Errors"));
         assert!(output.contains("No coverage"));
@@ -1246,7 +1334,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("[NO COVERAGE]"));
     }
 
@@ -1260,7 +1348,7 @@ mod tests {
             Duration::from_secs(0_u64),
             Some(42_u64),
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
         assert!(output.contains("(seed: 42)"));
         assert!(output.contains("Seed:               42"));
     }
@@ -1275,7 +1363,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = text::format_text(&report, false).expect("should format text");
+        let output = text::format_text(&report, false, Path::new(".")).expect("should format text");
         assert!(!output.contains("Seed:"));
         assert!(!output.contains("seed:"));
     }
@@ -1290,7 +1378,7 @@ mod tests {
             Duration::from_secs(0_u64),
             Some(123_u64),
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(output.contains("(seed: 123)"));
         assert!(output.contains("<tr><td>Seed</td><td>123</td></tr>"));
     }
@@ -1305,7 +1393,7 @@ mod tests {
             Duration::from_secs(0_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         assert!(!output.contains("Seed"));
     }
 
@@ -1333,7 +1421,7 @@ mod tests {
             Duration::from_secs(1_u64),
             None,
         );
-        let output = html::format_html(&report).expect("should format HTML");
+        let output = html::format_html(&report, Path::new(".")).expect("should format HTML");
         let open_divs = output.matches("<div").count();
         let close_divs = output.matches("</div>").count();
         assert_eq!(open_divs, close_divs);
