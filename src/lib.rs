@@ -147,7 +147,7 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
         mode,
         progress::RenderMode::Fancy | progress::RenderMode::Verbose
     ) && std::io::stdout().is_terminal();
-    let formatted = report::format_report(&report, &config.output, colored)?;
+    let formatted = report::format_report(&report, &config.output, colored, &project_dir)?;
     write_output(&formatted)?;
 
     check_final_status(was_cancelled, &report, &config)

@@ -4,6 +4,7 @@
 //! overall statistics and a listing of survived mutants.
 
 use core::fmt::Write as _;
+use std::path::Path;
 
 use super::types::MutationReport;
 use crate::mutation::MutantStatus;
@@ -21,12 +22,16 @@ use crate::mutation::MutantStatus;
 ///
 /// Returns [`crate::Error::Report`] if string formatting fails.
 #[inline]
-pub fn format_text(report: &MutationReport, colored: bool) -> Result<String, crate::Error> {
+pub fn format_text(
+    report: &MutationReport,
+    colored: bool,
+    project_dir: &Path,
+) -> Result<String, crate::Error> {
     let mut output = String::new();
 
     write_header(&mut output, report, colored)?;
     write_statistics(report, &mut output, colored)?;
-    write_survived_mutants(report, &mut output, colored)?;
+    write_survived_mutants(report, &mut output, colored, project_dir)?;
 
     Ok(output)
 }
@@ -176,6 +181,7 @@ fn write_survived_mutants(
     report: &MutationReport,
     output: &mut String,
     colored: bool,
+    project_dir: &Path,
 ) -> Result<(), crate::Error> {
     let survived: Vec<_> = report
         .results
@@ -194,11 +200,11 @@ fn write_survived_mutants(
 
     for result in survived {
         let mutant = &result.mutant;
+        let path = super::display_path(&mutant.file_path, project_dir);
         if colored {
-            let location =
-                console::style(format!("{}:{}", mutant.file_path.display(), mutant.line))
-                    .cyan()
-                    .force_styling(true);
+            let location = console::style(format!("{path}:{}", mutant.line))
+                .cyan()
+                .force_styling(true);
             let mutator = console::style(&mutant.mutator_name)
                 .dim()
                 .force_styling(true);
@@ -210,12 +216,8 @@ fn write_survived_mutants(
         } else {
             writeln!(
                 output,
-                "  {}:{}    {}    `{}` -> `{}`",
-                mutant.file_path.display(),
-                mutant.line,
-                mutant.mutator_name,
-                mutant.original_text,
-                mutant.mutated_text,
+                "  {path}:{}    {}    `{}` -> `{}`",
+                mutant.line, mutant.mutator_name, mutant.original_text, mutant.mutated_text,
             )
         }
         .map_err(|err| crate::Error::Report(format!("failed to format survived mutant: {err}")))?;
