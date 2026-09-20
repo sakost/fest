@@ -623,7 +623,9 @@ def pytest_runtestloop(session: Any) -> bool:
                 _emit_reload_warnings(msg.get("reload_warnings", []))
                 continue
             if msg_type == "mutant":
-                result = _handle_mutant(session, msg, item_index, file_to_mod, rev_index)
+                result = _safe_handle_mutant(
+                    session, msg, item_index, file_to_mod, rev_index,
+                )
                 _send(conn, result)
             else:
                 _send(
@@ -690,6 +692,29 @@ def _emit_thread_warning_if_needed() -> None:
             "--backend=subprocess.",
             file=sys.stderr,
         )
+
+
+def _safe_handle_mutant(
+    session: Any,
+    msg: dict[str, Any],
+    item_index: dict[str, Any],
+    file_to_mod: dict[str, str],
+    rev_index: ReverseImportIndex,
+) -> dict[str, Any]:
+    """Run ``_handle_mutant`` and turn any escaping failure into an ``error``.
+
+    One mutant must never take the worker down: a dead worker costs the
+    warm pool for the rest of the run. ``KeyboardInterrupt`` is left alone so
+    a user interrupt still stops the worker.
+    """
+    try:
+        return _handle_mutant(session, msg, item_index, file_to_mod, rev_index)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        return {
+            "type": "result",
+            "status": "error",
+            "error_message": f"worker_exception: {type(exc).__name__}: {exc}",
+        }
 
 
 def _handle_mutant(
@@ -760,9 +785,12 @@ def _handle_mutant(
                     "status": "error",
                     "error_message": f"generated_syntax_error: {exc}",
                 }
-            except Exception as exc:  # noqa: BLE001
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
                 # Mutated code raised at exec — treat as killed (the mutation
                 # broke import-time behavior, which IS the test signal).
+                # SystemExit is included: ``sys.exit()`` reached at import
+                # time is a BaseException and would otherwise tear down the
+                # worker (issue #16).
                 journal.rollback()
                 return {
                     "type": "result",

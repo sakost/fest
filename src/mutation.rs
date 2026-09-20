@@ -17,6 +17,8 @@ pub mod builtin;
 
 /// Structured diff IR for mutations dispatched to the plugin backend.
 pub mod diff;
+/// Detection of module-level `if __name__ == "__main__":` guards.
+pub mod main_guard;
 
 /// Data types for representing mutants and their execution results.
 pub mod mutant;
@@ -296,8 +298,8 @@ fn line_column_from_offset(source: &str, byte_offset: usize) -> (u32, u32) {
 ///
 /// Reads the source, parses the AST, and runs each mutator to produce
 /// [`Mutant`] descriptors. Mutators that do not match `filter_operators`
-/// are skipped, and individual mutations suppressed by pragma comments
-/// are excluded.
+/// are skipped, and individual mutations suppressed by pragma comments or
+/// located inside an `if __name__ == "__main__":` guard are excluded.
 fn generate_mutants_for_file(
     path: &Path,
     registry: &MutatorRegistry,
@@ -310,6 +312,7 @@ fn generate_mutants_for_file(
     let parsed = ruff_python_parser::parse_module(&source)
         .map_err(|err| Error::Mutation(format!("failed to parse {}: {err}", path.display())))?;
     let ast = parsed.into_syntax();
+    let guard_ranges = main_guard::main_guard_ranges(&ast);
 
     let ctx = MutationContext {
         file_path: path,
@@ -331,6 +334,11 @@ fn generate_mutants_for_file(
         for mutation in mutations {
             // Skip mutations suppressed by pragma comments.
             if is_suppressed_by_pragma(&source, mutation.byte_offset, name) {
+                continue;
+            }
+            // Skip mutations under a `__main__` guard: unreachable from tests
+            // under import, and applying them can run `main()` in-process.
+            if main_guard::is_inside_any(&guard_ranges, mutation.byte_offset) {
                 continue;
             }
 
@@ -662,6 +670,100 @@ mod tests {
         assert_eq!(mutants[0_usize].file_path, py_file);
         assert_eq!(mutants[0_usize].line, 1_u32);
         assert_eq!(mutants[0_usize].mutator_name, "arithmetic_op");
+    }
+
+    /// Write `source` to a temp file and generate mutants with every
+    /// built-in mutator.
+    fn generate_from_source(source: &str) -> (tempfile::TempDir, Vec<Mutant>) {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let py_file = dir.path().join("cli.py");
+        std::fs::write(&py_file, source).expect("write file");
+        let registry = build_registry(&MutatorConfig::default());
+        let mutants = generate_mutants_for_file(&py_file, &registry, None, &[])
+            .expect("should generate mutants");
+        (dir, mutants)
+    }
+
+    /// Nothing inside an `if __name__ == "__main__":` guard is mutated
+    /// (issue #16): no test can reach it under import, so every verdict
+    /// there is noise — and running `main()` inside a worker is dangerous.
+    #[test]
+    fn main_guard_is_not_mutated() {
+        let source = "import sys
+
+
+def add(a, b):
+    return a + b
+
+
+def main():
+                          sys.exit(1)
+
+
+if __name__ == \"__main__\":
+    main()
+";
+        let (_dir, mutants) = generate_from_source(source);
+        assert!(
+            mutants.iter().any(|m| m.line == 5_u32),
+            "code outside the guard must still be mutated"
+        );
+        let guard_hits: Vec<&Mutant> = mutants.iter().filter(|m| m.line >= 12_u32).collect();
+        assert!(
+            guard_hits.is_empty(),
+            "guard condition/body must yield no mutants, got {guard_hits:?}"
+        );
+    }
+
+    /// The reversed spelling `"__main__" == __name__` is a guard too.
+    #[test]
+    fn reversed_main_guard_is_not_mutated() {
+        let source = "x = 1
+if \"__main__\" == __name__:
+    x = 2
+";
+        let (_dir, mutants) = generate_from_source(source);
+        assert!(
+            mutants.iter().all(|m| m.line == 1_u32),
+            "only line 1 may be mutated, got {mutants:?}"
+        );
+    }
+
+    /// An `else:` branch of a guard *does* run under import and stays
+    /// mutable; only the test and the `if` body are excluded.
+    #[test]
+    fn main_guard_else_branch_is_still_mutated() {
+        let source = "x = 1
+if __name__ == \"__main__\":
+    x = 2
+else:
+    x = 3
+";
+        let (_dir, mutants) = generate_from_source(source);
+        assert!(
+            mutants.iter().any(|m| m.line == 5_u32),
+            "else branch must still be mutated, got {mutants:?}"
+        );
+        assert!(
+            mutants.iter().all(|m| m.line != 2_u32 && m.line != 3_u32),
+            "guard test and body must not be mutated, got {mutants:?}"
+        );
+    }
+
+    /// A nested `if __name__ == "__main__":` (inside a function) is not a
+    /// module guard and is left alone.
+    #[test]
+    fn nested_name_check_is_still_mutated() {
+        let source = "def f():
+    if __name__ == \"__main__\":
+        return 1
+    return 2
+";
+        let (_dir, mutants) = generate_from_source(source);
+        assert!(
+            mutants.iter().any(|m| m.line == 2_u32),
+            "nested check is ordinary code, got {mutants:?}"
+        );
     }
 
     /// The top-level `generate_mutants` function discovers files and produces
