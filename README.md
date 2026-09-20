@@ -63,7 +63,8 @@ fest will:
 2. Run pytest with coverage to build a per-test line map
 3. Generate mutants from the discovered source
 4. Test each mutant against only the relevant tests
-5. Print a summary report
+5. Print a summary report, followed by every **survived** mutant — the
+   code changes your tests did not notice
 
 ```
 fest — mutation testing for Python
@@ -78,7 +79,25 @@ fest — mutation testing for Python
   Mutants tested (4186 mutants)  4m 6s
 
   Mutation Score: 85.7%  |  Killed: 2401  Survived: 314  Timeout: 80  Errors: 8
+
+Survived mutants:
+  src/pkg/inout.py:14    constant_replace    `"\n"` -> `""`
+  src/pkg/parser.py:226    comparison_op    `<` -> `<=`
+  ...
+
+Annotated source view: fest run -o html > fest.html
 ```
+
+Each survived line is something to act on: apply the change by hand and
+you will see that the test suite still passes — add or tighten a test
+until it does not. For a browsable, colour-annotated view of the source
+with every mutant in context, write the HTML report:
+
+```bash
+fest run -o html > fest.html
+```
+
+Add `-v` to watch each mutant's verdict as it runs.
 
 ## Configuration
 
