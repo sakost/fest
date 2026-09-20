@@ -20,7 +20,10 @@ use tokio::{process::Command, sync::Mutex as AsyncMutex};
 use crate::{
     Error,
     mutation::{Mutant, MutantResult, MutantStatus},
-    runner::Runner,
+    runner::{
+        Runner,
+        process::{IsolatedChild, ProcessRegistry},
+    },
 };
 
 /// Default timeout in seconds when none is specified.
@@ -43,6 +46,9 @@ pub struct SubprocessRunner {
     /// a time.  Other mutants for different files can still run in
     /// parallel.
     file_locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// Live pytest process groups, shared with the signal handler so a
+    /// cancelled run can kill them.
+    processes: ProcessRegistry,
 }
 
 impl SubprocessRunner {
@@ -54,7 +60,17 @@ impl SubprocessRunner {
             timeout: Duration::from_secs(timeout_secs),
             project_dir,
             file_locks: Mutex::new(HashMap::new()),
+            processes: ProcessRegistry::default(),
         }
+    }
+
+    /// Record spawned pytest processes in `processes` instead of a private
+    /// registry, so cancellation can reach them.
+    #[inline]
+    #[must_use]
+    pub fn with_process_registry(mut self, processes: ProcessRegistry) -> Self {
+        self.processes = processes;
+        self
     }
 
     /// Get (or create) a per-file async lock.
@@ -124,10 +140,11 @@ impl Runner for SubprocessRunner {
             .args(["-m", "pytest", "-x", "--no-header", "-q"])
             .args(tests)
             .current_dir(&self.project_dir)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
-        let outcome = tokio::time::timeout(self.timeout, cmd.output()).await;
+        let outcome = run_with_timeout(&mut cmd, self.timeout, &self.processes).await;
 
         // 5. Restore the original source immediately (before releasing lock).
         let _restore = std::fs::write(file_path, source);
@@ -140,9 +157,9 @@ impl Runner for SubprocessRunner {
 
         // 6. Interpret the result.
         let status = match outcome {
-            Err(_elapsed) => MutantStatus::Timeout,
-            Ok(Err(err)) => MutantStatus::Error(format!("failed to spawn pytest: {err}")),
-            Ok(Ok(output)) => interpret_exit_code(output.status.code()),
+            Ok(None) => MutantStatus::Timeout,
+            Err(err) => MutantStatus::Error(format!("failed to spawn pytest: {err}")),
+            Ok(Some(exit)) => interpret_exit_code(exit.code()),
         };
 
         Ok(MutantResult {
@@ -151,6 +168,30 @@ impl Runner for SubprocessRunner {
             tests_run,
             duration: elapsed,
         })
+    }
+}
+
+/// Spawn `cmd` in its own process group and wait for it up to `timeout`.
+///
+/// Returns `Ok(None)` when the deadline passes; by then the whole process
+/// tree has been killed and reaped, so a runaway mutant cannot outlive its
+/// verdict (issue #15).
+///
+/// # Errors
+///
+/// Returns the spawn error if the interpreter cannot be started.
+async fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+    processes: &ProcessRegistry,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = IsolatedChild::spawn(cmd, processes)?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(exit) => exit.map(Some),
+        Err(_elapsed) => {
+            child.kill_tree().await;
+            Ok(None)
+        }
     }
 }
 
@@ -275,6 +316,65 @@ mod tests {
         // Verify original source was restored.
         let restored = std::fs::read_to_string(tmp.path()).expect("read restored");
         assert_eq!(restored, "pass");
+    }
+
+    /// Returns `true` while a process with `pid` still exists (zombies included).
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// Timing out a mutant must kill the whole pytest process tree, not just
+    /// abandon it (issue #15): a runaway grandchild kept allocating after fest
+    /// exited and eventually got the run OOM-killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_pytest_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `.venv/bin/python` that forks a grandchild and then blocks.
+        let project = tempfile::tempdir().expect("create project dir");
+        let bin = project.path().join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).expect("create venv bin");
+        let pid_file = project.path().join("grandchild.pid");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        );
+        let python = bin.join("python");
+        std::fs::write(&python, script).expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+
+        let source_file = project.path().join("mod.py");
+        std::fs::write(&source_file, "pass").expect("write source");
+        let mut mutant = make_test_mutant();
+        mutant.file_path = source_file;
+        mutant.byte_offset = 0_usize;
+        mutant.byte_length = 4_usize;
+
+        let runner = SubprocessRunner::new(1_u64, project.path().to_path_buf());
+        let result = runner
+            .run_mutant(&mutant, "pass", &["tests/test_x.py::test_x".to_owned()])
+            .await
+            .expect("run_mutant must not fail");
+        assert_eq!(result.status, MutantStatus::Timeout);
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+        // The grandchild is re-parented to init once its parent dies, so it is
+        // reaped promptly — but not synchronously. Poll briefly.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5_u64);
+        while process_alive(pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50_u64)).await;
+        }
+        assert!(
+            !process_alive(pid),
+            "grandchild {pid} survived the mutant timeout"
+        );
     }
 
     /// A mutant that runs against a non-existent test file produces

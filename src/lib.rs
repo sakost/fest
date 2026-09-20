@@ -32,8 +32,8 @@ pub use error::Error;
 
 /// Shared context passed into the mutant execution loop.
 ///
-/// Bundles the tokio runtime, progress reporter, and cancellation state
-/// so that [`run_mutants`] stays within the 5-argument limit.
+/// Bundles the tokio runtime, progress reporter, cancellation state and
+/// optional session so that [`run_mutants`] stays within the 5-argument limit.
 struct RunContext<'ctx> {
     /// Tokio async runtime for running test processes.
     runtime: &'ctx tokio::runtime::Runtime,
@@ -41,6 +41,8 @@ struct RunContext<'ctx> {
     progress: progress::ProgressReporter,
     /// Cancellation flag set by signal handlers.
     cancel: &'ctx signal::CancellationState,
+    /// Session database to flush each verdict into as it arrives, if any.
+    session: Option<&'ctx std::sync::Mutex<session::Session>>,
 }
 
 /// Run the fest pipeline to completion.
@@ -98,27 +100,21 @@ pub fn run(args: cli::RunArgs) -> Result<(), Error> {
     reporter.phase_start("Running mutants");
     reporter.start_mutants(total_u64);
 
+    // Verdicts are flushed to the session as they arrive (see `run_mutants`),
+    // so a killed run keeps everything finished so far.
+    let session_lock = session_db.map(std::sync::Mutex::new);
     let ctx = RunContext {
         runtime: &runtime,
         progress: reporter.clone(),
         cancel: &cancel,
+        session: session_lock.as_ref(),
     };
     let mutants_generated = mutants.len();
     let start = std::time::Instant::now();
     let (new_results, was_cancelled) =
         run_mutants(&mutants_to_run, &coverage_map, &config, &ctx, &project_dir)?;
-
-    // Persist results to session if available.
-    if let Some(sess) = session_db.as_ref() {
-        for result in &new_results {
-            sess.update_result(result)?;
-        }
-        // Store the current timestamp for incremental mode.
-        let epoch_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _meta = sess.set_metadata("last_run_at", &epoch_secs.to_string());
+    if let Some(lock) = session_lock.as_ref() {
+        stamp_last_run(lock);
     }
     let duration = start.elapsed();
     reporter.finish_mutants(was_cancelled);
@@ -467,10 +463,13 @@ fn resolve_session_mutants(
 /// Returns the collected results and a boolean indicating whether the run
 /// was cancelled by a signal.
 ///
+/// When `ctx.session` is given, every verdict is written to it as soon as
+/// it is known, so an interrupted run loses nothing that already finished.
+///
 /// # Errors
 ///
-/// Returns [`Error`] if a source file cannot be read or the thread pool
-/// fails to build.
+/// Returns [`Error`] if a source file cannot be read, the thread pool
+/// fails to build, or a verdict cannot be persisted to the session.
 #[allow(
     clippy::too_many_lines,
     reason = "main pipeline orchestration function"
@@ -482,7 +481,12 @@ fn run_mutants(
     ctx: &RunContext<'_>,
     project_dir: &Path,
 ) -> Result<(Vec<mutation::MutantResult>, bool), Error> {
-    let runner = runner::build_runner(&config.backend, config.timeout, project_dir.to_path_buf());
+    let runner = runner::build_runner(
+        &config.backend,
+        config.timeout,
+        project_dir.to_path_buf(),
+        ctx.cancel.processes(),
+    );
     let total = mutants.len();
 
     // Phase A: Pre-read source files that have at least one covered mutant.
@@ -550,6 +554,17 @@ fn run_mutants(
                     },
                 };
 
+                // A run that overlapped the cancellation signal had its
+                // pytest tree killed: the verdict is noise, not a result.
+                if ctx.cancel.is_cancelled() {
+                    was_cancelled.store(true, Ordering::Relaxed);
+                    return Ok(None);
+                }
+
+                if let Some(lock) = ctx.session {
+                    lock_session(lock).update_result(&result)?;
+                }
+
                 let index = completed.fetch_add(1_usize, Ordering::Relaxed);
                 ctx.progress.report_mutant(index, total, &result);
                 Ok(Some(result))
@@ -571,6 +586,25 @@ fn run_mutants(
     let cancelled = was_cancelled.load(Ordering::Relaxed);
 
     Ok((results, cancelled))
+}
+
+/// Record the current time as `last_run_at` so `--incremental` can tell
+/// which source files changed since this run.
+fn stamp_last_run(lock: &std::sync::Mutex<session::Session>) {
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _meta = lock_session(lock).set_metadata("last_run_at", &epoch_secs.to_string());
+}
+
+/// Lock the shared session, tolerating a poisoned mutex (`SQLite` state is
+/// consistent per statement, so a panic elsewhere does not corrupt it).
+fn lock_session(
+    lock: &std::sync::Mutex<session::Session>,
+) -> std::sync::MutexGuard<'_, session::Session> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Pre-read source files that have at least one covered mutant.
@@ -650,12 +684,21 @@ mod tests {
             }
         }
 
-        /// Borrow as a `RunContext`.
+        /// Borrow as a `RunContext` without a session.
         fn as_ctx(&self) -> RunContext<'_> {
+            self.as_ctx_with_session(None)
+        }
+
+        /// Borrow as a `RunContext` flushing verdicts into `session`.
+        fn as_ctx_with_session<'ctx>(
+            &'ctx self,
+            session: Option<&'ctx std::sync::Mutex<session::Session>>,
+        ) -> RunContext<'ctx> {
             RunContext {
                 runtime: &self.runtime,
                 progress: self.render.as_ref().expect("render handle").reporter(),
                 cancel: &self.cancel,
+                session,
             }
         }
     }
@@ -824,6 +867,44 @@ mod tests {
         assert!(results[0_usize].tests_run.is_empty());
     }
 
+    /// Verdicts reach the session database as each mutant finishes, not in a
+    /// batch after the run — a killed run must be resumable (issue #15).
+    #[test]
+    fn run_mutants_flushes_each_verdict_to_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sess = session::Session::open(&dir.path().join("s.db")).expect("open session");
+        let mutants: Vec<mutation::Mutant> = (0_u32..3_u32)
+            .map(|idx| mutation::Mutant {
+                byte_offset: idx as usize,
+                ..test_mutant()
+            })
+            .collect();
+        sess.store_mutants(&mutants).expect("store mutants");
+        let session_lock = std::sync::Mutex::new(sess);
+
+        let coverage_map = coverage::CoverageMap::new();
+        let config = config::FestConfig::default();
+        let test_ctx = TestRunContext::new();
+
+        let (results, _cancelled) = run_mutants(
+            &mutants,
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx_with_session(Some(&session_lock)),
+            Path::new("."),
+        )
+        .expect("should succeed");
+        assert_eq!(results.len(), 3_usize);
+
+        let stats = session_lock
+            .lock()
+            .expect("session lock")
+            .count_by_status()
+            .expect("count");
+        assert_eq!(stats.pending, 0_usize, "every verdict must be persisted");
+        assert_eq!(stats.no_coverage, 3_usize);
+    }
+
     /// `run_mutants` marks mutants as `NoCoverage` when the coverage map
     /// has entries but none for the mutant's file and line.
     #[test]
@@ -932,6 +1013,70 @@ mod tests {
         assert!(cancelled);
         // Should have 0 results since cancellation is checked before each mutant.
         assert!(results.is_empty());
+    }
+
+    /// Cancelling mid-run kills the in-flight pytest process and drops its
+    /// verdict: a signal-killed test run says nothing about the mutant.
+    #[cfg(unix)]
+    #[test]
+    fn run_mutants_cancelled_mid_run_kills_pytest_and_drops_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fake `.venv/bin/python` that would run for 30 s if left alone.
+        let project = tempfile::tempdir().expect("project dir");
+        let bin = project.path().join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).expect("venv bin");
+        let python = bin.join("python");
+        std::fs::write(&python, "#!/bin/sh\nsleep 30\n").expect("fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let source_file = project.path().join("app.py");
+        std::fs::write(&source_file, "x = 1 + 1\n").expect("source");
+
+        let mutant = mutation::Mutant {
+            file_path: source_file.clone(),
+            byte_offset: 6_usize,
+            ..test_mutant()
+        };
+        let mut coverage_map = coverage::CoverageMap::new();
+        let _prev = coverage_map.insert(
+            (source_file, 1_u32),
+            vec!["tests/test_app.py::test_x".to_owned()],
+        );
+        let config = config::FestConfig {
+            backend: config::RunnerBackend::Subprocess,
+            workers: Some(1_usize),
+            timeout: 30_u64,
+            ..config::FestConfig::default()
+        };
+        let test_ctx = TestRunContext::new();
+
+        // Simulate the first Ctrl+C arriving while pytest is running.
+        let cancel = test_ctx.cancel.clone();
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(500_u64));
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let (results, cancelled) = run_mutants(
+            core::slice::from_ref(&mutant),
+            &coverage_map,
+            &config,
+            &test_ctx.as_ctx(),
+            project.path(),
+        )
+        .expect("should succeed");
+        signaller.join().expect("signaller thread");
+
+        assert!(cancelled);
+        assert!(
+            results.is_empty(),
+            "in-flight verdict must be dropped, got {results:?}"
+        );
+        assert!(
+            started.elapsed() < core::time::Duration::from_secs(10_u64),
+            "cancellation must kill pytest, not wait for it"
+        );
     }
 
     /// Parallel execution preserves input order of mutant results.

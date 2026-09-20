@@ -12,6 +12,8 @@
 //! communicates over a Unix domain socket for faster in-process
 //! module patching.
 
+/// Child-process lifecycle helpers (process groups, tree kill).
+pub(crate) mod process;
 /// Pytest-plugin-based runner backend.
 pub mod pytest_plugin;
 /// Subprocess-based runner backend.
@@ -267,13 +269,15 @@ pub fn build_runner(
     backend: &RunnerBackend,
     timeout: u64,
     project_dir: std::path::PathBuf,
+    processes: &process::ProcessRegistry,
 ) -> AnyRunner {
     match *backend {
-        RunnerBackend::Subprocess => {
-            AnyRunner::Subprocess(SubprocessRunner::new(timeout, project_dir))
-        }
+        RunnerBackend::Subprocess => AnyRunner::Subprocess(
+            SubprocessRunner::new(timeout, project_dir).with_process_registry(processes.clone()),
+        ),
         RunnerBackend::Plugin => {
-            let subprocess = SubprocessRunner::new(timeout, project_dir);
+            let subprocess = SubprocessRunner::new(timeout, project_dir)
+                .with_process_registry(processes.clone());
             AnyRunner::Plugin {
                 plugin: PytestPluginRunner::new(timeout),
                 subprocess,
@@ -296,6 +300,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
         );
         assert!(matches!(runner, AnyRunner::Subprocess(_)));
     }
@@ -303,14 +308,24 @@ mod tests {
     /// `build_runner` returns `AnyRunner::Plugin` for the plugin backend.
     #[test]
     fn build_runner_plugin() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Plugin,
+            10_u64,
+            PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
+        );
         assert!(matches!(runner, AnyRunner::Plugin { .. }));
     }
 
     /// Plugin variant includes a fresh `plugin_failed` flag.
     #[test]
     fn build_runner_plugin_not_failed() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Plugin,
+            10_u64,
+            PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
+        );
         if let AnyRunner::Plugin { plugin_failed, .. } = &runner {
             assert!(!plugin_failed.load(Ordering::Relaxed));
         } else {
@@ -325,6 +340,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
         );
         let result = runner.start(4_usize, Path::new(".")).await;
         assert!(result.is_ok());
@@ -337,6 +353,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
         );
         let result = runner.stop().await;
         assert!(result.is_ok());
@@ -347,7 +364,12 @@ mod tests {
     #[tokio::test]
     async fn any_runner_start_plugin_absorbs_error() {
         // Using timeout=0 so the worker spawn will likely fail/timeout.
-        let runner = build_runner(&RunnerBackend::Plugin, 0_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Plugin,
+            0_u64,
+            PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
+        );
         // start should not return Err -- it absorbs plugin errors.
         let result = runner.start(1_usize, Path::new(".")).await;
         assert!(result.is_ok());
@@ -356,7 +378,12 @@ mod tests {
     /// `AnyRunner::stop` on plugin variant succeeds even without start.
     #[tokio::test]
     async fn any_runner_stop_plugin_without_start() {
-        let runner = build_runner(&RunnerBackend::Plugin, 10_u64, PathBuf::from("/project"));
+        let runner = build_runner(
+            &RunnerBackend::Plugin,
+            10_u64,
+            PathBuf::from("/project"),
+            &process::ProcessRegistry::default(),
+        );
         let result = runner.stop().await;
         assert!(result.is_ok());
     }

@@ -164,3 +164,6 @@ harness = false
 [[bench]]
 name = "coverage"
 harness = false
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31", features = ["signal"] }
