@@ -31,7 +31,10 @@ use crate::{
     Error,
     mutation::{Mutant, MutantResult, MutantStatus, SkipReason},
     plugin::FEST_PLUGIN_SOURCE,
-    runner::Runner,
+    runner::{
+        Runner,
+        process::{IsolatedChild, ProcessRegistry},
+    },
 };
 
 /// Default timeout in seconds when none is specified.
@@ -154,8 +157,9 @@ struct PersistentWorker {
     /// Kept alive so the directory is not cleaned up prematurely.
     _temp_dir: tempfile::TempDir,
 
-    /// The pytest child process.
-    child: tokio::process::Child,
+    /// The pytest child process, leader of its own process group so the
+    /// whole tree (pytest plus anything a test spawns) dies with it.
+    child: IsolatedChild,
 
     /// Buffered reader for the Unix socket connection.
     reader: BufReader<ReadHalf<IpcStream>>,
@@ -175,7 +179,8 @@ impl PersistentWorker {
     /// collect tests (much longer than per-mutant timeout for large suites).
     ///
     /// `index` is the project-level [`crate::plugin_index::PluginIndex`]
-    /// sent to the plugin as the `ready_ack` payload.
+    /// sent to the plugin as the `ready_ack` payload; the worker's process
+    /// group is recorded in `processes` so cancellation can kill it.
     ///
     /// # Errors
     ///
@@ -184,16 +189,18 @@ impl PersistentWorker {
         startup_timeout: Duration,
         project_dir: &std::path::Path,
         index: Arc<crate::plugin_index::PluginIndex>,
+        processes: &ProcessRegistry,
     ) -> Result<Self, Error> {
         let env = prepare_worker_env()?;
 
-        let mut child = Command::new(crate::python::resolve_python(project_dir))
+        let mut cmd = Command::new(crate::python::resolve_python(project_dir));
+        let _cmd = cmd
             .args(build_worker_args(&env.socket_addr_str, project_dir))
             .current_dir(project_dir)
             .env("PYTHONPATH", &env.python_path)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .stderr(std::process::Stdio::piped());
+        let mut child = IsolatedChild::spawn(&mut cmd, processes)
             .map_err(|err| Error::Runner(format!("failed to spawn pytest: {err}")))?;
 
         // Race between accepting a connection and the child exiting.
@@ -276,6 +283,9 @@ impl PersistentWorker {
     }
 
     /// Send a shutdown message and wait for the child to exit.
+    ///
+    /// A worker that does not exit (stuck in a mutant's infinite loop, or a
+    /// test left a subprocess behind) is torn down as a whole process tree.
     async fn shutdown(mut self) {
         let shutdown_msg = r#"{"type":"shutdown"}"#;
         let _write_result = write_message(&mut self.writer, shutdown_msg).await;
@@ -284,8 +294,7 @@ impl PersistentWorker {
         let wait_result = tokio::time::timeout(Duration::from_secs(5_u64), self.child.wait()).await;
 
         if wait_result.is_err() {
-            let _kill_result = self.child.kill().await;
-            let _wait_result = self.child.wait().await;
+            self.child.kill_tree().await;
         }
     }
 }
@@ -310,22 +319,42 @@ struct WorkerPool {
 
     /// Context for respawning replacements of discarded workers. `None`
     /// disables respawning (unit tests).
-    respawn: Option<RespawnContext>,
+    respawn: Option<WorkerSpawnContext>,
 }
 
-/// Everything needed to spawn a replacement worker after a discard.
+/// Everything needed to spawn a worker: at start-up, as a replacement
+/// after a discard, or as a one-shot fallback.
 ///
 /// Without respawning, every timed-out mutant permanently shrinks the
 /// pool; once it is empty every remaining mutant is misreported as
 /// `Timeout` without ever running.
 #[derive(Clone)]
-struct RespawnContext {
-    /// Startup timeout for the replacement worker (pytest must collect).
+struct WorkerSpawnContext {
+    /// Startup timeout for the worker (pytest must collect).
     startup_timeout: Duration,
     /// Project directory the worker runs in.
     project_dir: std::path::PathBuf,
     /// Shared plugin index sent in the `ready_ack` handshake.
     index: Arc<crate::plugin_index::PluginIndex>,
+    /// Registry the worker's process group is recorded in.
+    processes: ProcessRegistry,
+}
+
+impl WorkerSpawnContext {
+    /// Spawn one worker with this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Runner`] if the worker fails to start or handshake.
+    async fn spawn_worker(&self) -> Result<PersistentWorker, Error> {
+        PersistentWorker::spawn(
+            self.startup_timeout,
+            &self.project_dir,
+            Arc::clone(&self.index),
+            &self.processes,
+        )
+        .await
+    }
 }
 
 impl core::fmt::Debug for WorkerPool {
@@ -336,7 +365,7 @@ impl core::fmt::Debug for WorkerPool {
 
 impl WorkerPool {
     /// Create a new pool containing the given workers.
-    fn new(workers: Vec<PersistentWorker>, respawn: Option<RespawnContext>) -> Self {
+    fn new(workers: Vec<PersistentWorker>, respawn: Option<WorkerSpawnContext>) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         for worker in workers {
             // Channel is unbounded and fresh — send cannot fail.
@@ -363,7 +392,7 @@ impl WorkerPool {
         let pool = Arc::clone(self);
         drop(tokio::spawn(async move {
             worker.shutdown().await;
-            match PersistentWorker::spawn(ctx.startup_timeout, &ctx.project_dir, ctx.index).await {
+            match ctx.spawn_worker().await {
                 Ok(replacement) => pool.return_worker(replacement),
                 Err(_err) => {
                     // Replacement failed (e.g. project env broke mid-run):
@@ -436,19 +465,33 @@ pub struct PytestPluginRunner {
     /// Project plugin index, computed during `start()` and sent to each
     /// worker as the `ready_ack` handshake payload.
     project_index: std::sync::Mutex<Option<Arc<crate::plugin_index::PluginIndex>>>,
+
+    /// Live worker process groups, shared with the signal handler so a
+    /// cancelled run can kill them.
+    processes: ProcessRegistry,
 }
 
 impl PytestPluginRunner {
     /// Create a new [`PytestPluginRunner`] with the given timeout.
     #[inline]
     #[must_use]
-    pub const fn new(timeout_secs: u64) -> Self {
+    pub fn new(timeout_secs: u64) -> Self {
         Self {
             timeout: Duration::from_secs(timeout_secs),
             pool: std::sync::Mutex::new(None),
             project_dir: std::sync::Mutex::new(None),
             project_index: std::sync::Mutex::new(None),
+            processes: ProcessRegistry::default(),
         }
+    }
+
+    /// Record worker processes in `processes` instead of a private
+    /// registry, so cancellation can reach them.
+    #[inline]
+    #[must_use]
+    pub fn with_process_registry(mut self, processes: ProcessRegistry) -> Self {
+        self.processes = processes;
+        self
     }
 }
 
@@ -506,35 +549,14 @@ impl Runner for PytestPluginRunner {
         // of seconds. When timeout is zero (tests), skip the floor.
         let startup_timeout = compute_startup_timeout(self.timeout);
 
-        let mut handles = Vec::with_capacity(num_workers);
-        let dir = project_dir.to_path_buf();
-
-        for _idx in 0..num_workers {
-            let worker_dir = dir.clone();
-            let worker_timeout = startup_timeout;
-            let worker_index = Arc::clone(&index_arc);
-            let handle = tokio::spawn(async move {
-                PersistentWorker::spawn(worker_timeout, &worker_dir, worker_index).await
-            });
-            handles.push(handle);
-        }
-
-        let mut workers = Vec::with_capacity(num_workers);
-        for handle in handles {
-            let worker = handle
-                .await
-                .map_err(|err| Error::Runner(format!("worker spawn task panicked: {err}")))??;
-            workers.push(worker);
-        }
-
-        let worker_pool = Arc::new(WorkerPool::new(
-            workers,
-            Some(RespawnContext {
-                startup_timeout,
-                project_dir: dir,
-                index: index_arc,
-            }),
-        ));
+        let ctx = WorkerSpawnContext {
+            startup_timeout,
+            project_dir: project_dir.to_path_buf(),
+            index: index_arc,
+            processes: self.processes.clone(),
+        };
+        let workers = spawn_workers(num_workers, &ctx).await?;
+        let worker_pool = Arc::new(WorkerPool::new(workers, Some(ctx)));
         *self
             .pool
             .lock()
@@ -604,7 +626,13 @@ impl Runner for PytestPluginRunner {
                 .ok()
                 .and_then(|guard| guard.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            run_oneshot(mutant, source, tests, self.timeout, &dir).await?
+            let ctx = WorkerSpawnContext {
+                startup_timeout: compute_startup_timeout(self.timeout),
+                project_dir: dir,
+                index: Arc::new(crate::plugin_index::PluginIndex::default()),
+                processes: self.processes.clone(),
+            };
+            run_oneshot(mutant, source, tests, self.timeout, &ctx).await?
         };
 
         let elapsed = start.elapsed();
@@ -661,6 +689,32 @@ async fn run_via_pool(
     result
 }
 
+/// Spawn `num_workers` workers concurrently and wait for all of them.
+///
+/// # Errors
+///
+/// Returns the first [`Error::Runner`] if any worker fails to start.
+async fn spawn_workers(
+    num_workers: usize,
+    ctx: &WorkerSpawnContext,
+) -> Result<Vec<PersistentWorker>, Error> {
+    let handles: Vec<_> = (0..num_workers)
+        .map(|_idx| {
+            let worker_ctx = ctx.clone();
+            tokio::spawn(async move { worker_ctx.spawn_worker().await })
+        })
+        .collect();
+
+    let mut workers = Vec::with_capacity(num_workers);
+    for handle in handles {
+        let worker = handle
+            .await
+            .map_err(|err| Error::Runner(format!("worker spawn task panicked: {err}")))??;
+        workers.push(worker);
+    }
+    Ok(workers)
+}
+
 /// Run a single mutant using a freshly spawned one-shot worker.
 ///
 /// This is used as a fallback when the persistent pool is not available.
@@ -673,18 +727,11 @@ async fn run_oneshot(
     source: &str,
     tests: &[String],
     timeout: Duration,
-    project_dir: &std::path::Path,
+    ctx: &WorkerSpawnContext,
 ) -> Result<MutantStatus, Error> {
     // One-shot workers need a generous spawn timeout (pytest must collect
     // tests), but the per-mutant timeout is used for the actual test run.
-    let startup_timeout = compute_startup_timeout(timeout);
-
-    let default_index = Arc::new(crate::plugin_index::PluginIndex::default());
-    let spawn_result = tokio::time::timeout(
-        startup_timeout,
-        PersistentWorker::spawn(startup_timeout, project_dir, default_index),
-    )
-    .await;
+    let spawn_result = tokio::time::timeout(ctx.startup_timeout, ctx.spawn_worker()).await;
 
     let mut worker = match spawn_result {
         Err(_elapsed) => return Ok(MutantStatus::Timeout),
@@ -700,8 +747,8 @@ async fn run_oneshot(
 ///
 /// Returns whatever has been written so far, truncated to a reasonable
 /// length. If stderr cannot be read, returns a placeholder message.
-async fn capture_child_stderr(child: &mut tokio::process::Child) -> String {
-    let Some(stderr) = child.stderr.take() else {
+async fn capture_child_stderr(child: &mut IsolatedChild) -> String {
+    let Some(stderr) = child.take_stderr() else {
         return "<no stderr captured>".to_owned();
     };
 
@@ -769,7 +816,7 @@ fn compute_startup_timeout(per_mutant_timeout: Duration) -> Duration {
 /// Returns [`Error::Runner`] if the child exits, timeout elapses, or
 /// accept fails.
 async fn accept_or_child_exit(
-    child: &mut tokio::process::Child,
+    child: &mut IsolatedChild,
     listener: IpcListener,
     timeout: Duration,
 ) -> Result<IpcStream, Error> {
@@ -780,8 +827,7 @@ async fn accept_or_child_exit(
                 Ok((stream, _addr)) => Ok(stream),
                 Err(err) => {
                     let stderr_output = capture_child_stderr(child).await;
-                    let _kill_result = child.kill().await;
-                    let _wait_result = child.wait().await;
+                    child.kill_tree().await;
                     Err(Error::Runner(format!(
                         "failed to accept connection from pytest worker: {err} \
                          (pytest stderr: {stderr_output})"
@@ -804,8 +850,7 @@ async fn accept_or_child_exit(
         // Branch 3: timeout elapses.
         () = tokio::time::sleep(timeout) => {
             let stderr_output = capture_child_stderr(child).await;
-            let _kill_result = child.kill().await;
-            let _wait_result = child.wait().await;
+            child.kill_tree().await;
             Err(Error::Runner(format!(
                 "timeout waiting for pytest worker to connect \
                  (pytest stderr: {stderr_output})"
@@ -1873,6 +1918,46 @@ mod tests {
     ///  * mutation score >= 70% (most mutants killed)
     ///  * 0 error statuses
     ///
+    /// Workers are registered as isolated process groups while they live and
+    /// are gone — group and process — once the runner stops, so cancellation
+    /// can kill them and nothing they spawned outlives fest.
+    ///
+    /// Ignored by default — requires python+pytest in the fixture's `.venv`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "integration test; requires python+pytest in environment"]
+    async fn plugin_workers_are_isolated_groups_and_die_on_stop() {
+        let fixture = Path::new("tests/fixtures/control_flow_bindings");
+        let python = crate::python::resolve_python(fixture);
+        let py_check = std::process::Command::new(&python)
+            .args(["-c", "import pytest"])
+            .output();
+        if !fixture.exists() || !py_check.is_ok_and(|out| out.status.success()) {
+            return;
+        }
+
+        let registry = ProcessRegistry::default();
+        let runner = PytestPluginRunner::new(60_u64).with_process_registry(registry.clone());
+        runner.start(1_usize, fixture).await.expect("start");
+
+        let groups = registry.snapshot();
+        assert_eq!(
+            groups.len(),
+            1_usize,
+            "one worker, one live group: {groups:?}"
+        );
+        let pgid = groups[0_usize];
+
+        runner.stop().await.expect("stop");
+
+        assert!(
+            registry.snapshot().is_empty(),
+            "stop must unregister the worker"
+        );
+        let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pgid), None).is_ok();
+        assert!(!alive, "worker {pgid} must be dead after stop");
+    }
+
     /// Ignored by default — requires python+pytest on PATH.
     #[tokio::test]
     #[ignore = "integration test; requires python+pytest in environment"]
