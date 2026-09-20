@@ -168,10 +168,12 @@ fest run [OPTIONS]
 
 | Backend | How it works | Speed | Compatibility |
 |---------|-------------|-------|---------------|
-| **plugin** (default) | Patches modules in a long-lived pytest process | ⚡ Fast | Most projects |
-| **subprocess** | Overwrites source file on disk, runs `pytest` | Slower | Universal |
+| **plugin** (default) | Patches modules in a long-lived pytest process; `--workers` run in parallel | ⚡ Fast | Most projects |
+| **subprocess** | Overwrites the source file on disk, runs `pytest`; one mutant at a time (`--workers` has no effect) | Slower | Universal |
 
 The plugin backend falls back to subprocess automatically on infrastructure errors.
+The subprocess backend cannot run mutants in parallel: pytest imports the whole
+package, so two mutants on disk at once would contaminate each other's verdict.
 
 ## Performance
 
