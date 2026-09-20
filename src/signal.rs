@@ -13,11 +13,15 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::runner::process::ProcessRegistry;
+
 /// Shared cancellation flag polled by the pipeline.
 #[derive(Debug, Clone)]
 pub struct CancellationState {
     /// Set to `true` when the first signal is received.
     cancelled: Arc<AtomicBool>,
+    /// Test-process trees to kill when cancellation is requested.
+    processes: ProcessRegistry,
 }
 
 impl CancellationState {
@@ -27,7 +31,16 @@ impl CancellationState {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            processes: ProcessRegistry::default(),
         }
+    }
+
+    /// Registry the runners record spawned test processes in, so that
+    /// [`cancel`](Self::cancel) can kill them.
+    #[inline]
+    #[must_use]
+    pub const fn processes(&self) -> &ProcessRegistry {
+        &self.processes
     }
 
     /// Returns `true` if a cancellation signal has been received.
@@ -41,6 +54,16 @@ impl CancellationState {
     #[cfg(test)]
     pub fn set_cancelled_for_test(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// Request cancellation: raise the flag, then kill every in-flight test
+    /// process tree so the pipeline can wind down promptly.
+    ///
+    /// The flag goes first so a run that ends because its process was killed
+    /// already observes `is_cancelled()` and discards the tainted verdict.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.processes.kill_all();
     }
 }
 
@@ -71,7 +94,7 @@ pub fn install_signal_handlers(
     state: &CancellationState,
 ) -> Result<(), crate::Error> {
     let _guard = runtime.enter();
-    let cancelled = Arc::clone(&state.cancelled);
+    let shared = state.clone();
 
     #[cfg(unix)]
     {
@@ -93,13 +116,13 @@ pub fn install_signal_handlers(
                 _ = sigterm.recv() => {}
                 _ = sigquit.recv() => {}
             }
-            on_first_signal(&cancelled);
+            on_first_signal(&shared);
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
                 _ = sigquit.recv() => {}
             }
-            on_second_signal();
+            on_second_signal(&shared);
         });
     }
 
@@ -107,9 +130,9 @@ pub fn install_signal_handlers(
     {
         let _handle = runtime.spawn(async move {
             let _result = tokio::signal::ctrl_c().await;
-            on_first_signal(&cancelled);
+            on_first_signal(&shared);
             let _result = tokio::signal::ctrl_c().await;
-            on_second_signal();
+            on_second_signal(&shared);
         });
     }
 
@@ -117,8 +140,8 @@ pub fn install_signal_handlers(
 }
 
 /// Handle the first cancellation signal.
-fn on_first_signal(cancelled: &AtomicBool) {
-    cancelled.store(true, Ordering::Relaxed);
+fn on_first_signal(state: &CancellationState) {
+    state.cancel();
     let mut stderr = std::io::stderr().lock();
     let _result = std::io::Write::write_all(
         &mut stderr,
@@ -127,7 +150,11 @@ fn on_first_signal(cancelled: &AtomicBool) {
 }
 
 /// Handle the second cancellation signal — hard exit.
-fn on_second_signal() -> ! {
+///
+/// Anything spawned since the first signal is killed too; nothing may
+/// outlive the abort.
+fn on_second_signal(state: &CancellationState) -> ! {
+    state.processes.kill_all();
     let mut stderr = std::io::stderr().lock();
     let _result = std::io::Write::write_all(&mut stderr, b"\nReceived second signal, aborting.\n");
     #[allow(clippy::exit, reason = "intentional hard exit on second signal")]
