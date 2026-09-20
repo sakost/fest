@@ -28,7 +28,8 @@ pub use subprocess::SubprocessRunner;
 use crate::{
     Error,
     config::RunnerBackend,
-    mutation::{Mutant, MutantResult},
+    mutation::{Mutant, MutantResult, MutantStatus},
+    signal::CancellationState,
 };
 
 /// Trait for mutant execution backends.
@@ -130,7 +131,9 @@ pub(crate) fn build_python_path(dir: &Path) -> String {
 ///
 /// The [`Plugin`](Self::Plugin) variant carries a subprocess fallback:
 /// on the first [`Error::Runner`] from the plugin, it switches to
-/// subprocess for all remaining mutants.
+/// subprocess for all remaining mutants — unless the run has been
+/// cancelled, in which case the failure is the abort's own doing (the
+/// signal handler killed the workers) and nothing is re-run.
 #[derive(Debug)]
 pub enum AnyRunner {
     /// Subprocess-based runner (no fallback).
@@ -143,6 +146,9 @@ pub enum AnyRunner {
         subprocess: SubprocessRunner,
         /// Set to `true` after the first plugin infrastructure failure.
         plugin_failed: AtomicBool,
+        /// Cancellation state: a plugin failure after cancellation is not
+        /// an infrastructure failure and must not trigger the fallback.
+        cancel: CancellationState,
     },
 }
 
@@ -225,12 +231,23 @@ impl AnyRunner {
                 plugin,
                 subprocess,
                 plugin_failed,
+                cancel,
             } => {
                 if plugin_failed.load(Ordering::Relaxed) {
                     return subprocess.run_mutant(mutant, source, tests).await;
                 }
 
                 match plugin.run_mutant(mutant, source, tests).await {
+                    Err(Error::Runner(msg)) if cancel.is_cancelled() => {
+                        // The workers were killed by the abort; the verdict
+                        // is discarded by the caller anyway.
+                        Ok(MutantResult {
+                            mutant: mutant.clone(),
+                            status: MutantStatus::Error(format!("cancelled: {msg}")),
+                            tests_run: tests.to_vec(),
+                            duration: core::time::Duration::ZERO,
+                        })
+                    }
                     Err(Error::Runner(_msg)) => {
                         plugin_failed.store(true, Ordering::Relaxed);
                         subprocess.run_mutant(mutant, source, tests).await
@@ -269,19 +286,21 @@ pub fn build_runner(
     backend: &RunnerBackend,
     timeout: u64,
     project_dir: std::path::PathBuf,
-    processes: &process::ProcessRegistry,
+    cancel: &CancellationState,
 ) -> AnyRunner {
+    let processes = cancel.processes().clone();
     match *backend {
         RunnerBackend::Subprocess => AnyRunner::Subprocess(
-            SubprocessRunner::new(timeout, project_dir).with_process_registry(processes.clone()),
+            SubprocessRunner::new(timeout, project_dir).with_process_registry(processes),
         ),
         RunnerBackend::Plugin => {
             let subprocess = SubprocessRunner::new(timeout, project_dir)
                 .with_process_registry(processes.clone());
             AnyRunner::Plugin {
-                plugin: PytestPluginRunner::new(timeout),
+                plugin: PytestPluginRunner::new(timeout).with_process_registry(processes),
                 subprocess,
                 plugin_failed: AtomicBool::new(false),
+                cancel: cancel.clone(),
             }
         }
     }
@@ -300,7 +319,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         assert!(matches!(runner, AnyRunner::Subprocess(_)));
     }
@@ -312,7 +331,7 @@ mod tests {
             &RunnerBackend::Plugin,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         assert!(matches!(runner, AnyRunner::Plugin { .. }));
     }
@@ -324,7 +343,7 @@ mod tests {
             &RunnerBackend::Plugin,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         if let AnyRunner::Plugin { plugin_failed, .. } = &runner {
             assert!(!plugin_failed.load(Ordering::Relaxed));
@@ -340,7 +359,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         let result = runner.start(4_usize, Path::new(".")).await;
         assert!(result.is_ok());
@@ -353,7 +372,7 @@ mod tests {
             &RunnerBackend::Subprocess,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         let result = runner.stop().await;
         assert!(result.is_ok());
@@ -368,11 +387,53 @@ mod tests {
             &RunnerBackend::Plugin,
             0_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         // start should not return Err -- it absorbs plugin errors.
         let result = runner.start(1_usize, Path::new(".")).await;
         assert!(result.is_ok());
+    }
+
+    /// Once cancellation has killed the workers, a plugin failure is a
+    /// consequence of the abort, not an infrastructure problem: no fallback
+    /// to subprocess, no `plugin_failed` flag, just a throwaway verdict.
+    #[tokio::test]
+    async fn plugin_failure_after_cancellation_does_not_fall_back() {
+        let cancel = CancellationState::new();
+        let runner = build_runner(
+            &RunnerBackend::Plugin,
+            10_u64,
+            PathBuf::from("/nonexistent/project"),
+            &cancel,
+        );
+        cancel.set_cancelled_for_test();
+
+        let mutant = Mutant {
+            file_path: PathBuf::from("/nonexistent/project/app.py"),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 1_usize,
+            original_text: "1".to_owned(),
+            mutated_text: "2".to_owned(),
+            mutator_name: "constant_replace".to_owned(),
+        };
+        // No pool was started, so the plugin path spawns a one-shot worker in
+        // a directory that does not exist and fails with Error::Runner.
+        let result = runner
+            .run_mutant(&mutant, "1", &["tests/test_a.py::test_a".to_owned()])
+            .await
+            .expect("cancelled failure must not abort the run");
+
+        assert!(
+            matches!(result.status, MutantStatus::Error(_)),
+            "expected a throwaway error verdict, got {:?}",
+            result.status
+        );
+        assert!(
+            !runner.did_plugin_fail(),
+            "cancellation must not be reported as a plugin failure"
+        );
     }
 
     /// `AnyRunner::stop` on plugin variant succeeds even without start.
@@ -382,7 +443,7 @@ mod tests {
             &RunnerBackend::Plugin,
             10_u64,
             PathBuf::from("/project"),
-            &process::ProcessRegistry::default(),
+            &CancellationState::new(),
         );
         let result = runner.stop().await;
         assert!(result.is_ok());

@@ -484,7 +484,7 @@ fn run_mutants(
         &config.backend,
         config.timeout,
         project_dir.to_path_buf(),
-        ctx.cancel.processes(),
+        ctx.cancel,
     );
     let total = mutants.len();
 

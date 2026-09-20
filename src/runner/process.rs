@@ -66,6 +66,12 @@ impl ProcessRegistry {
         self.groups().contains(&pgid)
     }
 
+    /// The live group ids at this instant.
+    #[cfg(all(test, unix))]
+    pub(super) fn snapshot(&self) -> Vec<i32> {
+        self.groups().iter().copied().collect()
+    }
+
     /// Lock the set, tolerating poisoning (the set stays usable).
     fn groups(&self) -> MutexGuard<'_, BTreeSet<i32>> {
         self.groups.lock().unwrap_or_else(PoisonError::into_inner)
@@ -123,6 +129,11 @@ impl IsolatedChild {
     #[cfg(all(test, unix))]
     pub(super) const fn group_id(&self) -> Option<i32> {
         self.pgid
+    }
+
+    /// Take the leader's piped stderr, if the command asked for one.
+    pub(super) const fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
     }
 
     /// Wait for the leader to exit and unregister its group.
