@@ -318,6 +318,30 @@ mod tests {
             ruff_python_parser::parse_module(&mutated).expect("mutant must stay valid Python");
     }
 
+    /// Multi-line parenthesized operand (issue #14): only `not ` is removed,
+    /// the newline and indentation inside the parens are untouched.
+    #[test]
+    fn remove_not_before_multiline_parenthesized_operand_keeps_layout() {
+        let source = "def f(x, y):\n    return not (\n        x > 0\n        and y > 0\n    )\n";
+        let mutations = find(source);
+        let removal = mutations
+            .iter()
+            .find(|m| m.replacement_text.is_empty())
+            .expect("not-removal mutation present");
+        assert_eq!(removal.original_text, "not ");
+        let mutated = format!(
+            "{}{}",
+            &source[..removal.byte_offset],
+            &source[removal.byte_offset + removal.byte_length..]
+        );
+        assert_eq!(
+            mutated,
+            "def f(x, y):\n    return (\n        x > 0\n        and y > 0\n    )\n"
+        );
+        let _parsed =
+            ruff_python_parser::parse_module(&mutated).expect("mutant must stay valid Python");
+    }
+
     /// `not(x)` with no space also stays balanced.
     #[test]
     fn remove_not_without_space_keeps_parens() {
