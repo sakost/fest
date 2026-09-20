@@ -110,6 +110,14 @@ pub struct ProgressReporter {
 }
 
 impl ProgressReporter {
+    /// A reporter whose events land in the returned receiver instead of a
+    /// render task, so tests can assert on what the pipeline reported.
+    #[cfg(test)]
+    pub(crate) fn capturing() -> (Self, tokio::sync::mpsc::UnboundedReceiver<RenderEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (Self { sender }, receiver)
+    }
+
     /// Signal that a pipeline phase has started.
     #[inline]
     pub fn phase_start(&self, label: &str) {

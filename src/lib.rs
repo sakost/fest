@@ -494,6 +494,12 @@ fn run_mutants(
 
     // Phase B: Parallel execution via rayon.
     let num_workers = config.resolved_workers();
+    if matches!(config.backend, config::RunnerBackend::Subprocess) && num_workers > 1_usize {
+        ctx.progress.warning(
+            "subprocess backend applies mutants in place and runs them one at a time; --workers \
+             has no effect (use the plugin backend for parallelism)",
+        );
+    }
 
     // Start the runner (spawns persistent workers for the plugin backend).
     ctx.progress.phase_start("Starting test workers");
@@ -865,6 +871,47 @@ mod tests {
         assert_eq!(results.len(), 1_usize);
         assert_eq!(results[0_usize].status, mutation::MutantStatus::NoCoverage);
         assert!(results[0_usize].tests_run.is_empty());
+    }
+
+    /// The subprocess backend serialises mutants behind a tree-wide lock, so
+    /// asking it for several workers must tell the user that `--workers` is
+    /// not doing what they think.
+    #[test]
+    fn subprocess_backend_with_many_workers_warns_about_serialisation() {
+        let (progress, mut events) = progress::ProgressReporter::capturing();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let cancel = signal::CancellationState::new();
+        let ctx = RunContext {
+            runtime: &runtime,
+            progress,
+            cancel: &cancel,
+            session: None,
+        };
+        let config = config::FestConfig {
+            backend: config::RunnerBackend::Subprocess,
+            workers: Some(4_usize),
+            ..config::FestConfig::default()
+        };
+
+        let _run = run_mutants(
+            &[test_mutant()],
+            &coverage::CoverageMap::new(),
+            &config,
+            &ctx,
+            Path::new("."),
+        )
+        .expect("should succeed");
+
+        let mut warnings = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let progress::event::RenderEvent::Warning { message } = event {
+                warnings.push(message);
+            }
+        }
+        assert!(
+            warnings.iter().any(|w| w.contains("one at a time")),
+            "expected a serialisation warning, got {warnings:?}"
+        );
     }
 
     /// Verdicts reach the session database as each mutant finishes, not in a
