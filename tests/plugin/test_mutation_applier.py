@@ -508,3 +508,42 @@ def test_function_body_clears_lru_cache_on_apply_and_rollback(target_module):
     assert target_module.compute(1) == 2, (
         "mutated result leaked through the cache after rollback"
     )
+
+
+def test_handle_mutant_survives_system_exit_at_apply(target_module):
+    """``SystemExit`` raised while applying a mutation must not kill the worker.
+
+    Regression (issue #16): mutating an ``if __name__ == "__main__":`` guard
+    made ``main()`` run inside the worker; its ``sys.exit()`` escaped the
+    ``except Exception`` clause and took the whole worker pool down.
+    """
+    from _fest_plugin import _handle_mutant
+
+    msg = {
+        "file": "src/applier_target_mod.py",
+        "module": target_module.__name__,
+        "diff": [{"kind": "statement_bind", "names": ["X"],
+                  "stmt_source": "import sys\nsys.exit(1)\nX = 6",
+                  "scope": {"kind": "module"}}],
+        "tests": ["tests/test_a.py::test_one"],
+    }
+    item_index = {"tests/test_a.py::test_one": object()}
+    result = _handle_mutant(None, msg, item_index, {}, ReverseImportIndex())
+    # Parity with the subprocess backend: a module that exits at import time
+    # fails every test importing it.
+    assert result["status"] == "killed"
+    assert result["killed_by"] == "exec_raised: SystemExit"
+
+
+def test_safe_handle_mutant_reports_unexpected_exceptions_as_error(monkeypatch):
+    """An unexpected failure inside ``_handle_mutant`` becomes an ``error``
+    result instead of an uncaught exception that ends the worker."""
+    import _fest_plugin
+
+    def boom(*_args, **_kwargs):
+        raise SystemExit(3)
+
+    monkeypatch.setattr(_fest_plugin, "_handle_mutant", boom)
+    result = _fest_plugin._safe_handle_mutant(None, {}, {}, {}, ReverseImportIndex())
+    assert result["status"] == "error"
+    assert "SystemExit" in result["error_message"]
