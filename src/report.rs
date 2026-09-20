@@ -430,6 +430,45 @@ mod tests {
         assert!(!output.contains("Survived mutants:"));
     }
 
+    /// Text report shows skipped count and per-reason breakdown.
+    #[test]
+    fn text_report_shows_skipped_count_and_breakdown() {
+        use crate::mutation::SkipReason;
+        let mk = |status: MutantStatus| MutantResult {
+            mutant: make_mutant("m.py", 1_u32, "test", "a", "b"),
+            status,
+            tests_run: vec![],
+            duration: Duration::from_millis(1_u64),
+        };
+        let results = vec![
+            mk(MutantStatus::Killed),
+            mk(MutantStatus::Killed),
+            mk(MutantStatus::Survived),
+            mk(MutantStatus::Skipped {
+                reason: SkipReason::ConditionMutation,
+            }),
+            mk(MutantStatus::Skipped {
+                reason: SkipReason::UnmappableTarget,
+            }),
+        ];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            5_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output = text::format_text(&report, false, true).expect("should format text");
+        assert!(output.contains("Killed:"), "should show Killed line");
+        assert!(output.contains("Survived:"), "should show Survived line");
+        assert!(output.contains("Skipped:"), "should show Skipped line");
+        // Mutation score is killed / (killed + survived) = 2 / 3 = 66.7%
+        assert!(
+            output.contains("66.7%") || output.contains("66.67%"),
+            "expected score 66.7% (2 killed / 3 scored), got:\n{output}"
+        );
+    }
+
     /// Text report shows no-coverage count when present.
     #[test]
     fn text_report_shows_no_coverage() {
@@ -456,6 +495,46 @@ mod tests {
     }
 
     // -- JSON reporter tests -------------------------------------------------
+
+    /// JSON aggregate includes `skipped` and `skip_reasons` fields.
+    #[test]
+    fn json_report_contains_skipped_fields() {
+        use crate::mutation::SkipReason;
+        let results = vec![
+            make_result(
+                make_mutant("a.py", 1_u32, "op", "+", "-"),
+                MutantStatus::Skipped {
+                    reason: SkipReason::UnmappableTarget,
+                },
+            ),
+            make_result(
+                make_mutant("a.py", 2_u32, "op", "-", "+"),
+                MutantStatus::Skipped {
+                    reason: SkipReason::UnmappableTarget,
+                },
+            ),
+            make_result(
+                make_mutant("a.py", 3_u32, "op", "*", "/"),
+                MutantStatus::Skipped {
+                    reason: SkipReason::ConditionMutation,
+                },
+            ),
+        ];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            3_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let json_str = json::format_json(&report).expect("should format JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(&json_str).expect("should be valid JSON");
+
+        assert_eq!(value["skipped"], 3_i64);
+        assert_eq!(value["skip_reasons"]["unmappable_target"], 2_i64);
+        assert_eq!(value["skip_reasons"]["condition_mutation"], 1_i64);
+    }
 
     /// JSON report is valid JSON and contains expected fields.
     #[test]
@@ -863,6 +942,39 @@ mod tests {
         );
         let output = html::format_html(&report).expect("should format HTML");
         assert!(output.contains("[TIMEOUT]"));
+    }
+
+    /// HTML report shows `[SKIPPED]` label with dedicated CSS class.
+    #[test]
+    fn html_report_shows_skipped_label_and_css() {
+        use crate::mutation::SkipReason;
+        let results = vec![make_result(
+            make_mutant("a.py", 1_u32, "op", "+", "-"),
+            MutantStatus::Skipped {
+                reason: SkipReason::ConditionMutation,
+            },
+        )];
+        let report = MutationReport::from_results(
+            results,
+            1_usize,
+            1_usize,
+            Duration::from_secs(1_u64),
+            None,
+        );
+        let output = html::format_html(&report).expect("should format HTML");
+        assert!(output.contains("[SKIPPED]"), "should have [SKIPPED] label");
+        assert!(
+            output.contains("status-skipped"),
+            "should use status-skipped CSS class"
+        );
+        assert!(
+            output.contains(".status-skipped"),
+            "should define .status-skipped CSS rule"
+        );
+        assert!(
+            output.contains("Skipped"),
+            "should show Skipped row in summary"
+        );
     }
 
     /// HTML report shows error mutation detail label.

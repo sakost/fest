@@ -87,6 +87,7 @@ fn write_statistics(
 
     write_score_line("Killed:", report.killed, score, output, colored)?;
     write_survived_line(report, output, colored)?;
+    write_skipped_line(report, output)?;
 
     writeln!(output, "Timeout:            {}", report.timeouts)
         .map_err(|err| crate::Error::Report(format!("failed to format statistics: {err}")))?;
@@ -126,14 +127,15 @@ fn write_survived_line(
     output: &mut String,
     colored: bool,
 ) -> Result<(), crate::Error> {
-    let survived_pct = if report.mutants_tested == 0 {
+    let scored = report.killed + report.survived;
+    let survived_pct = if scored == 0 {
         0.0_f64
     } else {
         #[allow(
             clippy::cast_precision_loss,
             reason = "mutant counts are small enough to fit in f64 mantissa"
         )]
-        let pct = (report.survived as f64) / (report.mutants_tested as f64) * 100.0_f64;
+        let pct = (report.survived as f64) / (scored as f64) * 100.0_f64;
         pct
     };
     if colored && report.survived > 0 {
@@ -151,6 +153,27 @@ fn write_survived_line(
         )
     }
     .map_err(|err| crate::Error::Report(format!("failed to format survived line: {err}")))?;
+    Ok(())
+}
+
+/// Write the "Skipped" line with optional per-reason breakdown.
+fn write_skipped_line(report: &MutationReport, output: &mut String) -> Result<(), crate::Error> {
+    if report.skipped == 0 {
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "{:<20}{}  (out-of-scope mutations)",
+        "Skipped:", report.skipped
+    )
+    .map_err(|err| crate::Error::Report(format!("failed to format skipped line: {err}")))?;
+
+    let mut reasons: Vec<(&String, &usize)> = report.skip_reasons.iter().collect();
+    reasons.sort_unstable_by(|&(a, _), &(b, _)| a.cmp(b));
+    for (reason, count) in reasons {
+        writeln!(output, "  {reason}:  {count}")
+            .map_err(|err| crate::Error::Report(format!("failed to format skip reason: {err}")))?;
+    }
     Ok(())
 }
 

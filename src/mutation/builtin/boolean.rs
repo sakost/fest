@@ -70,10 +70,17 @@ fn collect_not_removal(
     let start = unary_op.range().start().to_usize();
     let operand_start = unary_op.operand.range().start().to_usize();
     let prefix = &source[start..operand_start];
+    // Remove only the `not` keyword and the whitespace that follows it.
+    // The prefix may also contain `(` when the operand is parenthesized
+    // (the operand's AST range excludes parens) — those must stay, or the
+    // paired `)` after the operand is orphaned and the mutant won't parse.
+    let after_keyword = prefix.get("not".len()..).unwrap_or("");
+    let whitespace_len = after_keyword.len() - after_keyword.trim_start().len();
+    let removal_len = "not".len() + whitespace_len;
     out.push(Mutation {
         byte_offset: start,
-        byte_length: prefix.len(),
-        original_text: prefix.to_owned(),
+        byte_length: removal_len,
+        original_text: prefix.get(..removal_len).unwrap_or(prefix).to_owned(),
         replacement_text: String::new(),
     });
 }
@@ -285,6 +292,71 @@ mod tests {
         assert_eq!(mutations.len(), 1_usize);
         assert_eq!(mutations[0_usize].original_text, "not ");
         assert_eq!(mutations[0_usize].replacement_text, "");
+    }
+
+    /// `not (...)` removal must leave the parentheses balanced.
+    ///
+    /// Regression: the operand's AST range excludes its parentheses, so
+    /// removing `start..operand_start` deleted `not (` and orphaned the
+    /// closing paren, producing a syntactically invalid mutant.
+    #[test]
+    fn remove_not_before_parenthesized_operand_keeps_parens() {
+        let source = "x = not (a or b)";
+        let mutations = find(source);
+        let removal = mutations
+            .iter()
+            .find(|m| m.replacement_text.is_empty())
+            .expect("not-removal mutation present");
+        assert_eq!(removal.original_text, "not ");
+        let mutated = format!(
+            "{}{}",
+            &source[..removal.byte_offset],
+            &source[removal.byte_offset + removal.byte_length..]
+        );
+        assert_eq!(mutated, "x = (a or b)");
+        let _parsed =
+            ruff_python_parser::parse_module(&mutated).expect("mutant must stay valid Python");
+    }
+
+    /// Multi-line parenthesized operand (issue #14): only `not ` is removed,
+    /// the newline and indentation inside the parens are untouched.
+    #[test]
+    fn remove_not_before_multiline_parenthesized_operand_keeps_layout() {
+        let source = "def f(x, y):\n    return not (\n        x > 0\n        and y > 0\n    )\n";
+        let mutations = find(source);
+        let removal = mutations
+            .iter()
+            .find(|m| m.replacement_text.is_empty())
+            .expect("not-removal mutation present");
+        assert_eq!(removal.original_text, "not ");
+        let mutated = format!(
+            "{}{}",
+            &source[..removal.byte_offset],
+            &source[removal.byte_offset + removal.byte_length..]
+        );
+        assert_eq!(
+            mutated,
+            "def f(x, y):\n    return (\n        x > 0\n        and y > 0\n    )\n"
+        );
+        let _parsed =
+            ruff_python_parser::parse_module(&mutated).expect("mutant must stay valid Python");
+    }
+
+    /// `not(x)` with no space also stays balanced.
+    #[test]
+    fn remove_not_without_space_keeps_parens() {
+        let source = "x = not(y)";
+        let mutations = find(source);
+        let removal = mutations
+            .iter()
+            .find(|m| m.replacement_text.is_empty())
+            .expect("not-removal mutation present");
+        let mutated = format!(
+            "{}{}",
+            &source[..removal.byte_offset],
+            &source[removal.byte_offset + removal.byte_length..]
+        );
+        assert_eq!(mutated, "x = (y)");
     }
 
     /// Multiple `and` operators in a chained expression.

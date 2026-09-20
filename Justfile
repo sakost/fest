@@ -17,6 +17,11 @@ check:
 test:
     cargo test --all-features
 
+# Run Python plugin unit tests
+# Uses uvx so contributors don't need pytest installed system-wide.
+test-plugin:
+    uvx pytest tests/plugin -v
+
 # Run clippy lints
 lint:
     cargo clippy --all-features -- -D warnings
@@ -73,4 +78,4 @@ bench-compare *args:
     bash bench/compare.sh {{args}}
 
 # Full pre-commit suite (coverage is CI-only due to speed)
-check-all: fmt-check lint deny machete test jscpd
+check-all: fmt-check lint deny machete test test-plugin jscpd

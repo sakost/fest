@@ -35,7 +35,13 @@ fn resolve_python_inner(project_dir: &Path, virtual_env: Option<&str>) -> PathBu
         let bin = venv_bin_dir(&local_venv);
         let python = bin.join(python_exe_name());
         if python.exists() {
-            return python;
+            // Callers pair this path with `Command::current_dir(project_dir)`;
+            // on Unix the chdir happens before exec, so a relative path would
+            // resolve against the project dir instead of the caller's cwd.
+            // `std::path::absolute` (unlike `canonicalize`) keeps the
+            // `.venv/bin/python` symlink intact, which python needs to
+            // discover `pyvenv.cfg`.
+            return std::path::absolute(&python).unwrap_or(python);
         }
     }
 
@@ -92,6 +98,40 @@ mod tests {
 
         let result = resolve_python_inner(dir.path(), None);
         assert_eq!(result, python);
+    }
+
+    /// A relative project dir must still yield an absolute interpreter path.
+    ///
+    /// Callers pair the resolved path with `Command::current_dir(project_dir)`;
+    /// on Unix the chdir happens before exec, so a relative interpreter path
+    /// would resolve against the *project* dir and fail to spawn.
+    ///
+    /// Unix-only: the `..`-walk below assumes a single filesystem root, which
+    /// does not hold across Windows drive letters.
+    #[cfg(unix)]
+    #[test]
+    fn local_venv_resolves_to_absolute_path_for_relative_project_dir() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bin = venv_bin_dir(&dir.path().join(".venv"));
+        std::fs::create_dir_all(&bin).expect("create bin dir");
+        std::fs::write(bin.join(python_exe_name()), "").expect("create fake python");
+
+        // Build a relative path from cwd to the temp dir (../../…/tmp/xyz).
+        let ups: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = ups.join(dir.path().strip_prefix("/").expect("absolute tmp"));
+        assert!(
+            relative.is_relative(),
+            "precondition: path must be relative"
+        );
+
+        let result = resolve_python_inner(&relative, None);
+        assert!(
+            result.is_absolute(),
+            "resolved venv python must be absolute, got {}",
+            result.display()
+        );
+        assert!(result.exists(), "resolved path must exist");
     }
 
     /// VIRTUAL_ENV takes precedence over local .venv.
