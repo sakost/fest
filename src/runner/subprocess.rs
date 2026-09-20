@@ -3,17 +3,16 @@
 //! [`SubprocessRunner`] is the simplest (fallback) backend: for each
 //! mutant it overwrites the original source file in-place, spawns
 //! `pytest` as a subprocess, then restores the original source.
-//! Mutants for the same file are serialised to avoid races.
+//!
+//! Because the mutation lives on disk and pytest imports the whole
+//! package, only one mutant may be applied to the source tree at a time —
+//! regardless of which file it touches. Two mutants in different files
+//! overlapping would each see the other's change and produce false kills.
+//! Mutants are therefore serialised behind a single tree-wide lock; this
+//! backend has no intra-run parallelism.
 
-extern crate alloc;
-
-use alloc::sync::Arc;
 use core::time::Duration;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::path::PathBuf;
 
 use tokio::{process::Command, sync::Mutex as AsyncMutex};
 
@@ -33,8 +32,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 ///
 /// Holds tunable parameters such as the per-mutant timeout.
 ///
-/// The runner mutates source files **in-place** (overwrite → test → restore),
-/// using per-file locks to prevent concurrent modifications to the same file.
+/// The runner mutates source files **in-place** (overwrite → test → restore)
+/// behind a single lock, so at most one mutant is ever visible on disk.
 #[derive(Debug)]
 pub struct SubprocessRunner {
     /// Maximum wall-clock time (in seconds) for a single pytest
@@ -42,10 +41,10 @@ pub struct SubprocessRunner {
     timeout: Duration,
     /// Project root directory, used as `current_dir` for pytest.
     project_dir: PathBuf,
-    /// Per-file locks ensuring only one mutant modifies a given file at
-    /// a time.  Other mutants for different files can still run in
-    /// parallel.
-    file_locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// Serialises the overwrite → test → restore cycle across *all* files:
+    /// pytest imports the whole tree, so a concurrent mutant anywhere else
+    /// would contaminate this run's verdict.
+    tree_lock: AsyncMutex<()>,
     /// Live pytest process groups, shared with the signal handler so a
     /// cancelled run can kill them.
     processes: ProcessRegistry,
@@ -59,7 +58,7 @@ impl SubprocessRunner {
         Self {
             timeout: Duration::from_secs(timeout_secs),
             project_dir,
-            file_locks: Mutex::new(HashMap::new()),
+            tree_lock: AsyncMutex::new(()),
             processes: ProcessRegistry::default(),
         }
     }
@@ -71,19 +70,6 @@ impl SubprocessRunner {
     pub fn with_process_registry(mut self, processes: ProcessRegistry) -> Self {
         self.processes = processes;
         self
-    }
-
-    /// Get (or create) a per-file async lock.
-    fn file_lock(&self, path: &Path) -> Arc<AsyncMutex<()>> {
-        let mut locks = self
-            .file_locks
-            .lock()
-            .unwrap_or_else(|poisoned: std::sync::PoisonError<_>| poisoned.into_inner());
-        Arc::clone(
-            locks
-                .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-        )
     }
 }
 
@@ -117,9 +103,8 @@ impl Runner for SubprocessRunner {
         // 1. Apply the mutation.
         let mutated_source = mutant.apply_to_source(source);
 
-        // 2. Acquire per-file lock to prevent concurrent modifications.
-        let lock = self.file_lock(&mutant.file_path);
-        let guard = lock.lock().await;
+        // 2. Take the tree-wide lock: no other mutant may be on disk while this one's tests run.
+        let guard = self.tree_lock.lock().await;
 
         // 3. Overwrite the original file in-place.
         let file_path = &mutant.file_path;
@@ -213,7 +198,7 @@ const fn interpret_exit_code(code: Option<i32>) -> MutantStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -374,6 +359,62 @@ mod tests {
         assert!(
             !process_alive(pid),
             "grandchild {pid} survived the mutant timeout"
+        );
+    }
+
+    /// Two mutants in *different* files must never be on disk at the same
+    /// time: pytest imports the whole package, so a concurrent mutant in
+    /// another file would leak into this mutant's verdict (false kills).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_mutants_in_different_files_never_overlap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().expect("create project dir");
+        let root = project.path();
+        std::fs::write(root.join("a.py"), "A\n").expect("write a.py");
+        std::fs::write(root.join("b.py"), "B\n").expect("write b.py");
+        let bin = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).expect("create venv bin");
+        // Fake pytest: snapshot both files, linger, snapshot again. One
+        // `printf` per snapshot so concurrent appends cannot interleave.
+        let snapshot = "printf '%s\\n' \"$(cat a.py b.py | tr -d '\\n')\" >> snapshots.log";
+        let script = format!("#!/bin/sh\n{snapshot}\nsleep 0.3\n{snapshot}\n");
+        let python = bin.join("python");
+        std::fs::write(&python, script).expect("write fake python");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python");
+
+        let mutant_for = |name: &str, original: &str, mutated: &str| Mutant {
+            file_path: root.join(name),
+            line: 1_u32,
+            column: 1_u32,
+            byte_offset: 0_usize,
+            byte_length: 1_usize,
+            original_text: original.to_owned(),
+            mutated_text: mutated.to_owned(),
+            mutator_name: "constant_replace".to_owned(),
+        };
+        let runner = SubprocessRunner::new(10_u64, root.to_path_buf());
+        let tests = vec!["tests/test_x.py::test_x".to_owned()];
+        let mutant_a = mutant_for("a.py", "A", "X");
+        let mutant_b = mutant_for("b.py", "B", "Y");
+        let (first, second) = tokio::join!(
+            runner.run_mutant(&mutant_a, "A\n", &tests),
+            runner.run_mutant(&mutant_b, "B\n", &tests),
+        );
+        assert_eq!(first.expect("first run").status, MutantStatus::Survived);
+        assert_eq!(second.expect("second run").status, MutantStatus::Survived);
+
+        let log = std::fs::read_to_string(root.join("snapshots.log")).expect("snapshots");
+        assert!(
+            !log.lines().any(|line| line == "XY"),
+            "a test run observed both files mutated at once:\n{log}"
+        );
+        assert_eq!(
+            log.lines().count(),
+            4_usize,
+            "two runs × two snapshots:\n{log}"
         );
     }
 
