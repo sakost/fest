@@ -105,6 +105,10 @@ mod tests {
     /// Callers pair the resolved path with `Command::current_dir(project_dir)`;
     /// on Unix the chdir happens before exec, so a relative interpreter path
     /// would resolve against the *project* dir and fail to spawn.
+    ///
+    /// Unix-only: the `..`-walk below assumes a single filesystem root, which
+    /// does not hold across Windows drive letters.
+    #[cfg(unix)]
     #[test]
     fn local_venv_resolves_to_absolute_path_for_relative_project_dir() {
         let cwd = std::env::current_dir().expect("cwd");

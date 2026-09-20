@@ -1243,9 +1243,13 @@ mod tests {
     /// Worker argv pins `--rootdir` so nodeids stay project-relative.
     #[test]
     fn worker_args_pin_rootdir_to_project_dir() {
-        let args = build_worker_args("/tmp/xyz/fest.sock", Path::new("/proj/app"));
+        // Use a path that is already absolute on every platform (`/proj/app`
+        // has no drive on Windows and would be absolutized against cwd).
+        let project_dir = std::env::temp_dir().join("proj").join("app");
+        let args = build_worker_args("/tmp/xyz/fest.sock", &project_dir);
+        let expected = format!("--rootdir={}", project_dir.display());
         assert!(
-            args.contains(&"--rootdir=/proj/app".to_owned()),
+            args.contains(&expected),
             "worker argv must pin pytest rootdir to the project dir, got {args:?}"
         );
     }
