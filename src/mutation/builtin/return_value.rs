@@ -1,7 +1,8 @@
 //! Return value mutation.
 //!
 //! Replaces `return expr` with `return None`, and swaps `return True`
-//! with `return False` (and vice versa).
+//! with `return False` (and vice versa). An explicit `return None` is left
+//! alone — mutating it to itself would be an unkillable equivalent mutant.
 
 use ruff_python_ast::{Expr, Stmt};
 use ruff_text_size::Ranged;
@@ -28,6 +29,9 @@ fn return_mutation(ret: &ruff_python_ast::StmtReturn, source: &str) -> Option<Mu
     let original_text = &source[value_start..value_end];
 
     let replacement_text = match value.as_ref() {
+        // `return None` -> `return None` would be an equivalent mutant: it
+        // can never be killed and only inflates the survivor list.
+        Expr::NoneLiteral(_) => return None,
         Expr::BooleanLiteral(bool_lit) => if bool_lit.value { "False" } else { "True" }.to_owned(),
         Expr::BoolOp(_)
         | Expr::Named(_)
@@ -50,7 +54,6 @@ fn return_mutation(ret: &ruff_python_ast::StmtReturn, source: &str) -> Option<Mu
         | Expr::StringLiteral(_)
         | Expr::BytesLiteral(_)
         | Expr::NumberLiteral(_)
-        | Expr::NoneLiteral(_)
         | Expr::EllipsisLiteral(_)
         | Expr::Attribute(_)
         | Expr::Subscript(_)
@@ -189,6 +192,17 @@ mod tests {
         assert_eq!(mutations.len(), 1_usize);
         assert_eq!(mutations[0_usize].original_text, "42");
         assert_eq!(mutations[0_usize].replacement_text, "None");
+    }
+
+    /// `return None` -> `return None` is a no-op that can never be killed,
+    /// so no mutation is produced for an explicit `None`.
+    #[test]
+    fn return_none_is_not_mutated() {
+        let mutations = find("def f():\n    return None\n");
+        assert!(
+            mutations.is_empty(),
+            "explicit `return None` must not yield an equivalent mutant, got {mutations:?}"
+        );
     }
 
     /// `return True` is swapped to `return False`.
